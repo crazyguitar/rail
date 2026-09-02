@@ -1,0 +1,45 @@
+{{- if .Values.railfs.create }}
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ include "vllm.fullname" . }}-models
+  labels:
+    {{- include "vllm.labels" . | nindent 4 }}
+spec:
+  capacity:
+    storage: {{ .Values.railfs.capacity }}
+  accessModes:
+    - ReadOnlyMany
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  claimRef:
+    namespace: {{ .Release.Namespace }}
+    name: {{ .Values.railfs.claimName }}
+  csi:
+    driver: {{ .Values.railfs.driver }}
+    volumeHandle: {{ printf "%s-%s" (include "vllm.fullname" .) .Release.Namespace | quote }}
+    volumeAttributes:
+      host: {{ required "railfs.attributes.host is required: the fabric address of the node running raild" .Values.railfs.attributes.host | quote }}
+      export: {{ required "railfs.attributes.export is required: the directory raild serves" .Values.railfs.attributes.export | quote }}
+      {{- range $k, $v := omit .Values.railfs.attributes "host" "export" }}
+      {{ $k }}: {{ $v | quote }}
+      {{- end }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.railfs.claimName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vllm.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadOnlyMany
+    - ReadWriteMany
+  storageClassName: ""
+  volumeName: {{ include "vllm.fullname" . }}-models
+  resources:
+    requests:
+      storage: {{ .Values.railfs.capacity }}
+{{- end }}

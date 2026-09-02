@@ -1,0 +1,46 @@
+driverName: railfs.csi.rail.io
+
+image:
+  repository: railfs-csi
+  tag: dev
+  pullPolicy: IfNotPresent
+
+registrar:
+  image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.11.1
+  pullPolicy: IfNotPresent
+
+livenessProbe:
+  enabled: true
+  image: registry.k8s.io/sig-storage/livenessprobe:v2.13.1
+  pullPolicy: IfNotPresent
+  port: 9808
+
+kubeletDir: /var/lib/kubelet
+
+priorityClassName: system-node-critical
+
+modprobe: true
+
+nodeSelector: {}
+
+tolerations:
+  - operator: Exists
+
+resources: {}
+
+volume:
+  create: false
+  name: railfs
+  capacity: 1Ti
+  accessModes:
+    - ReadWriteMany
+  reclaimPolicy: Retain
+  attributes:
+    host: ""
+    export: ""
+    port: "18600"
+    rdma: "true"
+  mountFlags: []
+
+nameOverride: ""
+fullnameOverride: ""

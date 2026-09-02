@@ -1,0 +1,118 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "railfs-csi.fullname" . }}
+  labels:
+    {{- include "railfs-csi.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "railfs-csi.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "railfs-csi.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.modprobe }}
+      initContainers:
+        - name: modprobe
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["modprobe", "railfs"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: modules
+              mountPath: /lib/modules
+              readOnly: true
+      {{- end }}
+      containers:
+        - name: registrar
+          image: {{ .Values.registrar.image }}
+          imagePullPolicy: {{ .Values.registrar.pullPolicy }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path={{ .Values.kubeletDir }}/plugins/{{ .Values.driverName }}/csi.sock
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+            - name: registration
+              mountPath: /registration
+        {{- if .Values.livenessProbe.enabled }}
+        - name: liveness-probe
+          image: {{ .Values.livenessProbe.image }}
+          imagePullPolicy: {{ .Values.livenessProbe.pullPolicy }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --health-port={{ .Values.livenessProbe.port }}
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+        {{- end }}
+        - name: plugin
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --endpoint=unix:///csi/csi.sock
+            - --drivername={{ .Values.driverName }}
+            - --nodeid=$(NODE_NAME)
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+            - name: pods
+              mountPath: {{ .Values.kubeletDir }}/pods
+              mountPropagation: Bidirectional
+          {{- if .Values.livenessProbe.enabled }}
+          ports:
+            - name: healthz
+              containerPort: {{ .Values.livenessProbe.port }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: socket
+          hostPath:
+            path: {{ .Values.kubeletDir }}/plugins/{{ .Values.driverName }}
+            type: DirectoryOrCreate
+        - name: registration
+          hostPath:
+            path: {{ .Values.kubeletDir }}/plugins_registry
+            type: Directory
+        - name: pods
+          hostPath:
+            path: {{ .Values.kubeletDir }}/pods
+            type: DirectoryOrCreate
+        {{- if .Values.modprobe }}
+        - name: modules
+          hostPath:
+            path: /lib/modules
+            type: Directory
+        {{- end }}

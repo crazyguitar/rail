@@ -1,0 +1,6 @@
+apiVersion: v2
+name: raild
+description: The rail file daemon, exporting a host directory over RDMA
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

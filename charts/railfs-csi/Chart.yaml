@@ -1,0 +1,6 @@
+apiVersion: v2
+name: railfs-csi
+description: A CSI node driver that mounts railfs, the kernel client for raild
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

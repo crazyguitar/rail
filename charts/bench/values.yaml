@@ -1,0 +1,41 @@
+image:
+  repository: rail-test
+  tag: dev
+  pullPolicy: IfNotPresent
+
+# The address that serves. The benchmarks run the peer's copy of raild by the
+# path they found their own binary at, so the peer needs the same tree at
+# /opt/rail, which is where the image puts it.
+peer: ""
+
+# The address the mounts and the file client dial. Left empty it falls back to
+# peer, and a run over the ssh route reports the slow network as the result.
+fabric: ""
+
+# Which cases to run, as a google/benchmark filter.
+filter: "."
+
+# Whether the run mounts and loads the module: it takes the privilege, links
+# railfs.ko in from the node and mounts the node's debugfs. The kernel mount
+# cases need it; BM_RdmaSend and the fuse cases do not.
+kernel: true
+
+# Pin to a CPU list, as taskset spells it. Cores in different cache domains
+# give different numbers for the same code, so an unpinned comparison measures
+# the scheduler. Empty leaves the scheduler in charge.
+cpus: ""
+
+module: /lib/modules
+
+# The benchmarks drive the peer over ssh. Give them an identity that reaches it:
+#   kubectl -n <ns> create secret generic rail-e2e-ssh \
+#     --from-file=id_ed25519=$HOME/.ssh/id_ed25519 \
+#     --from-file=known_hosts=$HOME/.ssh/known_hosts
+ssh:
+  secret: rail-e2e-ssh
+  # The container is root; the peer is not. Without this it offers the key as
+  # root and the peer refuses it.
+  user: ""
+
+node: ""
+backoffLimit: 0

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: vllm
+description: A Dynamo vLLM deployment whose model weights are read from an railfs mount
+type: application
+version: 0.1.0
+appVersion: "1.4.2"

@@ -1,0 +1,24 @@
+FROM ubuntu:24.04 AS build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake git ca-certificates pkg-config \
+      libfuse3-dev libibverbs-dev librdmacm-dev libssh-dev liburing-dev ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/rail
+COPY . .
+RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build --target rail-e2e rail-bench rail-cli raild-cli mount-railfuse mount-railnfs mount-railfs --parallel
+
+FROM ubuntu:24.04
+
+# The suite links these, and still calls out to ssh and the mount helpers.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates coreutils fio fuse3 ibverbs-providers kmod nfs-common \
+      libfuse3-3 libibverbs1 librdmacm1t64 libssh-4 liburing2 \
+      openssh-client util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /opt/rail /opt/rail
+WORKDIR /opt/rail
+ENTRYPOINT ["/bin/sh", "-c"]

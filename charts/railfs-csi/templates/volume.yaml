@@ -1,0 +1,47 @@
+{{- if .Values.volume.create }}
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ .Values.volume.name }}
+  labels:
+    {{- include "railfs-csi.labels" . | nindent 4 }}
+spec:
+  capacity:
+    storage: {{ .Values.volume.capacity }}
+  accessModes:
+    {{- toYaml .Values.volume.accessModes | nindent 4 }}
+  persistentVolumeReclaimPolicy: {{ .Values.volume.reclaimPolicy }}
+  storageClassName: ""
+  claimRef:
+    namespace: {{ .Release.Namespace }}
+    name: {{ .Values.volume.name }}
+  {{- with .Values.volume.mountFlags }}
+  mountOptions:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  csi:
+    driver: {{ .Values.driverName }}
+    volumeHandle: {{ printf "%s-%s" .Release.Namespace .Values.volume.name | quote }}
+    volumeAttributes:
+      host: {{ required "volume.attributes.host is required when volume.create is set" .Values.volume.attributes.host | quote }}
+      export: {{ required "volume.attributes.export is required when volume.create is set" .Values.volume.attributes.export | quote }}
+      {{- range $k, $v := omit .Values.volume.attributes "host" "export" }}
+      {{ $k }}: {{ $v | quote }}
+      {{- end }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.volume.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "railfs-csi.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.volume.accessModes | nindent 4 }}
+  storageClassName: ""
+  volumeName: {{ .Values.volume.name }}
+  resources:
+    requests:
+      storage: {{ .Values.volume.capacity }}
+{{- end }}

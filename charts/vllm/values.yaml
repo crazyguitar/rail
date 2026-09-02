@@ -1,0 +1,41 @@
+image:
+  repository: nvcr.io/nvidia/ai-dynamo/vllm-runtime
+  tag: "1.4.2"
+  pullPolicy: IfNotPresent
+
+model:
+  name: Qwen3.8-27B-FP8
+  path: /models/Qwen3.8-27B-FP8
+
+railfs:
+  create: true
+  claimName: railfs-models
+  driver: railfs.csi.rail.io
+  capacity: 1Ti
+  mountPath: /models
+  readOnly: true
+  attributes:
+    host: ""
+    export: ""
+    port: "18600"
+    rdma: "true"
+
+frontend:
+  replicas: 1
+  resources: {}
+
+worker:
+  replicas: 1
+  gpu: 1
+  gpuMemoryUtilization: "0.45"
+  kvCacheDtype: fp8
+  extraArgs: []
+  resources:
+    requests:
+      ephemeral-storage: 2Gi
+
+nodeSelector: {}
+tolerations: []
+
+nameOverride: ""
+fullnameOverride: ""

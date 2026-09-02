@@ -1,0 +1,36 @@
+image:
+  repository: rail-test
+  tag: dev
+  pullPolicy: IfNotPresent
+
+# The address that serves. The suite runs the peer's copy of raild by the path
+# it found its own binary at, so the peer needs the same tree at /opt/rail,
+# which is where the image puts it.
+peer: ""
+
+# Which cases to run, as a gtest filter. docs/testing.md names the ones worth
+# remembering; anything gtest accepts works here.
+filter: "*"
+
+# Whether this run mounts and loads the module: it asks for the privilege, links
+# railfs.ko in from the node and lets the mounting suites run at all. Leaving it
+# on costs nothing when the filter selects none of them. Off runs unprivileged,
+# which is worth proving the protocol suites still pass.
+kernel: true
+
+# The module is built against the running kernel, so it comes from the node
+# rather than the image.
+module: /lib/modules
+
+# The harness drives the peer over ssh. Give it an identity that reaches it:
+#   kubectl -n <ns> create secret generic rail-e2e-ssh \
+#     --from-file=id_ed25519=$HOME/.ssh/id_ed25519 \
+#     --from-file=known_hosts=$HOME/.ssh/known_hosts
+ssh:
+  secret: rail-e2e-ssh
+  # The container is root; the peer is not. Without this it offers the key as
+  # root and the peer refuses it.
+  user: ""
+
+node: ""
+backoffLimit: 0

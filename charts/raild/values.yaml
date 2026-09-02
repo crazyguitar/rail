@@ -1,0 +1,47 @@
+image:
+  repository: raild
+  tag: dev
+  pullPolicy: IfNotPresent
+
+export:
+  hostPath: ""
+  mountPath: /models
+  readOnly: false
+
+port: 18600
+backend: rdma
+
+serve:
+  threads: ""
+  maxSessions: ""
+  pages: ""
+  pageSizeMiB: ""
+
+rdma:
+  enabled: true
+  devicePath: /dev/infiniband
+
+hostNetwork: true
+
+nodeSelector:
+  rail.io/export: "true"
+
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+
+affinity: {}
+
+privileged: true
+
+seccompProfile:
+  type: Unconfined
+
+probes:
+  enabled: true
+
+resources: {}
+
+nameOverride: ""
+fullnameOverride: ""

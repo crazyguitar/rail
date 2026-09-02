@@ -1,0 +1,84 @@
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: {{ include "vllm.fullname" . }}
+  labels:
+    {{- include "vllm.labels" . | nindent 4 }}
+spec:
+  backendFramework: vllm
+  components:
+    - name: Frontend
+      type: frontend
+      replicas: {{ .Values.frontend.replicas }}
+      podTemplate:
+        spec:
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: main
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              {{- with .Values.frontend.resources }}
+              resources:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+    - name: VllmDecodeWorker
+      type: worker
+      replicas: {{ .Values.worker.replicas }}
+      podTemplate:
+        spec:
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: main
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command:
+                - python3
+                - -m
+                - dynamo.vllm
+              args:
+                - --model
+                - {{ .Values.model.path | quote }}
+                - --served-model-name
+                - {{ .Values.model.name | quote }}
+                {{- with .Values.worker.gpuMemoryUtilization }}
+                - --gpu-memory-utilization
+                - {{ . | quote }}
+                {{- end }}
+                {{- with .Values.worker.kvCacheDtype }}
+                - --kv-cache-dtype
+                - {{ . | quote }}
+                {{- end }}
+                {{- range .Values.worker.extraArgs }}
+                - {{ . | quote }}
+                {{- end }}
+              resources:
+                limits:
+                  nvidia.com/gpu: {{ .Values.worker.gpu | quote }}
+                {{- with .Values.worker.resources.requests }}
+                requests:
+                  nvidia.com/gpu: {{ $.Values.worker.gpu | quote }}
+                  {{- toYaml . | nindent 18 }}
+                {{- end }}
+              volumeMounts:
+                - name: models
+                  mountPath: {{ .Values.railfs.mountPath }}
+                  readOnly: {{ .Values.railfs.readOnly }}
+          volumes:
+            - name: models
+              persistentVolumeClaim:
+                claimName: {{ .Values.railfs.claimName }}
+                readOnly: {{ .Values.railfs.readOnly }}

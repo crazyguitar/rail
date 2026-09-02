@@ -1,0 +1,15 @@
+raild is exporting {{ .Values.export.hostPath }} on port {{ .Values.port }} over {{ .Values.backend }}.
+
+It runs on nodes labelled:
+{{- range $k, $v := .Values.nodeSelector }}
+  {{ $k }}={{ $v }}
+{{- end }}
+
+Because hostNetwork is {{ .Values.hostNetwork }}, clients reach it at the node's own
+fabric address, not a Service IP. Find it with:
+
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }} -o wide
+
+Then mount from a client:
+
+  sudo mount -i -t railfs -o host=<fabric-ip>,export=/,port={{ .Values.port }},rdma,uid=$(id -u),gid=$(id -g) none /mnt

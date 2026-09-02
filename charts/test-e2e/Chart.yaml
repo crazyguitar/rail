@@ -1,0 +1,6 @@
+apiVersion: v2
+name: test-e2e
+description: Runs the rail end-to-end suite on a node, against a peer that serves
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

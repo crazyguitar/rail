@@ -1,0 +1,10 @@
+.git
+build
+compile_commands.json
+scripts
+trials.txt
+tune.md
+**/*.ko
+**/*.o
+**/MOK.priv
+**/MOK.der

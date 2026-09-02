@@ -1,0 +1,21 @@
+BasedOnStyle: LLVM
+
+# Wide enough that ordinary statements and signatures stay on one line, narrow
+# enough that a 200-character argument list still wraps instead of running off
+# the screen. Note ColumnLimit 0 does NOT mean "no limit" to clang-format: it
+# means "keep the breaks already in the file", which leaves old wrapping in
+# place forever.
+ColumnLimit: 150
+
+AllowShortIfStatementsOnASingleLine: AllIfsAndElse
+AllowShortLoopsOnASingleLine: true
+AllowShortBlocksOnASingleLine: Empty
+AllowShortFunctionsOnASingleLine: All
+DerivePointerAlignment: false
+
+# When a parameter or argument list does have to wrap, give each one its own
+# line rather than packing as many per line as will fit.
+BinPackParameters: false
+BinPackArguments: false
+AllowAllParametersOfDeclarationOnNextLine: false
+AllowAllArgumentsOnNextLine: false

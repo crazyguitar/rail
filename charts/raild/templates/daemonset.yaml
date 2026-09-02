@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "raild.fullname" . }}
+  labels:
+    {{- include "raild.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "raild.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "raild.selectorLabels" . | nindent 8 }}
+    spec:
+      hostNetwork: {{ .Values.hostNetwork }}
+      {{- if .Values.hostNetwork }}
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.seccompProfile }}
+      securityContext:
+        seccompProfile:
+          {{- toYaml . | nindent 10 }}
+      {{- end }}
+      containers:
+        - name: raild
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --serve
+            - {{ .Values.export.mountPath | quote }}
+            - --port
+            - {{ .Values.port | quote }}
+            - --backend
+            - {{ .Values.backend | quote }}
+            {{- with .Values.serve.threads }}
+            - --threads
+            - {{ . | quote }}
+            {{- end }}
+            {{- with .Values.serve.maxSessions }}
+            - --max-sessions
+            - {{ . | quote }}
+            {{- end }}
+            {{- with .Values.serve.pages }}
+            - --pages
+            - {{ . | quote }}
+            {{- end }}
+            {{- with .Values.serve.pageSizeMiB }}
+            - --page-size
+            - {{ . | quote }}
+            {{- end }}
+          securityContext:
+            privileged: {{ .Values.privileged }}
+          ports:
+            - name: rail
+              containerPort: {{ .Values.port }}
+              protocol: TCP
+          volumeMounts:
+            - name: export
+              mountPath: {{ .Values.export.mountPath | quote }}
+              readOnly: {{ .Values.export.readOnly }}
+            {{- if .Values.rdma.enabled }}
+            - name: rdma
+              mountPath: {{ .Values.rdma.devicePath | quote }}
+            {{- end }}
+          {{- if .Values.probes.enabled }}
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.port }}
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: {{ .Values.port }}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: export
+          hostPath:
+            path: {{ required "export.hostPath is required: the node directory to serve" .Values.export.hostPath | quote }}
+            type: Directory
+        {{- if .Values.rdma.enabled }}
+        - name: rdma
+          hostPath:
+            path: {{ .Values.rdma.devicePath | quote }}
+            type: Directory
+        {{- end }}

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: bench
+description: Runs the rail benchmarks on a node, against a peer that serves
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
