@@ -17,6 +17,7 @@
 #include <rdma/ib_verbs.h>
 
 #include "railfs-rdma.h"
+#include "railfs-gds.h"
 #include "railfs-proto.h"
 
 #define RAILFS_CQ_DEPTH 64
@@ -95,6 +96,10 @@ struct railfs_line {
 	struct ib_cqe arm_cqe;
 	struct completion armed;
 	int arm_err;
+	struct ib_mr *gpu_mr;
+	struct sg_table gpu_table;
+	unsigned int gpu_nents;
+	enum dma_data_direction gpu_dir;
 };
 
 // One connection's rails. The peer spreads pages across them and says which it
@@ -352,6 +357,14 @@ static void railfs_line_close(struct railfs_line *line)
 		ib_destroy_qp(line->qp);
 	}
 
+	if (line->gpu_mr) {
+		ib_dereg_mr(line->gpu_mr);
+	}
+
+	if (line->gpu_table.sgl) {
+		sg_free_table(&line->gpu_table);
+	}
+
 	if (line->landing_mr) {
 		ib_dereg_mr(line->landing_mr);
 	}
@@ -466,6 +479,18 @@ static int railfs_line_open(struct railfs_line *line)
 	line->offers = dma_alloc_coherent(line->device->dma_device, RAILFS_STREAM_SLOTS * RAILFS_CTS_BYTES, &line->offers_dma, GFP_KERNEL);
 	if (!line->offers) {
 		err = -ENOMEM;
+		goto out;
+	}
+
+	line->gpu_mr = ib_alloc_mr(line->pd, IB_MR_TYPE_MEM_REG, RAILFS_GDS_MAX_SG);
+	if (IS_ERR(line->gpu_mr)) {
+		err = PTR_ERR(line->gpu_mr);
+		line->gpu_mr = NULL;
+		goto out;
+	}
+
+	err = sg_alloc_table(&line->gpu_table, RAILFS_GDS_MAX_SG, GFP_KERNEL);
+	if (err) {
 		goto out;
 	}
 
@@ -599,24 +624,19 @@ static void railfs_on_armed(struct ib_cq *cq, struct ib_wc *wc)
 
 // A send work request, so the queue pair has to be sending already: this runs
 // after the transition to ready, not while the region is being allocated.
-static int railfs_arm_region(struct railfs_line *line, struct ib_mr *mr)
+static int railfs_fence(struct railfs_line *line, struct ib_send_wr *wr)
 {
 	const struct ib_send_wr *bad;
-	struct ib_reg_wr reg = {};
 	int err;
 
 	line->arm_cqe.done = railfs_on_armed;
 	line->arm_err = 0;
 	reinit_completion(&line->armed);
 
-	reg.wr.wr_cqe = &line->arm_cqe;
-	reg.wr.opcode = IB_WR_REG_MR;
-	reg.wr.send_flags = IB_SEND_SIGNALED;
-	reg.mr = mr;
-	reg.key = mr->rkey;
-	reg.access = IB_ACCESS_LOCAL_WRITE | IB_ACCESS_REMOTE_WRITE;
+	wr->wr_cqe = &line->arm_cqe;
+	wr->send_flags = IB_SEND_SIGNALED;
 
-	err = ib_post_send(line->qp, &reg.wr, &bad);
+	err = ib_post_send(line->qp, wr, &bad);
 	if (err) {
 		return err;
 	}
@@ -626,6 +646,107 @@ static int railfs_arm_region(struct railfs_line *line, struct ib_mr *mr)
 	}
 
 	return line->arm_err;
+}
+
+static int railfs_arm(struct railfs_line *line, struct ib_mr *mr, int access)
+{
+	struct ib_reg_wr reg = {};
+
+	reg.wr.opcode = IB_WR_REG_MR;
+	reg.mr = mr;
+	reg.key = mr->rkey;
+	reg.access = access;
+
+	return railfs_fence(line, &reg.wr);
+}
+
+static int railfs_arm_region(struct railfs_line *line, struct ib_mr *mr)
+{
+	return railfs_arm(line, mr, IB_ACCESS_LOCAL_WRITE | IB_ACCESS_REMOTE_WRITE);
+}
+
+static int railfs_disarm(struct railfs_line *line, struct ib_mr *mr)
+{
+	struct ib_send_wr inv = {};
+
+	inv.opcode = IB_WR_LOCAL_INV;
+	inv.ex.invalidate_rkey = mr->rkey;
+
+	return railfs_fence(line, &inv);
+}
+
+static int railfs_gpu_copy(struct railfs_line *line, struct sg_table *pages, unsigned int nents)
+{
+	struct scatterlist *src = pages->sgl;
+	struct scatterlist *dst;
+	unsigned int i;
+
+	if (nents > RAILFS_GDS_MAX_SG) {
+		return -EMSGSIZE;
+	}
+
+	for_each_sg(line->gpu_table.sgl, dst, nents, i) {
+		sg_set_page(dst, sg_page(src), src->length, src->offset);
+		src = sg_next(src);
+	}
+
+	line->gpu_nents = nents;
+	return 0;
+}
+
+static int railfs_gpu_bind(struct railfs_line *line, struct sg_table *pages, enum dma_data_direction dir, int access)
+{
+	struct ib_mr *mr = line->gpu_mr;
+	int nents = pages->nents;
+	int mapped;
+	int err;
+
+	err = railfs_gpu_copy(line, pages, nents);
+	if (err) {
+		return err;
+	}
+
+	mapped = railfs_gds_map(line->device->dma_device, line->gpu_table.sgl, nents, dir);
+	if (mapped != nents) {
+		line->gpu_nents = 0;
+		return mapped < 0 ? mapped : -EIO;
+	}
+
+	line->gpu_dir = dir;
+
+	ib_update_fast_reg_key(mr, ib_inc_rkey(mr->rkey));
+
+	mapped = ib_map_mr_sg(mr, line->gpu_table.sgl, nents, NULL, PAGE_SIZE);
+	if (mapped != nents) {
+		err = mapped < 0 ? mapped : -EIO;
+		goto unmap;
+	}
+
+	err = railfs_arm(line, mr, access);
+	if (err) {
+		goto unmap;
+	}
+
+	return 0;
+
+unmap:
+	railfs_gds_unmap(line->device->dma_device, line->gpu_table.sgl, nents, dir);
+	line->gpu_nents = 0;
+	return err;
+}
+
+static void railfs_gpu_unbind(struct railfs_line *line)
+{
+	if (!line->gpu_nents) {
+		return;
+	}
+
+	if (railfs_disarm(line, line->gpu_mr)) {
+		pr_err("railfs: could not invalidate the gpu region on rail %u\n", line->index);
+	}
+
+	railfs_gds_unmap(line->device->dma_device, line->gpu_table.sgl, line->gpu_nents, line->gpu_dir);
+	line->gpu_nents = 0;
 }
 
 static void railfs_on_landed(struct ib_cq *cq, struct ib_wc *wc);
@@ -820,7 +941,7 @@ static void railfs_on_sent(struct ib_cq *cq, struct ib_wc *wc)
 // on every rail, and lets the peer pick. Returns as soon as the request is on
 // the wire - the payload arrives later and raises the slot's completion, which
 // is the only notification there is.
-int railfs_rdma_offer(struct railfs_rdma *rail, u32 slot, u64 key, u32 len)
+static int railfs_rdma_offer_at(struct railfs_rdma *rail, u32 slot, u64 key, u32 len, const u64 *addr, const u32 *rkey)
 {
 	struct railfs_line *post = &rail->line[0];
 	const struct ib_send_wr *bad_send;
@@ -857,11 +978,9 @@ int railfs_rdma_offer(struct railfs_rdma *rail, u32 slot, u64 key, u32 len)
 	cts.length = len;
 	cts.slot = slot;
 
-	// Every rail names its own landing, because the same page registered on
-	// two devices has a different address and a different key on each.
 	for (i = 0; i < shared; i++) {
-		cts.addr[i] = (u64)railfs_landing_dma_at(&rail->line[i], slot);
-		cts.rkey[i] = rail->line[i].landing_mr->rkey;
+		cts.addr[i] = addr[i];
+		cts.rkey[i] = rkey[i];
 	}
 
 	// The peer notices a record by its sequence changing, so this counts
@@ -888,21 +1007,28 @@ int railfs_rdma_offer(struct railfs_rdma *rail, u32 slot, u64 key, u32 len)
 	return ib_post_send(post->qp, &wr.wr, &bad_send);
 }
 
-// Waits for the page offered into this slot and copies it out of whichever
-// rail's landing the peer chose. The slot is free to be offered again once this
-// returns.
-int railfs_rdma_collect(struct railfs_rdma *rail, u32 slot, void *buf, u32 len)
+// Every rail names its own landing, because the same page registered on two
+// devices has a different address and a different key on each.
+int railfs_rdma_offer(struct railfs_rdma *rail, u32 slot, u64 key, u32 len)
 {
-	u32 line;
+	u64 addr[RAILFS_MAX_RAILS] = {};
+	u32 rkey[RAILFS_MAX_RAILS] = {};
+	u32 i;
 
 	if (slot >= RAILFS_STREAM_SLOTS) {
 		return -EINVAL;
 	}
 
-	if (len > RAILFS_PAGE_BYTES) {
-		return -EMSGSIZE;
+	for (i = 0; i < railfs_shared_lines(rail); i++) {
+		addr[i] = (u64)railfs_landing_dma_at(&rail->line[i], slot);
+		rkey[i] = rail->line[i].landing_mr->rkey;
 	}
 
+	return railfs_rdma_offer_at(rail, slot, key, len, addr, rkey);
+}
+
+static int railfs_rdma_await(struct railfs_rdma *rail, u32 slot)
+{
 	if (!wait_for_completion_timeout(&rail->slot[slot].done, msecs_to_jiffies(RAILFS_WAIT_MS))) {
 		railfs_rail_break(rail);
 		return -ETIMEDOUT;
@@ -912,13 +1038,77 @@ int railfs_rdma_collect(struct railfs_rdma *rail, u32 slot, void *buf, u32 len)
 		return rail->slot[slot].err;
 	}
 
-	line = rail->slot[slot].line;
-	if (line >= rail->live) {
+	if (rail->slot[slot].line >= rail->live) {
 		return -EPROTO;
 	}
 
-	memcpy(buf, railfs_landing_at(&rail->line[line], slot), len);
+	return 0;
+}
+
+// Waits for the page offered into this slot and copies it out of whichever
+// rail's landing the peer chose. The slot is free to be offered again once this
+// returns.
+int railfs_rdma_collect(struct railfs_rdma *rail, u32 slot, void *buf, u32 len)
+{
+	int err;
+
+	if (slot >= RAILFS_STREAM_SLOTS) {
+		return -EINVAL;
+	}
+
+	if (len > RAILFS_PAGE_BYTES) {
+		return -EMSGSIZE;
+	}
+
+	err = railfs_rdma_await(rail, slot);
+	if (err) {
+		return err;
+	}
+
+	memcpy(buf, railfs_landing_at(&rail->line[rail->slot[slot].line], slot), len);
 	return len;
+}
+
+int railfs_rdma_fetch_sg(struct railfs_rdma *rail, u64 key, struct sg_table *pages, u32 len)
+{
+	u64 addr[RAILFS_MAX_RAILS] = {};
+	u32 rkey[RAILFS_MAX_RAILS] = {};
+	u32 shared = railfs_shared_lines(rail);
+	u32 bound = 0;
+	u32 i;
+	int err;
+
+	if (rail->broken || !shared) {
+		return -ENOTCONN;
+	}
+
+	for (i = 0; i < shared; i++) {
+		err = railfs_gpu_bind(&rail->line[i], pages, DMA_FROM_DEVICE, IB_ACCESS_LOCAL_WRITE | IB_ACCESS_REMOTE_WRITE);
+		if (err) {
+			goto unbind;
+		}
+
+		bound++;
+		addr[i] = rail->line[i].gpu_mr->iova;
+		rkey[i] = rail->line[i].gpu_mr->rkey;
+	}
+
+	err = railfs_rdma_offer_at(rail, 0, key, len, addr, rkey);
+	if (err) {
+		goto unbind;
+	}
+
+	err = railfs_rdma_await(rail, 0);
+	if (err == -ETIMEDOUT) {
+		return err;
+	}
+
+unbind:
+	for (i = 0; i < bound; i++) {
+		railfs_gpu_unbind(&rail->line[i]);
+	}
+
+	return err ? err : (int)len;
 }
 
 // One page, offered and collected without letting go in between. What a ranged
@@ -979,10 +1169,12 @@ static int railfs_await_cts(struct railfs_rdma *rail, u64 key, struct railfs_cts
 	}
 }
 
-static int railfs_rdma_push_from(struct railfs_rdma *rail, u64 key, const void *buf, struct folio **folios, unsigned int nr, u32 len)
+static int railfs_rdma_push_from(struct railfs_rdma *rail, u64 key, const void *buf, struct folio **folios, unsigned int nr,
+				 struct sg_table *pages, u32 len)
 {
 	const struct ib_send_wr *bad_send;
 	struct railfs_line *post;
+	struct railfs_line *bound = NULL;
 	struct ib_rdma_wr wr = {};
 	struct railfs_cts cts;
 	struct ib_sge sge[RAILFS_MAX_SGE] = {};
@@ -1062,6 +1254,16 @@ static int railfs_rdma_push_from(struct railfs_rdma *rail, u64 key, const void *
 			err = -EMSGSIZE;
 			goto out;
 		}
+	} else if (pages) {
+		err = railfs_gpu_bind(post, pages, DMA_TO_DEVICE, IB_ACCESS_LOCAL_WRITE);
+		if (err) {
+			goto out;
+		}
+
+		bound = post;
+		sge[0].addr = post->gpu_mr->iova;
+		sge[0].length = len;
+		sge[0].lkey = post->gpu_mr->lkey;
 	} else {
 		memcpy(railfs_landing_at(post, RAILFS_PUSH_SLOT), buf, len);
 		sge[0].addr = railfs_landing_dma_at(post, RAILFS_PUSH_SLOT);
@@ -1096,6 +1298,7 @@ static int railfs_rdma_push_from(struct railfs_rdma *rail, u64 key, const void *
 		// adapter can still touch it is worse than leaking it on a path that
 		// has already broken the rail.
 		mapped = NULL;
+		bound = NULL;
 		err = -ETIMEDOUT;
 		goto out;
 	}
@@ -1109,17 +1312,25 @@ out:
 			ib_dma_unmap_page(mapped, dma[i], sge[i].length, DMA_TO_DEVICE);
 		}
 	}
+	if (bound) {
+		railfs_gpu_unbind(bound);
+	}
 	return err;
 }
 
 int railfs_rdma_push(struct railfs_rdma *rail, u64 key, const void *buf, u32 len)
 {
-	return railfs_rdma_push_from(rail, key, buf, NULL, 0, len);
+	return railfs_rdma_push_from(rail, key, buf, NULL, 0, NULL, len);
 }
 
 int railfs_rdma_push_folios(struct railfs_rdma *rail, u64 key, struct folio **folios, unsigned int nr, u32 len)
 {
-	return railfs_rdma_push_from(rail, key, NULL, folios, nr, len);
+	return railfs_rdma_push_from(rail, key, NULL, folios, nr, NULL, len);
+}
+
+int railfs_rdma_push_sg(struct railfs_rdma *rail, u64 key, struct sg_table *pages, u32 len)
+{
+	return railfs_rdma_push_from(rail, key, NULL, NULL, 0, pages, len);
 }
 
 int railfs_rdma_start(void)

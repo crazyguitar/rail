@@ -2,7 +2,13 @@
 #ifndef RAILFS_RDMA_H
 #define RAILFS_RDMA_H
 
+#include <linux/mm.h>
+#include <linux/scatterlist.h>
 #include <linux/types.h>
+
+#include "railfs-msg.h"
+
+#define RAILFS_GDS_MAX_SG (RAILFS_PAGE_SIZE / PAGE_SIZE + 1)
 
 /* Mirrors src/transport/rdma-data-channel.cc. The blob below is memcpy'd onto
  * the wire by the peer, so every field here is layout, not convenience.
@@ -77,6 +83,9 @@ int railfs_rdma_push(struct railfs_rdma *rdma, u64 key, const void *buf, u32 len
  * The folio has to cover the whole length.
  */
 int railfs_rdma_push_folios(struct railfs_rdma *rdma, u64 key, struct folio **folios, unsigned int nr, u32 len);
+
+int railfs_rdma_fetch_sg(struct railfs_rdma *rdma, u64 key, struct sg_table *pages, u32 len);
+int railfs_rdma_push_sg(struct railfs_rdma *rdma, u64 key, struct sg_table *pages, u32 len);
 
 /* One clear-to-send record, written by rdma into the peer's ring. Layout is
  * wire format: struct Cts in src/transport/rdma-data-channel.cc.

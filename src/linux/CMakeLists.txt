@@ -16,7 +16,7 @@ endif()
 find_program(RAILFS_MAKE make REQUIRED)
 find_program(RAILFS_OPENSSL openssl)
 
-set(RAILFS_OBJECTS railfs-main.o railfs-read.o railfs-write.o railfs-direct.o railfs-lookup.o railfs-create.o railfs-mkdir.o railfs-unlink.o railfs-rename.o railfs-symlink.o railfs-link.o railfs-readdir.o railfs-open.o railfs-fsync.o railfs-setattr.o railfs-statfs.o railfs-inode.o railfs-proto.o railfs-tcp.o railfs-rdma.o railfs-trace.o)
+set(RAILFS_OBJECTS railfs-main.o railfs-read.o railfs-write.o railfs-direct.o railfs-lookup.o railfs-create.o railfs-mkdir.o railfs-unlink.o railfs-rename.o railfs-symlink.o railfs-link.o railfs-readdir.o railfs-open.o railfs-fsync.o railfs-setattr.o railfs-statfs.o railfs-inode.o railfs-proto.o railfs-tcp.o railfs-rdma.o railfs-gds.o railfs-trace.o)
 
 set(RAILFS_SOURCES
     railfs-main.c
@@ -40,11 +40,14 @@ set(RAILFS_SOURCES
     railfs-proto.c
     railfs-tcp.c
     railfs-rdma.c
+    railfs-gds.c
     railfs-trace.c
     railfs-msg.h
     railfs-proto.h
     railfs-tcp.h
     railfs-rdma.h
+    railfs-gds.h
+    railfs-nvfs.h
     railfs-trace.h)
 
 # kbuild reads this from src=, so it has to sit beside the sources. Generated
