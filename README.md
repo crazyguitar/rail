@@ -9,3 +9,8 @@ Backends are `tcp` and `rdma`. `rdma` is one-sided: the receiver publishes
 where a page should land and the sender writes straight into it.
 
 For what it measures, see [docs/benchmark.md](docs/benchmark.md).
+
+## License
+
+Apache-2.0, except `src/linux`, which is GPL-2.0 because it is a Linux kernel
+module.
