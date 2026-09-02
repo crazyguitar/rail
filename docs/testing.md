@@ -22,6 +22,7 @@ tree at the same path. A peer that is behind fails as a refused connection.
 | `RAIL_FABRIC` | its address on the fast network, default `RAIL_PEER` |
 | `RAIL_DIR` | working directory on both sides, default `/tmp/rail-e2e` |
 | `RAIL_KERNEL_TESTS` | ask for the privileged suites; without it they are left out |
+| `RAIL_GDS_TESTS` | with the above, the GPUDirect Storage suite: needs a GPU, nvidia-fs and cuFile on this side, and an rdma peer |
 
 ## Root
 
