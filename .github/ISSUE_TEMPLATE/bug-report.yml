@@ -1,0 +1,37 @@
+name: 🐛 Bug report
+description: Report a problem with rail
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    attributes:
+      label: Environment
+      description: >
+        rail version and how it was installed (deb / source), OS and kernel on
+        both hosts, rdma-core version, the NIC, and which path you used:
+        the rail command, the kernel mount, FUSE, NFS or the CSI driver.
+      placeholder: |
+        rail 0.1.0 (rail_0.1.0-1_arm64.deb, railfs-dkms)
+        Ubuntu 24.04, kernel 6.8 on both hosts
+        rdma-core 50, ConnectX-7 (RoCE), backend rdma
+        mount -t railfs 10.0.0.2:models /mnt/models
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: What happened
+      description: >
+        What you expected against what you saw. Paste the daemon's stderr,
+        the client's error, and `dmesg` for the kernel mount.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: How to reproduce
+      description: The commands, including how the daemon was started and the file sizes involved.
+  - type: checkboxes
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
