@@ -10,9 +10,11 @@
 
 #include <algorithm>
 #include <array>
+#include <coroutine>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -134,6 +136,7 @@ bool namedSafely(const std::string &Name) { return !Name.empty() && Name != "." 
 class Handles {
 public:
   std::vector<std::byte> encode(const std::string &Path) {
+    const std::lock_guard<std::mutex> Held(Lock);
     std::vector<std::byte> H(kHandleSize, std::byte{0});
     if (Path.size() <= kInlineLimit) {
       H[0] = std::byte{1};
@@ -150,6 +153,7 @@ public:
   }
 
   std::optional<std::string> decode(std::span<const std::byte> H) const {
+    const std::lock_guard<std::mutex> Held(Lock);
     if (H.size() != kHandleSize) return std::nullopt;
 
     if (H[0] == std::byte{1}) {
@@ -165,8 +169,14 @@ public:
   }
 
 private:
+  mutable std::mutex Lock;
   std::unordered_map<std::string, std::string> Long;
 };
+
+Handles &sharedHandles() {
+  static Handles Only;
+  return Only;
+}
 
 void writeAttrs(XdrWriter &W, const proto::FileAttrs &A, const std::string &Path) {
   W.u32(A.Directory ? kTypeDirectory : kTypeRegular);
@@ -275,13 +285,55 @@ private:
   // One file's read window, and where that file was last read to: a detector
   // shared by the whole connection cannot tell two readers apart, since each
   // one's offsets break the other's run of sequential reads.
+  struct Buffer {
+    vfs::Window Have;
+    size_t Sending = 0;
+    std::deque<std::coroutine_handle<>> Idle;
+
+    void sent() {
+      if (--Sending > 0) return;
+      auto Woken = std::move(Idle);
+      Idle.clear();
+      for (auto H : Woken)
+        if (H && !H.done()) Loop::get().schedule(H);
+    }
+
+    void forget() {
+      Have.Bytes = 0;
+      Have.Path.clear();
+    }
+  };
+
+  struct Drained {
+    Buffer &B;
+    std::coroutine_handle<> Queued{};
+
+    bool await_ready() const noexcept { return B.Sending == 0; }
+    void await_suspend(std::coroutine_handle<> H) {
+      Queued = H;
+      B.Idle.push_back(H);
+    }
+    void await_resume() noexcept { Queued = {}; }
+    ~Drained() {
+      if (Queued) std::erase(B.Idle, Queued);
+    }
+  };
+
   struct Cached {
     std::string Path;
     uint64_t End = 0;
     uint64_t Used = 0;
     size_t Users = 0;
     vfs::Gate Filling;
-    vfs::Window Have;
+    std::unique_ptr<Buffer> Front = std::make_unique<Buffer>();
+    std::unique_ptr<Buffer> Back = std::make_unique<Buffer>();
+
+    vfs::Window &have() { return Front->Have; }
+
+    void forget() {
+      Front->forget();
+      Back->forget();
+    }
   };
 
   struct Hold {
@@ -941,28 +993,32 @@ private:
   Coro<Result<void>> onWindowedRead(Stream &Conn, const Call &C, Cached &Entry, const std::string &Path, uint64_t Offset, uint32_t Count) {
     const Hold Busy(Entry);
 
-    if (!Entry.Have.covers(Path, Offset, Count)) {
+    if (!Entry.have().covers(Path, Offset, Count)) {
       co_await Entry.Filling.take();
 
       Result<void> Filled{};
-      if (!Entry.Have.covers(Path, Offset, Count)) Filled = co_await fillWindow(Entry, Path, Offset);
+      if (!Entry.have().covers(Path, Offset, Count)) Filled = co_await fillWindow(Entry, Path, Offset);
 
       Entry.Filling.give();
       if (!Filled) co_return co_await replyBroken(Conn, C, 1, Filled.error());
     }
 
-    const uint64_t Into = Offset - Entry.Have.Start;
-    const size_t Mine = Into < Entry.Have.Bytes ? std::min<size_t>(Count, Entry.Have.Bytes - Into) : 0;
+    Buffer &From = *Entry.Front;
+    const uint64_t Into = Offset - From.Have.Start;
+    const size_t Mine = Into < From.Have.Bytes ? std::min<size_t>(Count, From.Have.Bytes - Into) : 0;
     Served += Mine;
 
     XdrWriter W;
     W.u32(kOk);
     writeNoAttrs(W);
     W.u32(static_cast<uint32_t>(Mine));
-    W.boolean(Offset + Mine >= Entry.Have.FileSize);
-    const std::byte *From = Entry.Have.bytes().data();
-    W.opaqueTail({Mine > 0 ? From + Into : From, Mine});
-    co_return co_await reply(Conn, C.Xid, W);
+    W.boolean(Offset + Mine >= From.Have.FileSize);
+    const std::byte *Bytes = From.Have.bytes().data();
+    W.opaqueTail({Mine > 0 ? Bytes + Into : Bytes, Mine});
+    From.Sending++;
+    auto Sent = co_await reply(Conn, C.Xid, W);
+    From.sent();
+    co_return Sent;
   }
 
   // Aligned to what one call can actually carry rather than to the readahead
@@ -975,18 +1031,23 @@ private:
     const uint64_t Room = std::min<uint64_t>(Opts.Remote.Readahead, Held->client().maxTransfer());
     const uint64_t Start = Room > 0 ? (Offset / Room) * Room : Offset;
 
-    Page *Landing = Entry.Have.page(Room);
-    auto Got = Landing ? co_await Held->client().read(Path, Start, *Landing) : co_await Held->client().read(Path, Start, Entry.Have.room(Room));
+    Buffer &Into = *Entry.Back;
+    while (Into.Sending > 0) co_await Drained{Into};
+    Into.forget();
+
+    Page *Landing = Into.Have.page(Room);
+    auto Got = Landing ? co_await Held->client().read(Path, Start, *Landing) : co_await Held->client().read(Path, Start, Into.Have.room(Room));
     if (!Got) {
       if (!Held->client().alive()) Held->discard();
       co_return std::unexpected(Got.error());
     }
 
     Fetched += Got->Bytes;
-    Entry.Have.Path = Path;
-    Entry.Have.Start = Start;
-    Entry.Have.FileSize = Got->FileSize;
-    Entry.Have.Bytes = Got->Bytes;
+    Into.Have.Path = Path;
+    Into.Have.Start = Start;
+    Into.Have.FileSize = Got->FileSize;
+    Into.Have.Bytes = Got->Bytes;
+    std::swap(Entry.Front, Entry.Back);
     co_return Result<void>{};
   }
 
@@ -1000,15 +1061,19 @@ private:
     if (!R.ok()) co_return co_await sendGated(Conn, C.Xid, AcceptStatus::GarbageArguments, {});
     if (!Path) co_return co_await replyStatus(Conn, C, kErrStale, 1);
 
-    auto Held = co_await Pool.take();
-    if (!Held) co_return co_await replyBroken(Conn, C, 1, Held.error());
+    if (Cookie == 0 || Listing.Path != *Path) {
+      auto Held = co_await Pool.take();
+      if (!Held) co_return co_await replyBroken(Conn, C, 1, Held.error());
 
-    auto Listed = co_await Held->client().list(*Path);
-    if (!Listed) co_return co_await replyBroken(Conn, C, 1, Listed.error(), *Held);
-    if (!Listed->Found) co_return co_await replyStatus(Conn, C, kErrNotDir, 1);
+      auto Listed = co_await Held->client().list(*Path);
+      if (!Listed) co_return co_await replyBroken(Conn, C, 1, Listed.error(), *Held);
+      if (!Listed->Found) co_return co_await replyStatus(Conn, C, kErrNotDir, 1);
 
-    std::vector<proto::ListEntry> Entries = std::move(Listed->Entries);
-    std::ranges::sort(Entries, [](const proto::ListEntry &A, const proto::ListEntry &B) { return A.Name < B.Name; });
+      Listing.Path = *Path;
+      Listing.Entries = std::move(Listed->Entries);
+      std::ranges::sort(Listing.Entries, [](const proto::ListEntry &A, const proto::ListEntry &B) { return A.Name < B.Name; });
+    }
+    const std::vector<proto::ListEntry> &Entries = Listing.Entries;
 
     XdrWriter W;
     W.u32(kOk);
@@ -1130,8 +1195,7 @@ private:
     for (auto &W : Windows) {
       if (W.Path != Path) continue;
       W.End = 0;
-      W.Have.Bytes = 0;
-      W.Have.Path.clear();
+      W.forget();
     }
   }
 
@@ -1153,14 +1217,19 @@ private:
       Cold->Path = Path;
       Cold->End = 0;
       Cold->Used = ++Ticks;
-      Cold->Have.Bytes = 0;
-      Cold->Have.Path.clear();
+      Cold->forget();
     }
     return Cold;
   }
 
   static constexpr size_t kMaxInFlight = 64;
   static constexpr size_t kWindows = 8;
+
+  struct SortedListing {
+    std::string Path;
+    std::vector<proto::ListEntry> Entries;
+  };
+  SortedListing Listing;
 
   bool Warmed = false;
 
@@ -1185,7 +1254,7 @@ Coro<Result<void>> serveExport(const ExportOptions &Opts) {
 
   constexpr size_t kMaxConnections = 8;
 
-  Handles Known;
+  Handles &Known = sharedHandles();
   struct Live {
     std::unique_ptr<Session> Owner;
     Coro<Result<void>> Task;

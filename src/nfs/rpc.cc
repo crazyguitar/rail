@@ -41,15 +41,23 @@ Coro<Result<void>> sendRecord(Stream &S, std::span<const std::byte> Header, cons
   Out.u32(static_cast<uint32_t>(Header.size() + Body.size()) | kLastFragment);
   Out.fixed(Header);
 
-  if (auto R = co_await S.writeAll(Out.bytes()); !R) co_return std::unexpected(R.error());
-  if (!Body.Body.empty())
-    if (auto R = co_await S.writeAll(Body.Body); !R) co_return std::unexpected(R.error());
-  if (!Body.Tail.empty())
-    if (auto R = co_await S.writeAll(Body.Tail); !R) co_return std::unexpected(R.error());
-  if (Body.Pad == 0) co_return Result<void>{};
-
   static constexpr std::byte Zero[XdrPayload::kMaxPad]{};
-  co_return co_await S.writeAll(std::span<const std::byte>(Zero, std::min(Body.Pad, XdrPayload::kMaxPad)));
+  const std::span<const std::byte> Pad(Zero, std::min(Body.Pad, XdrPayload::kMaxPad));
+
+  if (Body.Tail.empty()) {
+    if (auto R = co_await S.writeAll(Out.bytes(), Body.Body); !R) co_return std::unexpected(R.error());
+    if (Pad.empty()) co_return Result<void>{};
+    co_return co_await S.writeAll(Pad);
+  }
+
+  if (Body.Body.empty()) {
+    if (auto R = co_await S.writeAll(Out.bytes(), Body.Tail); !R) co_return std::unexpected(R.error());
+    if (Pad.empty()) co_return Result<void>{};
+    co_return co_await S.writeAll(Pad);
+  }
+
+  if (auto R = co_await S.writeAll(Out.bytes(), Body.Body); !R) co_return std::unexpected(R.error());
+  co_return co_await S.writeAll(Body.Tail, Pad);
 }
 
 } // namespace

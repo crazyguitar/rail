@@ -1,8 +1,8 @@
 #include "harness.h"
 
+#include "local-process.h"
 #include "rail/nfs/rpc.h"
 #include "rail/nfs/xdr.h"
-#include "local-process.h"
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -935,6 +935,28 @@ TEST_P(Nfs, StaleHandleIsRefused) {
 
   nfs::XdrReader Body(R->Body);
   EXPECT_EQ(Body.u32(), 70u) << "an unknown handle should be NFS3ERR_STALE";
+}
+
+TEST_P(Nfs, ALongPathsHandleResolvesOnEveryConnection) {
+  const std::string Long(70, 'n');
+  ASSERT_TRUE(peer().makeDirectory(Root + "/" + Long));
+
+  RpcProbe Minting;
+  ASSERT_TRUE(connectProbe(Minting));
+  const auto RootHandle = mountRoot(Minting);
+  ASSERT_EQ(RootHandle.size(), 64u);
+
+  uint32_t Status = 1;
+  const auto Handle = lookup(Minting, RootHandle, Long, Status);
+  ASSERT_EQ(Status, 0u);
+  ASSERT_EQ(Handle.size(), 64u);
+  ASSERT_EQ(Handle[0], std::byte{2}) << "a path this long should not fit inline";
+
+  for (int I = 0; I < 16; I++) {
+    RpcProbe Other;
+    ASSERT_TRUE(connectProbe(Other));
+    EXPECT_EQ(statusOfGetAttr(Other, Handle), 0u) << "connection " << I << " did not know the handle";
+  }
 }
 
 TEST_P(Nfs, TooLongNameIsRefused) {

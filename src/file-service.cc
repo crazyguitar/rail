@@ -5,6 +5,7 @@
 
 #include "rail/app/checksum.h"
 #include "rail/fs/safe-path.h"
+#include "rail/io/offload.h"
 #include "rail/io/stream.h"
 #include "rail/io/trace.h"
 #include "rail/io/uring.h"
@@ -54,6 +55,20 @@ proto::FileAttrs attrsOf(const std::filesystem::path &P, bool &Found) {
   A.Link = S_ISLNK(St.st_mode);
   A.Links = static_cast<uint32_t>(St.st_nlink);
   return A;
+}
+
+proto::ListReply listDirectory(const std::filesystem::path &Dir) {
+  proto::ListReply Listed;
+  std::error_code EC;
+  for (const auto &Entry : std::filesystem::directory_iterator(Dir, EC)) {
+    proto::ListEntry E;
+    E.Name = Entry.path().filename().string();
+    bool Found = false;
+    E.Attrs = attrsOf(Entry.path(), Found);
+    if (Found) Listed.Entries.push_back(std::move(E));
+  }
+  Listed.Found = !EC;
+  return Listed;
 }
 
 // One per daemon, not one per session. A mount spreads its operations over
@@ -366,15 +381,9 @@ public:
 
     auto Path = underRoot(Root, L.Path);
     if (Path) {
-      std::error_code EC;
-      for (const auto &Entry : std::filesystem::directory_iterator(*Path, EC)) {
-        proto::ListEntry E;
-        E.Name = Entry.path().filename().string();
-        bool Found = false;
-        E.Attrs = attrsOf(Entry.path(), Found);
-        if (Found) Reply.Entries.push_back(std::move(E));
-      }
-      Reply.Found = !EC;
+      auto Listed = co_await offLoop([Dir = *Path] { return listDirectory(Dir); });
+      Reply.Found = Listed.Found;
+      Reply.Entries = std::move(Listed.Entries);
     }
     co_return co_await Control.send(Reply);
   }
@@ -483,12 +492,8 @@ public:
       if (::utimensat(AT_FDCWD, Path.c_str(), Times, 0) != 0) return failErrno("utimensat");
       return {};
     }
-    case proto::MetaOp::Fsync: {
-      auto File = heldFor(Meta.Handle, Meta.Path, O_WRONLY);
-      if (!File) return std::unexpected(File.error());
-      if (::fsync((*File)->fd()) != 0) return failErrno("fsync");
-      return {};
-    }
+    case proto::MetaOp::Fsync:
+      return failMessage("fsync is answered before it reaches here");
     case proto::MetaOp::Symlink: {
       // The target is stored as the peer sent it and never resolved here: it is
       // read back on a machine where it may mean something quite different, and
@@ -521,6 +526,17 @@ public:
     Reply.Error = failErrno(What).error().message();
   }
 
+  static Coro<Result<void>> syncFile(int Fd) {
+    Uring::Fsync Op;
+    Op.Fd = Fd;
+    if (Uring::get().usable()) {
+      if (auto R = Uring::get().submit(Op); !R) co_return R;
+      co_return co_await Uring::get().await(Op);
+    }
+    if (::fsync(Fd) != 0) co_return failErrno("fsync");
+    co_return Result<void>{};
+  }
+
   Coro<Result<void>> onMeta(const proto::MetaRequest &Meta) {
     proto::MetaReply Reply;
     Reply.Id = Meta.Id;
@@ -542,6 +558,17 @@ public:
       }
       if (Linking) landed(Reply, ::link(Path->c_str(), Target->c_str()), "link");
       else landed(Reply, ::rename(Path->c_str(), Target->c_str()), "rename");
+      co_return co_await Control.send(Reply);
+    }
+
+    if (Meta.Op == proto::MetaOp::Fsync) {
+      auto File = heldFor(Meta.Handle, Meta.Path, O_WRONLY);
+      if (!File) {
+        refused(Reply, File.error());
+        co_return co_await Control.send(Reply);
+      }
+      if (auto R = co_await syncFile((*File)->fd()); !R) refused(Reply, R.error());
+      else Reply.Ok = true;
       co_return co_await Control.send(Reply);
     }
 

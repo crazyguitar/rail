@@ -45,6 +45,10 @@ public:
     int Fd = -1;
   };
 
+  struct Fsync : Completion {
+    int Fd = -1;
+  };
+
   bool usable() const { return EventFd >= 0; }
 
   // Operations the ring is sized for. Going far past this leaves the kernel
@@ -53,12 +57,15 @@ public:
 
   Result<void> submit(Write &W);
   Result<void> submit(Read &R);
+  Result<void> submit(Fsync &F);
 
   // Resumes when W has fully landed, resubmitting whatever a short write left.
   Coro<Result<void>> await(Write &W);
 
   // Resumes with the bytes read; short only at end of file.
   Coro<Result<size_t>> await(Read &R);
+
+  Coro<Result<void>> await(Fsync &F);
 
   // Takes every completion the ring has, for whoever submitted it, and wakes
   // the coroutines waiting on the ones it finished. Public because that second

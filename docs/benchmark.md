@@ -32,27 +32,38 @@ salloc -N2 make bench FILTER='BM_Read|BM_Write/'
 ```
 
 GiB/s between two hosts on the same RoCE fabric, median of seven repetitions
-with the standard deviation beside it. `q` streams, each moving a 1 GiB file of its own. Reads
-drop both page caches first; writes end in `fsync` at both ends.
+with the standard deviation beside it, `--cpus 8-15` and the daemon on the peer
+left unpinned. `q` streams, each moving a 1 GiB file of its own. Reads drop
+both page caches first; writes end in `fsync` at both ends.
 
 Read:
 
 | q | p2p | nvme | rail | nfs | fuse | railfs |
 | --- | --- | --- | --- | --- | --- | --- |
-| 4 | 20.91 ±0.28 | 9.71 ±0.23 | 7.99 ±1.33 | 4.80 ±0.12 | 8.36 ±0.16 | 9.49 ±0.07 |
-| 8 | 20.88 ±0.12 | 10.01 ±0.04 | 9.77 ±0.49 | 6.55 ±0.08 | 8.97 ±0.06 | 9.88 ±0.06 |
-| 16 | 20.98 ±0.06 | 9.93 ±0.03 | 9.16 ±0.37 | 8.39 ±0.12 | 8.76 ±0.98 | 9.55 ±0.06 |
+| 4 | 20.99 ±0.09 | 10.86 ±0.08 | 9.64 ±1.74 | 4.63 ±0.10 | 5.61 ±0.21 | 9.73 ±0.13 |
+| 8 | 21.05 ±0.12 | 10.94 ±0.03 | 9.25 ±0.73 | 6.41 ±0.82 | 8.86 ±0.28 | 10.07 ±0.05 |
+| 16 | 21.04 ±0.07 | 10.68 ±0.03 | 8.55 ±0.56 | 8.27 ±0.16 | 8.66 ±0.41 | 10.02 ±0.05 |
 
 Write:
 
 | q | p2p | nvme | rail | nfs | fuse | railfs |
 | --- | --- | --- | --- | --- | --- | --- |
-| 4 | 20.92 ±0.12 | 9.36 ±0.33 | 4.39 ±0.29 | 8.77 ±0.39 | 4.73 ±0.26 | 8.18 ±0.56 |
-| 8 | 21.07 ±0.13 | 10.38 ±0.12 | 8.29 ±0.31 | 8.62 ±0.41 | 6.14 ±0.08 | 9.17 ±0.44 |
-| 16 | 21.02 ±0.12 | 10.79 ±0.09 | 10.57 ±0.09 | 8.47 ±0.42 | 6.94 ±0.41 | 9.60 ±0.17 |
+| 4 | 21.03 ±0.10 | 9.93 ±0.16 | 4.70 ±0.24 | 8.15 ±1.24 | 4.41 ±0.13 | 8.66 ±0.49 |
+| 8 | 21.07 ±0.19 | 10.51 ±0.09 | 8.60 ±0.18 | 9.00 ±0.12 | 4.73 ±0.20 | 9.36 ±0.14 |
+| 16 | 21.09 ±0.04 | 10.79 ±0.09 | 10.73 ±0.08 | 9.43 ±0.09 | 5.05 ±0.33 | 9.85 ±0.08 |
 
 `p2p` opens no file and `nvme` is this machine's own disk, so a row near either
 is bound by the fabric or a drive rather than the filesystem above it.
+
+Two columns move more than their deviation says between runs on the same code.
+`rail` reads at `q=4` are bimodal, near 9.7 or near 7, depending on where the
+peer's daemon threads land. `fuse` writes vary with how far the peer's drive
+has recovered from the case before, by 20% from one pass to the next; a pass
+of that column on its own reads higher than a pass inside the whole table.
+
+`--daemon-cpus LIST` pins `raild` on the peer as well. It costs every write
+column 5 to 20%, because the daemon's io_uring workers inherit the mask, so it
+is off unless asked for.
 
 ## By thread count
 
