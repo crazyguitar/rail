@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+
+NAME=railfs
+VERSION=#VERSION#
+
+case "$1" in
+  configure)
+    dkms add -m "$NAME" -v "$VERSION" >/dev/null 2>&1 || true
+    if dkms build -m "$NAME" -v "$VERSION" && dkms install -m "$NAME" -v "$VERSION"; then
+      :
+    else
+      echo "railfs-dkms: the module was not built for $(uname -r); install linux-headers-$(uname -r) and run: dkms autoinstall" >&2
+    fi
+    ;;
+esac
+
+#DEBHELPER#

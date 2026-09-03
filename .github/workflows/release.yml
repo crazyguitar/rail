@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    env:
+      TAG_NAME: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches src/version.cc
+        run: |
+          set -eu
+          tag="${TAG_NAME#v}"
+          have="$(sed -n 's/.*return "\([0-9][^"]*\)".*/\1/p' src/version.cc)"
+          if [ "$tag" != "$have" ]; then
+            echo "tag $tag != version $have in src/version.cc" >&2
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            devscripts debhelper build-essential cmake ninja-build pkg-config git \
+            libfuse3-dev libibverbs-dev librdmacm-dev liburing-dev
+
+      - name: Stamp debian/changelog with the tag
+        env:
+          DEBEMAIL: spiderpower02@gmail.com
+          DEBFULLNAME: Chang Ning Tsai
+        run: |
+          set -eu
+          version="${TAG_NAME#v}"
+          rm -f debian/changelog
+          dch --create --package rail --newversion "${version}-1" --distribution unstable "Release ${version}."
+
+      - name: Build the packages
+        run: dpkg-buildpackage -us -uc -b
+
+      - name: Build the tarball
+        run: |
+          set -eu
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DRAIL_BUILD_TESTS=OFF -DRAIL_BUILD_BENCH=OFF -DRAILFS_KDIR=/nonexistent
+          cmake --build build --parallel
+          cmake --install build --prefix stage/usr
+          mkdir -p stage/usr/src/railfs
+          cp src/linux/*.c src/linux/*.h src/linux/Makefile src/linux/dkms.conf src/linux/LICENSE stage/usr/src/railfs/
+          tar czf "rail-${TAG_NAME}-${{ matrix.arch }}.tar.gz" -C stage .
+          mv ../*.deb .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rail-${{ matrix.arch }}
+          path: |
+            rail-*.tar.gz
+            *.deb
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rail-*.tar.gz
+            *.deb
+          generate_release_notes: true

@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential cmake ninja-build pkg-config git kmod \
+            libfuse3-dev libibverbs-dev librdmacm-dev liburing-dev libssh-dev \
+            "linux-headers-$(uname -r)"
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build everything, module included
+        run: cmake --build build --parallel
+
+      - name: Check the module
+        run: |
+          test -f build/src/linux/railfs.ko
+          modinfo build/src/linux/railfs.ko
+
+      - name: Tests that need no peer
+        env:
+          RAIL_MEMORY_REGIONS: 4
+        run: ./build/tests/e2e/rail-e2e --gtest_filter='Codec.*:SafePath.*:Loop.*:Uring.*:Xdr.*:Pages.*'
+
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            devscripts debhelper build-essential cmake ninja-build pkg-config git \
+            libfuse3-dev libibverbs-dev librdmacm-dev liburing-dev
+
+      - name: Build the packages
+        run: |
+          dpkg-buildpackage -us -uc -b
+          mv ../*.deb .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debs-ci
+          path: '*.deb'
+
+  csi:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: csi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: csi/go.mod
+      - run: go build ./...
+      - run: go vet ./...
