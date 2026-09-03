@@ -22,7 +22,8 @@ Result<std::filesystem::path> underRoot(const std::filesystem::path &Root, const
 
   const std::string RootText = RealRoot.generic_string();
   const std::string RealText = Real.generic_string();
-  if (RealText != RootText && !RealText.starts_with(RootText + "/")) return failMessage(std::format("refusing path outside the root: {}", Name));
+  const std::string Prefix = RootText.ends_with('/') ? RootText : RootText + "/";
+  if (RealText != RootText && !RealText.starts_with(Prefix)) return failMessage(std::format("refusing path outside the root: {}", Name));
 
   return Candidate;
 }

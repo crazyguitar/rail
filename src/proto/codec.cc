@@ -415,8 +415,9 @@ Result<Message> decode(Type T, std::span<const std::byte> Payload) {
     V.Id = R.u64();
     V.Found = R.u8() != 0;
     const uint32_t Count = R.u32();
+    if (!R.ok() || Count > R.remaining()) return failMessage("list reply length out of range");
     V.Entries.reserve(Count);
-    for (uint32_t I = 0; I < Count; I++) {
+    for (uint32_t I = 0; I < Count && R.ok(); I++) {
       ListEntry E;
       E.Name = R.str();
       E.Attrs = readAttrs(R);

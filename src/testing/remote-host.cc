@@ -315,6 +315,7 @@ Result<RemoteProcess> RemoteHost::run(const std::vector<std::string> &Argv, cons
   auto Channel = std::make_unique<RemoteProcess::Impl>();
   Channel->Channel = ssh_channel_new(P->Session);
   if (!Channel->Channel) return failMessage("ssh_channel_new: " + P->lastError());
+  Channel->Session = P->Epoch;
   if (ssh_channel_open_session(Channel->Channel) != SSH_OK) return failMessage("ssh_channel_open_session: " + P->lastError());
 
   std::string Command;
@@ -323,7 +324,6 @@ Result<RemoteProcess> RemoteHost::run(const std::vector<std::string> &Argv, cons
 
   if (ssh_channel_request_exec(Channel->Channel, Command.c_str()) != SSH_OK) return failMessage("ssh_channel_request_exec: " + P->lastError());
 
-  Channel->Session = P->Epoch;
   return RemoteProcess(std::move(Channel));
 }
 

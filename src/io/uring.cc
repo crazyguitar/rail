@@ -87,6 +87,29 @@ Result<void> Uring::post(Read &R) {
   return {};
 }
 
+Result<void> Uring::submit(Fsync &F) {
+  if (!usable()) return failMessage("io_uring is unavailable");
+
+  io_uring_sqe *Sqe = io_uring_get_sqe(Ring);
+  if (!Sqe) return failMessage("io_uring submission queue is full");
+
+  io_uring_prep_fsync(Sqe, F.Fd, 0);
+  io_uring_sqe_set_data(Sqe, static_cast<Completion *>(&F));
+
+  F.Done = false;
+  if (io_uring_submit(Ring) < 0) return failMessage("io_uring_submit failed");
+  return {};
+}
+
+Coro<Result<void>> Uring::await(Fsync &F) {
+  while (!F.Done) {
+    co_await WaitFor{EventFd, EPOLLIN, kCompletionTick};
+    reap();
+  }
+  if (F.Result < 0) co_return fail(std::error_code(-F.Result, std::generic_category()), "io_uring fsync");
+  co_return Result<void>{};
+}
+
 Result<void> Uring::submit(Read &R) {
   if (!usable()) return failMessage("io_uring is unavailable");
   if (R.Dst.size() > std::numeric_limits<unsigned>::max()) return failMessage("read is too large for one io_uring submission");

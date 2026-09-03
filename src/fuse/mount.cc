@@ -570,7 +570,10 @@ Coro<Result<void>> flushPending(Mount &M, File &F) {
   F.Flushing = false;
   shard(M).Written[F.Path]++;
   F.Writing.give();
-  if (!Done) co_return std::unexpected(Done.error());
+  if (!Done) {
+    F.WriteFailed = true;
+    co_return std::unexpected(Done.error());
+  }
   co_return Result<void>{};
 }
 
@@ -1281,9 +1284,13 @@ Coro<void> doHardLink(Mount &M, ::fuse_req_t Req, ::fuse_ino_t Ino, ::fuse_ino_t
   }
 
   auto Info = co_await Held->client().stat(Second);
-  if (!Info || !Info->Found) {
+  if (!Info) {
     Held->discard();
-    ::fuse_reply_err(Req, Info ? ENOENT : errnoOf(Info.error()));
+    ::fuse_reply_err(Req, errnoOf(Info.error()));
+    co_return;
+  }
+  if (!Info->Found) {
+    ::fuse_reply_err(Req, ENOENT);
     co_return;
   }
 

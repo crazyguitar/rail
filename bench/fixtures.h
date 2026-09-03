@@ -127,7 +127,9 @@ private:
   }
 
   bool startDaemon() {
-    return onPeer("cd / && setsid " + toolPath("raild") + " --serve " + exportDir() + " --port " + std::to_string(kServicePort) +
+    const std::string Cpus = envOr("RAIL_DAEMON_CPUS", "");
+    const std::string Pin = Cpus.empty() ? "" : "taskset -c " + Cpus + " ";
+    return onPeer("cd / && setsid " + Pin + toolPath("raild") + " --serve " + exportDir() + " --port " + std::to_string(kServicePort) +
                   " --backend rdma --threads " + envOr("RAIL_DAEMON_THREADS", "8") + " > /tmp/raild-bench.log 2>&1 < /dev/null &");
   }
 

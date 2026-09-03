@@ -1,10 +1,14 @@
 #include "rail/io/loop.h"
+#include "rail/io/offload.h"
+#include "rail/io/runner.h"
 #include "rail/io/stream.h"
 
 #include <gtest/gtest.h>
 
 #include <csignal>
+#include <stdexcept>
 #include <sys/socket.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -39,7 +43,45 @@ Coro<void> giveUp(int Silent, Stream &Peer) {
   Peer.close();
 }
 
+struct Never {
+  bool await_ready() const noexcept { return false; }
+  void await_suspend(std::coroutine_handle<>) const noexcept {}
+  void await_resume() const noexcept {}
+};
+
+Coro<int> parkedForever() {
+  co_await Never{};
+  co_return 1;
+}
+
 } // namespace
+
+TEST(Loop, RunRefusesToReturnAnUnfinishedResult) {
+  bool Threw = false;
+  bool Returned = false;
+  std::thread([&] {
+    try {
+      run(parkedForever());
+      Returned = true;
+    } catch (const std::runtime_error &) {
+      Threw = true;
+    }
+  }).join();
+
+  EXPECT_TRUE(Threw);
+  EXPECT_FALSE(Returned) << "run() returned a value the coroutine never produced";
+}
+
+TEST(Loop, OffLoopWorkComesBackToTheLoop) {
+  const auto Loop = std::this_thread::get_id();
+  std::thread::id Ran;
+  const int Got = run(offLoop([&] {
+    Ran = std::this_thread::get_id();
+    return 42;
+  }));
+  EXPECT_EQ(Got, 42);
+  EXPECT_NE(Ran, Loop) << "the work ran on the loop thread";
+}
 
 // A connection is read by one coroutine and written by another. Registering the
 // descriptor for only the newest waiter left the write asleep until the peer
