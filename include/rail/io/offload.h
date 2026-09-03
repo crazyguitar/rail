@@ -26,10 +26,10 @@ template <class Fn> Coro<std::invoke_result_t<Fn>> offLoop(Fn Work) {
     }
   };
 
+  std::optional<std::invoke_result_t<Fn>> Out;
   Worker W{{}, ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)};
   if (W.Done < 0) co_return Work();
 
-  std::optional<std::invoke_result_t<Fn>> Out;
   W.Thread = std::thread([&] {
     Out.emplace(Work());
     const uint64_t One = 1;

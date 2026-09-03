@@ -62,14 +62,14 @@ func requireHostAndExport(attrs map[string]string) error {
 
 func refuseCommas(attrs map[string]string) error {
 	for key, value := range attrs {
-		if carried(key) && strings.Contains(value, ",") {
+		if isMountOption(key) && strings.Contains(value, ",") {
 			return fmt.Errorf("%s contains a comma, which would split the mount options", key)
 		}
 	}
 	return nil
 }
 
-func carried(key string) bool {
+func isMountOption(key string) bool {
 	return key == "host" || key == "export" || valuedKeys[key] || flagKeys[key]
 }
 

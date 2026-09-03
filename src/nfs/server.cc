@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <coroutine>
 #include <cstdint>
 #include <cstdio>
@@ -20,6 +21,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <sys/eventfd.h>
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
@@ -328,7 +330,7 @@ private:
     std::unique_ptr<Buffer> Front = std::make_unique<Buffer>();
     std::unique_ptr<Buffer> Back = std::make_unique<Buffer>();
 
-    vfs::Window &have() { return Front->Have; }
+    vfs::Window &window() { return Front->Have; }
 
     void forget() {
       Front->forget();
@@ -993,11 +995,11 @@ private:
   Coro<Result<void>> onWindowedRead(Stream &Conn, const Call &C, Cached &Entry, const std::string &Path, uint64_t Offset, uint32_t Count) {
     const Hold Busy(Entry);
 
-    if (!Entry.have().covers(Path, Offset, Count)) {
+    if (!Entry.window().covers(Path, Offset, Count)) {
       co_await Entry.Filling.take();
 
       Result<void> Filled{};
-      if (!Entry.have().covers(Path, Offset, Count)) Filled = co_await fillWindow(Entry, Path, Offset);
+      if (!Entry.window().covers(Path, Offset, Count)) Filled = co_await fillWindow(Entry, Path, Offset);
 
       Entry.Filling.give();
       if (!Filled) co_return co_await replyBroken(Conn, C, 1, Filled.error());
@@ -1248,45 +1250,135 @@ private:
 
 } // namespace
 
-Coro<Result<void>> serveExport(const ExportOptions &Opts) {
-  auto Listener = Stream::listenOn(Opts.Port, true, Opts.Threads > 1);
+namespace {
+
+constexpr size_t kMaxConnections = 8;
+
+struct Live {
+  std::unique_ptr<Session> Owner;
+  Coro<Result<void>> Task;
+};
+
+void reapFinished(std::vector<Live> &Running) {
+  for (size_t I = Running.size(); I-- > 0;)
+    if (Running[I].Task.done()) {
+      if (auto R = Running[I].Task.result(); !R) std::fprintf(stderr, "railnfs: %s\n", R.error().message().c_str());
+      Running.erase(Running.begin() + static_cast<long>(I));
+    }
+}
+
+void startSession(const ExportOptions &Opts, std::vector<Live> &Running, Stream Conn) {
+  if (Running.size() >= kMaxConnections) {
+    std::fprintf(stderr, "railnfs: refusing a client, %zu connections already open\n", Running.size());
+    return;
+  }
+
+  Live Slot;
+  Slot.Owner = std::make_unique<Session>(Opts, sharedHandles());
+  Slot.Task = Slot.Owner->serveAndClose(std::move(Conn));
+  Slot.Task.start();
+  Running.push_back(std::move(Slot));
+}
+
+class Inbox {
+public:
+  Inbox() : Wake(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)) {}
+  Inbox(const Inbox &) = delete;
+  Inbox &operator=(const Inbox &) = delete;
+  ~Inbox() {
+    if (Wake >= 0) ::close(Wake);
+  }
+
+  bool usable() const { return Wake >= 0; }
+  int wakeFd() const { return Wake; }
+  bool stopped() const { return Stopping.load(); }
+
+  void post(Stream Conn) {
+    {
+      const std::lock_guard<std::mutex> Held(Lock);
+      Handed.push_back(std::move(Conn));
+    }
+    ring();
+  }
+
+  void stop() {
+    Stopping.store(true);
+    ring();
+  }
+
+  std::deque<Stream> take() {
+    const std::lock_guard<std::mutex> Held(Lock);
+    return std::exchange(Handed, {});
+  }
+
+  Coro<void> wakeup() {
+    co_await WaitFor{Wake, EPOLLIN};
+    uint64_t Ticks = 0;
+    [[maybe_unused]] auto Got = ::read(Wake, &Ticks, sizeof(Ticks));
+  }
+
+private:
+  void ring() {
+    const uint64_t One = 1;
+    [[maybe_unused]] auto Wrote = ::write(Wake, &One, sizeof(One));
+  }
+
+  int Wake;
+  std::atomic<bool> Stopping{false};
+  std::mutex Lock;
+  std::deque<Stream> Handed;
+};
+
+struct Attending {
+  Inbox &In;
+
+  explicit Attending(Inbox &In) : In(In) {}
+  Attending(const Attending &) = delete;
+  Attending &operator=(const Attending &) = delete;
+  ~Attending() { Loop::get().forget(In.wakeFd()); }
+};
+
+Coro<Result<void>> serveInbox(const ExportOptions &Opts, Inbox &In) {
+  const Attending Mine(In);
+  std::vector<Live> Running;
+  for (;;) {
+    co_await In.wakeup();
+    if (In.stopped()) co_return Result<void>{};
+    reapFinished(Running);
+    for (auto &Conn : In.take()) startSession(Opts, Running, std::move(Conn));
+  }
+}
+
+Coro<Result<void>> acceptInTurn(const ExportOptions &Opts, std::vector<std::unique_ptr<Inbox>> &Boxes) {
+  auto Listener = Stream::listenOn(Opts.Port, true);
   if (!Listener) co_return std::unexpected(Listener.error());
 
-  constexpr size_t kMaxConnections = 8;
-
-  Handles &Known = sharedHandles();
-  struct Live {
-    std::unique_ptr<Session> Owner;
-    Coro<Result<void>> Task;
-  };
-  std::vector<Live> Running;
-
-  for (;;) {
-    for (size_t I = Running.size(); I-- > 0;)
-      if (Running[I].Task.done()) {
-        if (auto R = Running[I].Task.result(); !R) std::fprintf(stderr, "railnfs: %s\n", R.error().message().c_str());
-        Running.erase(Running.begin() + static_cast<long>(I));
-      }
-
+  for (size_t Next = 0;; Next = (Next + 1) % Boxes.size()) {
     auto Conn = co_await Listener->accept();
     if (!Conn) co_return std::unexpected(Conn.error());
+    Boxes[Next]->post(std::move(*Conn));
+  }
+}
 
-    if (Running.size() >= kMaxConnections) {
-      std::fprintf(stderr, "railnfs: refusing a client, %zu connections already open\n", Running.size());
-      continue;
-    }
+} // namespace
 
-    Live Slot;
-    Slot.Owner = std::make_unique<Session>(Opts, Known);
-    Slot.Task = Slot.Owner->serveAndClose(std::move(*Conn));
-    Slot.Task.start();
-    Running.push_back(std::move(Slot));
+Coro<Result<void>> serveExport(const ExportOptions &Opts) {
+  auto Listener = Stream::listenOn(Opts.Port, true);
+  if (!Listener) co_return std::unexpected(Listener.error());
+
+  std::vector<Live> Running;
+  for (;;) {
+    reapFinished(Running);
+    auto Conn = co_await Listener->accept();
+    if (!Conn) co_return std::unexpected(Conn.error());
+    startSession(Opts, Running, std::move(*Conn));
   }
 }
 
 // One loop per thread: Loop::get() is thread_local and a Session belongs to
-// the thread that accepted it, so the threads share nothing but the listening
-// port and the handle table.
+// the thread it was handed to, so the threads share nothing but the handle
+// table. Connections go round in turn rather than through SO_REUSEPORT, whose
+// hash put five of a mount's eight connections on one thread and none on four.
 Result<void> serveExportThreaded(const ExportOptions &Opts) {
   const size_t Wanted = std::max<size_t>(1, Opts.Threads);
 
@@ -1294,30 +1386,24 @@ Result<void> serveExportThreaded(const ExportOptions &Opts) {
     return run(serveExport(Opts));
   }
 
-  std::mutex Telling;
-  Result<void> First{};
-  std::vector<std::thread> Answering;
-
+  std::vector<std::unique_ptr<Inbox>> Boxes;
   for (size_t I = 0; I < Wanted; I++) {
-    Answering.emplace_back([&] {
-      auto Outcome = run(serveExport(Opts));
-      if (Outcome) {
-        return;
-      }
+    Boxes.push_back(std::make_unique<Inbox>());
+    if (!Boxes.back()->usable()) return failErrno("eventfd");
+  }
 
-      std::fprintf(stderr, "mount.railnfs: a serving thread stopped: %s\n", Outcome.error().message().c_str());
-
-      const std::lock_guard<std::mutex> Held(Telling);
-      if (First) {
-        First = std::unexpected(Outcome.error());
-      }
+  std::vector<std::thread> Answering;
+  for (size_t I = 0; I < Wanted; I++) {
+    Answering.emplace_back([&Opts, &In = *Boxes[I]] {
+      if (auto Outcome = runToResult(serveInbox(Opts, In)); !Outcome)
+        std::fprintf(stderr, "mount.railnfs: a serving thread stopped: %s\n", Outcome.error().message().c_str());
     });
   }
 
-  for (auto &One : Answering) {
-    One.join();
-  }
-  return First;
+  auto Outcome = run(acceptInTurn(Opts, Boxes));
+  for (auto &Box : Boxes) Box->stop();
+  for (auto &One : Answering) One.join();
+  return Outcome;
 }
 
 } // namespace rail::nfs

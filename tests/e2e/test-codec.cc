@@ -32,6 +32,12 @@ TEST(Codec, AListReplyClaimingMoreEntriesThanItCarriesIsRefusedAtOnce) {
   EXPECT_LT(Took, 100) << "refusing the count took " << Took << " ms";
 }
 
+TEST(Codec, AListReplyClaimingMoreEntriesThanItsBytesCanHoldIsRefused) {
+  auto Payload = listReplyClaiming(1000);
+  Payload.resize(Payload.size() + 1000, std::byte{0});
+  EXPECT_FALSE(proto::decode(proto::Type::ListReply, Payload).has_value());
+}
+
 TEST(Codec, AListReplyRoundTrips) {
   proto::ListReply Reply;
   Reply.Id = 3;

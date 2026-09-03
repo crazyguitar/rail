@@ -121,6 +121,9 @@ void writeAttrs(Writer &W, const FileAttrs &A) {
   W.u32(A.Links);
 }
 
+constexpr size_t kAttrsBytes = 26;
+constexpr size_t kListEntryFloor = 4 + kAttrsBytes;
+
 FileAttrs readAttrs(Reader &R) {
   FileAttrs A;
   A.Size = R.u64();
@@ -415,7 +418,7 @@ Result<Message> decode(Type T, std::span<const std::byte> Payload) {
     V.Id = R.u64();
     V.Found = R.u8() != 0;
     const uint32_t Count = R.u32();
-    if (!R.ok() || Count > R.remaining()) return failMessage("list reply length out of range");
+    if (!R.ok() || static_cast<uint64_t>(Count) * kListEntryFloor > R.remaining()) return failMessage("list reply length out of range");
     V.Entries.reserve(Count);
     for (uint32_t I = 0; I < Count && R.ok(); I++) {
       ListEntry E;

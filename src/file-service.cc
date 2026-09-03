@@ -816,8 +816,8 @@ public:
     // flush - and that costs it 6.0 GiB/s against 10.8 with sixteen writers.
     // The cache of descriptors is keyed by flags, so this is its own entry and
     // readers keep the buffered one they had.
-    const bool Aligned = Wr.Offset % kDirectAlignment == 0 && Wr.Length % kDirectAlignment == 0 &&
-                         reinterpret_cast<uintptr_t>(Buf.bytes()) % kDirectAlignment == 0;
+    const bool Aligned =
+        Wr.Offset % kDirectAlignment == 0 && Wr.Length % kDirectAlignment == 0 && reinterpret_cast<uintptr_t>(Buf.bytes()) % kDirectAlignment == 0;
 
     auto File = heldFor(Wr.Handle, Wr.Path, O_WRONLY | O_CREAT | (Aligned ? O_DIRECT : 0));
     if (!File) {
@@ -1018,7 +1018,7 @@ Result<void> serveFilesThreaded(const std::filesystem::path &Root, const Service
 
   for (size_t I = 0; I < Wanted; I++)
     Answering.emplace_back([&] {
-      auto Outcome = run(serveFiles(Root, Opts));
+      auto Outcome = runToResult(serveFiles(Root, Opts));
       if (Outcome) return;
 
       // Said now rather than at the join: the healthy threads serve forever,
