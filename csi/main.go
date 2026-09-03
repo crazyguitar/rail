@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/url"
@@ -14,47 +15,83 @@ import (
 	"google.golang.org/grpc"
 )
 
+type driverConfig struct {
+	endpoint   string
+	nodeID     string
+	driverName string
+}
+
 func main() {
-	endpoint := flag.String("endpoint", "unix:///csi/csi.sock", "CSI endpoint")
-	nodeID := flag.String("nodeid", "", "name of the node this instance runs on")
-	name := flag.String("drivername", "railfs.csi.rail.io", "registered driver name")
+	config := parseFlags()
+
+	socket, err := unixSocketPath(config.endpoint)
+	if err != nil {
+		log.Fatalf("railfs-csi: %v", err)
+	}
+
+	listener, err := listenFresh(socket)
+	if err != nil {
+		log.Fatalf("railfs-csi: %v", err)
+	}
+
+	server := newDriverServer(config)
+	stopOnSignal(server)
+
+	log.Printf("railfs-csi: %s on %s, node %s", config.driverName, socket, config.nodeID)
+	if err := server.Serve(listener); err != nil {
+		log.Fatalf("railfs-csi: serve: %v", err)
+	}
+}
+
+func parseFlags() driverConfig {
+	var config driverConfig
+	flag.StringVar(&config.endpoint, "endpoint", "unix:///csi/csi.sock", "CSI endpoint")
+	flag.StringVar(&config.nodeID, "nodeid", "", "name of the node this instance runs on")
+	flag.StringVar(&config.driverName, "drivername", "railfs.csi.rail.io", "registered driver name")
 	flag.Parse()
 
-	if *nodeID == "" {
+	if config.nodeID == "" {
 		log.Fatal("railfs-csi: -nodeid is required")
 	}
+	return config
+}
 
-	u, err := url.Parse(*endpoint)
+func unixSocketPath(endpoint string) (string, error) {
+	parsed, err := url.Parse(endpoint)
 	if err != nil {
-		log.Fatalf("railfs-csi: endpoint %s: %v", *endpoint, err)
+		return "", fmt.Errorf("endpoint %s: %w", endpoint, err)
 	}
-	if u.Scheme != "unix" {
-		log.Fatalf("railfs-csi: endpoint %s: only unix sockets are served", *endpoint)
+	if parsed.Scheme != "unix" {
+		return "", fmt.Errorf("endpoint %s: only unix sockets are served", endpoint)
 	}
-	if err := os.Remove(u.Path); err != nil && !os.IsNotExist(err) {
-		log.Fatalf("railfs-csi: stale socket %s: %v", u.Path, err)
-	}
+	return parsed.Path, nil
+}
 
-	listener, err := net.Listen("unix", u.Path)
+func listenFresh(socket string) (net.Listener, error) {
+	if err := os.Remove(socket); err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("stale socket %s: %w", socket, err)
+	}
+	listener, err := net.Listen("unix", socket)
 	if err != nil {
-		log.Fatalf("railfs-csi: listen %s: %v", u.Path, err)
+		return nil, fmt.Errorf("listen %s: %w", socket, err)
 	}
+	return listener, nil
+}
 
+func newDriverServer(config driverConfig) *grpc.Server {
 	server := grpc.NewServer(grpc.UnaryInterceptor(logFailures))
-	csi.RegisterIdentityServer(server, &identity{name: *name})
-	csi.RegisterNodeServer(server, &node{id: *nodeID})
+	csi.RegisterIdentityServer(server, &identity{name: config.driverName})
+	csi.RegisterNodeServer(server, &node{id: config.nodeID})
+	return server
+}
 
+func stopOnSignal(server *grpc.Server) {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-stop
 		server.GracefulStop()
 	}()
-
-	log.Printf("railfs-csi: %s on %s, node %s", *name, u.Path, *nodeID)
-	if err := server.Serve(listener); err != nil {
-		log.Fatalf("railfs-csi: serve: %v", err)
-	}
 }
 
 func logFailures(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {

@@ -18,7 +18,7 @@ type node struct {
 	id string
 }
 
-var valued = map[string]bool{
+var valuedKeys = map[string]bool{
 	"port":        true,
 	"conns":       true,
 	"fetch":       true,
@@ -31,51 +31,68 @@ var valued = map[string]bool{
 	"flush_limit": true,
 }
 
-var bare = map[string]bool{
+var flagKeys = map[string]bool{
 	"rdma":     true,
 	"noverify": true,
 }
 
 func mountOptions(attrs map[string]string, capability *csi.VolumeCapability, readOnly bool) (string, error) {
-	if attrs["host"] == "" || attrs["export"] == "" {
-		return "", fmt.Errorf("volume needs both host and export attributes")
+	if err := requireHostAndExport(attrs); err != nil {
+		return "", err
 	}
-
-	for k, v := range attrs {
-		if k == "host" || k == "export" || valued[k] || bare[k] {
-			if strings.Contains(v, ",") {
-				return "", fmt.Errorf("%s contains a comma, which would split the mount options", k)
-			}
-		}
+	if err := refuseCommas(attrs); err != nil {
+		return "", err
 	}
 
 	opts := []string{"host=" + attrs["host"], "export=" + attrs["export"]}
-
-	keys := make([]string, 0, len(attrs))
-	for k := range attrs {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	for _, k := range keys {
-		switch {
-		case valued[k]:
-			opts = append(opts, k+"="+attrs[k])
-		case bare[k]:
-			if attrs[k] != "false" {
-				opts = append(opts, k)
-			}
-		}
-	}
-
-	if mount := capability.GetMount(); mount != nil {
-		opts = append(opts, mount.GetMountFlags()...)
-	}
+	opts = append(opts, tuningOptions(attrs)...)
+	opts = append(opts, capability.GetMount().GetMountFlags()...)
 	if readOnly {
 		opts = append(opts, "ro")
 	}
-
 	return strings.Join(opts, ","), nil
+}
+
+func requireHostAndExport(attrs map[string]string) error {
+	if attrs["host"] == "" || attrs["export"] == "" {
+		return fmt.Errorf("volume needs both host and export attributes")
+	}
+	return nil
+}
+
+func refuseCommas(attrs map[string]string) error {
+	for key, value := range attrs {
+		if carried(key) && strings.Contains(value, ",") {
+			return fmt.Errorf("%s contains a comma, which would split the mount options", key)
+		}
+	}
+	return nil
+}
+
+func carried(key string) bool {
+	return key == "host" || key == "export" || valuedKeys[key] || flagKeys[key]
+}
+
+func tuningOptions(attrs map[string]string) []string {
+	var opts []string
+	for _, key := range sortedKeys(attrs) {
+		switch {
+		case valuedKeys[key]:
+			opts = append(opts, key+"="+attrs[key])
+		case flagKeys[key] && attrs[key] != "false":
+			opts = append(opts, key)
+		}
+	}
+	return opts
+}
+
+func sortedKeys(attrs map[string]string) []string {
+	keys := make([]string, 0, len(attrs))
+	for key := range attrs {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // --mountpoint and not --target: the two are mutually exclusive, and only the
@@ -117,12 +134,11 @@ func (*node) NodeGetCapabilities(context.Context, *csi.NodeGetCapabilitiesReques
 }
 
 func (*node) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
-	target := req.GetTargetPath()
-	if target == "" {
-		return nil, status.Error(codes.InvalidArgument, "no target path")
+	target, err := targetPathOf(req.GetTargetPath())
+	if err != nil {
+		return nil, err
 	}
-
-	if capability := req.GetVolumeCapability(); capability.GetBlock() != nil {
+	if req.GetVolumeCapability().GetBlock() != nil {
 		return nil, status.Error(codes.InvalidArgument, "railfs serves a filesystem, not a block device")
 	}
 
@@ -131,44 +147,68 @@ func (*node) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRe
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	// Already mounted is only success when it is this volume. A target left by
-	// another one would otherwise be reported as published and never checked.
-	if options, ok := mountedOptions(target); ok {
-		if !serves(options, req.GetVolumeContext()) {
-			return nil, status.Errorf(codes.FailedPrecondition, "%s already holds another mount: %s", target, options)
-		}
-
-		return &csi.NodePublishVolumeResponse{}, nil
+	published, err := publishedAlready(target, req.GetVolumeContext())
+	if err != nil || published {
+		return &csi.NodePublishVolumeResponse{}, err
 	}
 
-	if err := os.MkdirAll(target, 0o750); err != nil {
-		return nil, status.Errorf(codes.Internal, "mkdir %s: %v", target, err)
+	if err := mountRailfs(ctx, opts, target); err != nil {
+		return nil, err
 	}
-
-	out, err := exec.CommandContext(ctx, "mount", "-i", "-t", "railfs", "-o", opts, "none", target).CombinedOutput()
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "mount -o %s %s: %v: %s", opts, target, err, strings.TrimSpace(string(out)))
-	}
-
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
 func (*node) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
-	target := req.GetTargetPath()
-	if target == "" {
-		return nil, status.Error(codes.InvalidArgument, "no target path")
+	target, err := targetPathOf(req.GetTargetPath())
+	if err != nil {
+		return nil, err
 	}
 
-	if _, ok := mountedOptions(target); ok {
-		out, err := exec.CommandContext(ctx, "umount", target).CombinedOutput()
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "umount %s: %v: %s", target, err, strings.TrimSpace(string(out)))
+	if _, mounted := mountedOptions(target); mounted {
+		if err := unmount(ctx, target); err != nil {
+			return nil, err
 		}
 	}
 
 	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
 		return nil, status.Errorf(codes.Internal, "remove %s: %v", target, err)
 	}
-
 	return &csi.NodeUnpublishVolumeResponse{}, nil
+}
+
+func targetPathOf(target string) (string, error) {
+	if target == "" {
+		return "", status.Error(codes.InvalidArgument, "no target path")
+	}
+	return target, nil
+}
+
+func publishedAlready(target string, attrs map[string]string) (bool, error) {
+	options, mounted := mountedOptions(target)
+	if !mounted {
+		return false, nil
+	}
+	if !serves(options, attrs) {
+		return false, status.Errorf(codes.FailedPrecondition, "%s already holds another mount: %s", target, options)
+	}
+	return true, nil
+}
+
+func mountRailfs(ctx context.Context, opts, target string) error {
+	if err := os.MkdirAll(target, 0o750); err != nil {
+		return status.Errorf(codes.Internal, "mkdir %s: %v", target, err)
+	}
+	out, err := exec.CommandContext(ctx, "mount", "-i", "-t", "railfs", "-o", opts, "none", target).CombinedOutput()
+	if err != nil {
+		return status.Errorf(codes.Internal, "mount -o %s %s: %v: %s", opts, target, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func unmount(ctx context.Context, target string) error {
+	out, err := exec.CommandContext(ctx, "umount", target).CombinedOutput()
+	if err != nil {
+		return status.Errorf(codes.Internal, "umount %s: %v: %s", target, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
