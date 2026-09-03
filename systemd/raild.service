@@ -1,0 +1,16 @@
+[Unit]
+Description=rail file service
+Documentation=https://github.com/crazyguitar/rail
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/default/raild
+ExecStart=/usr/bin/raild --serve ${RAIL_EXPORT} --port ${RAIL_PORT} --backend ${RAIL_BACKEND} $RAIL_OPTIONS
+Restart=on-failure
+RestartSec=2
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

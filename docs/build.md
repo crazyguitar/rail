@@ -38,3 +38,10 @@ sudo apt install ./rail_0.1.0-1_arm64.deb ./railfs-dkms_0.1.0-1_all.deb
 holds the module source and DKMS builds it for the running kernel, and again
 after a kernel upgrade; it needs `linux-headers-$(uname -r)`. Locally,
 `dpkg-buildpackage -us -uc -b` produces the same packages.
+
+The `rail` package ships a `raild` unit, installed but not enabled. Set the
+export in `/etc/default/raild`, then:
+
+```bash
+sudo systemctl enable --now raild
+```

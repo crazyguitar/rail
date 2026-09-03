@@ -14,6 +14,8 @@ override_dh_auto_configure:
 
 override_dh_auto_install:
 	dh_auto_install --destdir=debian/rail
+	install -D -m 0644 systemd/raild.service debian/rail/usr/lib/systemd/system/raild.service
+	install -D -m 0644 systemd/raild.default debian/rail/etc/default/raild
 	install -d $(DKMS_SRC)
 	install -m 0644 src/linux/*.c src/linux/*.h src/linux/Makefile src/linux/LICENSE $(DKMS_SRC)/
 	sed 's/#VERSION#/$(DEB_VERSION_UPSTREAM)/' src/linux/dkms.conf > $(DKMS_SRC)/dkms.conf
@@ -22,6 +24,9 @@ override_dh_installdeb:
 	sed 's/#VERSION#/$(DEB_VERSION_UPSTREAM)/' debian/railfs-dkms.postinst.in > debian/railfs-dkms.postinst
 	sed 's/#VERSION#/$(DEB_VERSION_UPSTREAM)/' debian/railfs-dkms.prerm.in > debian/railfs-dkms.prerm
 	dh_installdeb
+
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start
 
 override_dh_auto_test:
 
