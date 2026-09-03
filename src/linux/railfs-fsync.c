@@ -19,8 +19,7 @@ int railfs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 {
 	struct inode *inode = file_inode(file);
 	struct railfs_options *opts = inode->i_sb->s_fs_info;
-	const char *path = inode->i_private;
-	struct railfs_conn *conn;
+	struct railfs_path *path;
 	int err;
 
 	err = file_write_and_wait_range(file, start, end);
@@ -28,12 +27,16 @@ int railfs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 		return err;
 	}
 
-	if (!opts || !opts->pool || !path) {
+	if (!opts || !opts->pool) {
 		return 0;
 	}
 
-	conn = railfs_pool_take(opts->pool);
-	err = railfs_meta(conn, RAILFS_META_FSYNC, path, 0);
-	railfs_pool_give(opts->pool, conn);
+	path = railfs_path_hold(inode);
+	if (!path) {
+		return 0;
+	}
+
+	err = railfs_pool_meta(opts->pool, RAILFS_META_FSYNC, path->name, 0);
+	railfs_path_put(path);
 	return err;
 }

@@ -11,6 +11,7 @@
 #include <linux/log2.h>
 #include <linux/fs_context.h>
 #include <linux/fs_parser.h>
+#include <linux/kref.h>
 #include <linux/wait.h>
 
 #include "railfs-tcp.h"
@@ -145,6 +146,22 @@ struct railfs_inode {
 	bool mine;
 };
 
+struct railfs_path {
+	struct kref ref;
+	char name[];
+};
+
+struct railfs_path *railfs_path_new(const char *name);
+struct railfs_path *railfs_path_hold(struct inode *inode);
+void railfs_path_put(struct railfs_path *path);
+void railfs_path_replace(struct inode *inode, struct railfs_path *fresh);
+
+static inline struct railfs_path *railfs_path_get(struct railfs_path *path)
+{
+	kref_get(&path->ref);
+	return path;
+}
+
 
 extern struct kmem_cache *railfs_inode_cache;
 
@@ -193,16 +210,16 @@ int railfs_file_open(struct inode *inode, struct file *file);
 int railfs_file_release(struct inode *inode, struct file *file);
 int railfs_file_flush(struct file *file, fl_owner_t id);
 int railfs_fsync(struct file *file, loff_t start, loff_t end, int datasync);
-int railfs_push_attrs(struct railfs_conn *conn, const char *path, const struct iattr *attr);
+int railfs_push_attrs(struct railfs_pool *pool, const char *path, const struct iattr *attr);
 int railfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *attr);
 int railfs_statfs(struct dentry *dentry, struct kstatfs *buf);
 struct inode *railfs_alloc_inode(struct super_block *sb);
 void railfs_free_inode(struct inode *inode);
 void railfs_init_once(void *p);
 void railfs_evict_inode(struct inode *inode);
-struct inode *railfs_make_inode(struct super_block *sb, umode_t mode, loff_t size);
 void railfs_tune_folios(struct inode *inode);
 struct inode *railfs_inode_for(struct super_block *sb, const struct railfs_attrs *a, const char *path);
+void railfs_rehash_inode(struct inode *inode, struct railfs_path *fresh);
 int railfs_refresh(struct inode *inode, bool force);
 int railfs_revalidate(struct inode *dir, const struct qstr *name, struct dentry *dentry, unsigned int flags);
 

@@ -13,14 +13,34 @@
 #include "railfs-tcp.h"
 #include "railfs-trace.h"
 
+struct railfs_read_req {
+	const char *path;
+	loff_t offset;
+	void *buf;
+	u32 len;
+};
+
+static int railfs_read_op(struct railfs_conn *conn, void *arg)
+{
+	struct railfs_read_req *req = arg;
+
+	return railfs_read(conn, req->path, req->offset, req->buf, req->len);
+}
+
+static int railfs_read_retrying(struct railfs_pool *pool, const char *path, loff_t offset, void *buf, u32 len)
+{
+	struct railfs_read_req req = { .path = path, .offset = offset, .buf = buf, .len = len };
+
+	return railfs_pool_call(pool, railfs_read_op, &req);
+}
+
 int railfs_fill_folio(struct folio *folio)
 {
 	struct inode *inode = folio->mapping->host;
 	struct railfs_options *opts = inode->i_sb->s_fs_info;
-	const char *name = inode->i_private;
+	struct railfs_path *name = railfs_path_hold(inode);
 	size_t size = folio_size(folio);
 	loff_t pos = folio_pos(folio);
-	struct railfs_conn *conn;
 	void *buf = NULL;
 	int got;
 	int err;
@@ -36,10 +56,7 @@ int railfs_fill_folio(struct folio *folio)
 		goto out;
 	}
 
-	conn = railfs_pool_take(opts->pool);
-	got = railfs_read(conn, name, pos, buf, (u32)size);
-	railfs_pool_give(opts->pool, conn);
-
+	got = railfs_read_retrying(opts->pool, name->name, pos, buf, (u32)size);
 	if (got < 0) {
 		err = got;
 		goto out;
@@ -55,6 +72,7 @@ int railfs_fill_folio(struct folio *folio)
 	err = 0;
 out:
 	kvfree(buf);
+	railfs_path_put(name);
 	return err;
 }
 
@@ -68,6 +86,7 @@ int railfs_read_folio(struct file *file, struct folio *folio)
 
 struct railfs_fetch {
 	struct work_struct work;
+	struct inode *inode;
 	struct address_space *mapping;
 	struct railfs_pool *pool;
 	char *path;
@@ -152,11 +171,18 @@ static void railfs_fill_around(struct railfs_fetch *fetch, const void *buf, size
 	}
 }
 
+static void railfs_fetch_free(struct railfs_fetch *fetch)
+{
+	iput(fetch->inode);
+	kfree(fetch->folios);
+	kfree(fetch->path);
+	kfree(fetch);
+}
+
 static void railfs_fetch_one(struct work_struct *work)
 {
 	struct railfs_fetch *fetch = container_of(work, struct railfs_fetch, work);
 	u64 whole = railfs_now();
-	struct railfs_conn *conn;
 	u64 mark;
 	void *buf;
 	int got = 0;
@@ -166,12 +192,7 @@ static void railfs_fetch_one(struct work_struct *work)
 	railfs_trace_add(RAILFS_PHASE_READ_ALLOC, mark, fetch->len);
 
 	if (buf) {
-		mark = railfs_now();
-		conn = railfs_pool_take(fetch->pool);
-		railfs_trace_add(RAILFS_PHASE_POOL_WAIT, mark, 0);
-
-		got = railfs_read(conn, fetch->path, fetch->offset, buf, fetch->len);
-		railfs_pool_give(fetch->pool, conn);
+		got = railfs_read_retrying(fetch->pool, fetch->path, fetch->offset, buf, fetch->len);
 	}
 
 	mark = railfs_now();
@@ -187,17 +208,13 @@ static void railfs_fetch_one(struct work_struct *work)
 	railfs_trace_add(RAILFS_PHASE_READ_TOTAL, whole, got > 0 ? (u64)got : 0);
 	railfs_trace_inflight(-1);
 	kvfree(buf);
-	kfree(fetch->folios);
-	kfree(fetch->path);
-	kfree(fetch);
+	railfs_fetch_free(fetch);
 }
 
 static void railfs_fetch_drop(struct railfs_fetch *fetch)
 {
 	railfs_fetch_land(fetch, NULL, 0);
-	kfree(fetch->folios);
-	kfree(fetch->path);
-	kfree(fetch);
+	railfs_fetch_free(fetch);
 }
 
 static struct railfs_fetch *railfs_fetch_new(struct railfs_options *opts, struct address_space *mapping, const char *path, loff_t isize, loff_t offset,
@@ -224,6 +241,7 @@ static struct railfs_fetch *railfs_fetch_new(struct railfs_options *opts, struct
 	fetch->isize = isize;
 	fetch->offset = offset;
 	fetch->mapping = mapping;
+	fetch->inode = igrab(mapping->host);
 	INIT_WORK(&fetch->work, railfs_fetch_one);
 out:
 	return fetch;
@@ -234,7 +252,7 @@ void railfs_readahead(struct readahead_control *rac)
 	struct address_space *mapping = rac->mapping;
 	struct inode *inode = rac->mapping->host;
 	struct railfs_options *opts = inode->i_sb->s_fs_info;
-	const char *path = inode->i_private;
+	struct railfs_path *path = railfs_path_hold(inode);
 	loff_t isize = i_size_read(inode);
 	unsigned int room = opts->fetch / PAGE_SIZE;
 	struct railfs_fetch *fetch = NULL;
@@ -258,7 +276,7 @@ void railfs_readahead(struct readahead_control *rac)
 		}
 
 		if (!fetch) {
-			fetch = railfs_fetch_new(opts, mapping, path, isize, folio_pos(folio), room);
+			fetch = railfs_fetch_new(opts, mapping, path->name, isize, folio_pos(folio), room);
 		}
 
 		if (!fetch) {
@@ -285,5 +303,7 @@ void railfs_readahead(struct readahead_control *rac)
 	} else if (fetch) {
 		railfs_fetch_drop(fetch);
 	}
+
+	railfs_path_put(path);
 }
 

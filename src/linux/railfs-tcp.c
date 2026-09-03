@@ -8,9 +8,11 @@
 #include <linux/kernel.h>
 #include <linux/mutex.h>
 #include <linux/net.h>
+#include <linux/sched/mm.h>
 #include <linux/slab.h>
 #include <linux/uio.h>
 #include <net/sock.h>
+#include <net/tcp_states.h>
 
 #include "railfs-tcp.h"
 #include "railfs-trace.h"
@@ -25,6 +27,35 @@
 
 /* Room for a hello: a version, a backend name and eight fixed-width fields. */
 #define RAILFS_HELLO_BYTES 256
+
+#define RAILFS_SOCKET_DEADLINE_SECONDS 30
+#define RAILFS_REVIVE_INTERVAL (5 * HZ)
+
+static int railfs_lose_on(struct railfs_conn *conn, int err)
+{
+	if (err) {
+		conn->dead = true;
+	}
+	return err;
+}
+
+static int railfs_conn_lock(struct railfs_conn *conn)
+{
+	mutex_lock(&conn->lock);
+	if (!conn->dead) {
+		return 0;
+	}
+	mutex_unlock(&conn->lock);
+	return -ENOTCONN;
+}
+
+static void railfs_set_deadlines(struct socket *sock)
+{
+	struct __kernel_sock_timeval tv = { .tv_sec = RAILFS_SOCKET_DEADLINE_SECONDS, .tv_usec = 0 };
+
+	sock_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO_NEW, KERNEL_SOCKPTR(&tv), sizeof(tv));
+	sock_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO_NEW, KERNEL_SOCKPTR(&tv), sizeof(tv));
+}
 
 static int send_all(struct socket *sock, const void *buf, size_t len)
 {
@@ -195,7 +226,7 @@ static int say_hello(struct socket *sock, bool rdma, bool verify, char **endpoin
 		endpoint_bytes = (u32)(c.at - before - 4);
 	}
 
-	pr_info("railfs: negotiated with the daemon, backend %s\n", backend);
+	pr_info_ratelimited("railfs: negotiated with the daemon, backend %s\n", backend);
 	*endpoint_out = endpoint;
 	*endpoint_len = endpoint_bytes;
 	endpoint = NULL;
@@ -290,17 +321,37 @@ out:
 // other's replies.
 static int exchange(struct railfs_conn *conn, u8 *frame, size_t frame_len, u16 want, u8 **payload, u32 *payload_len)
 {
-	int err;
+	int err = railfs_conn_lock(conn);
 
-	mutex_lock(&conn->lock);
+	if (err) {
+		return err;
+	}
 
-	err = send_all(conn->sock, frame, frame_len);
+	err = railfs_lose_on(conn, send_all(conn->sock, frame, frame_len));
 	if (!err) {
-		err = recv_frame(conn->sock, want, payload, payload_len);
+		err = railfs_lose_on(conn, recv_frame(conn->sock, want, payload, payload_len));
 	}
 
 	mutex_unlock(&conn->lock);
 	return err;
+}
+
+static int railfs_reply_for(struct railfs_conn *conn, struct railfs_cursor *c, u64 id)
+{
+	u64 replied = 0;
+	int err = railfs_get_u64(c, &replied);
+
+	if (err) {
+		return err;
+	}
+
+	if (replied == id) {
+		return 0;
+	}
+
+	pr_err("railfs: reply id %llu does not match request %llu\n", replied, id);
+	conn->dead = true;
+	return -EPROTO;
 }
 
 void railfs_free_dirents(struct railfs_dirent *entries, u32 count)
@@ -323,7 +374,6 @@ int railfs_space_of(struct railfs_conn *conn, const char *path, struct railfs_sp
 	u8 *payload = NULL;
 	u8 *frame = NULL;
 	u32 payload_len = 0;
-	u64 replied = 0;
 	size_t cap;
 	u64 id;
 	u8 ok = 0;
@@ -354,10 +404,7 @@ int railfs_space_of(struct railfs_conn *conn, const char *path, struct railfs_sp
 	c.len = payload_len;
 	c.at = 0;
 
-	err = railfs_get_u64(&c, &replied);
-	if (!err && replied != id) {
-		err = -EPROTO;
-	}
+	err = railfs_reply_for(conn, &c, id);
 	if (!err) {
 		err = railfs_get_u8(&c, &ok);
 	}
@@ -391,7 +438,6 @@ int railfs_stat(struct railfs_conn *conn, const char *path, struct railfs_attrs 
 	u8 *payload = NULL;
 	u8 *frame = NULL;
 	u32 payload_len = 0;
-	u64 replied = 0;
 	u64 asked = railfs_now();
 	size_t cap;
 	u64 id;
@@ -425,14 +471,8 @@ int railfs_stat(struct railfs_conn *conn, const char *path, struct railfs_attrs 
 	c.len = payload_len;
 	c.at = 0;
 
-	err = railfs_get_u64(&c, &replied);
+	err = railfs_reply_for(conn, &c, id);
 	if (err) {
-		goto out;
-	}
-
-	if (replied != id) {
-		pr_err("railfs: stat reply id %llu does not match request %llu\n", replied, id);
-		err = -EPROTO;
 		goto out;
 	}
 
@@ -497,16 +537,7 @@ int railfs_list(struct railfs_conn *conn, const char *path, struct railfs_dirent
 	c.len = payload_len;
 	c.at = 0;
 
-	{
-		u64 replied = 0;
-
-		err = railfs_get_u64(&c, &replied);
-		if (!err && replied != id) {
-			pr_err("railfs: reply id %llu does not match request %llu\n", replied, id);
-			err = -EPROTO;
-		}
-	}
-
+	err = railfs_reply_for(conn, &c, id);
 	if (!err) {
 		err = railfs_get_u8(&c, &found);
 	}
@@ -595,13 +626,11 @@ static int railfs_matches_digest(const struct railfs_cursor *c, const u8 *payloa
 // The reply to a ranged read: who it answers, how much the peer had, and how
 // big the file is. Split out because the read itself is about moving bytes and
 // this is about reading four fields in order.
-static int railfs_read_reply(struct railfs_cursor *c, u64 id, u32 *reply_len, u64 *file_size)
+static int railfs_read_reply(struct railfs_conn *conn, struct railfs_cursor *c, u64 id, u32 *reply_len, u64 *file_size, u8 *ok)
 {
-	u64 replied = 0;
-	u8 ok = 0;
 	int err;
 
-	err = railfs_get_u64(c, &replied);
+	err = railfs_reply_for(conn, c, id);
 	if (!err) {
 		err = railfs_get_u32(c, reply_len);
 	}
@@ -609,18 +638,9 @@ static int railfs_read_reply(struct railfs_cursor *c, u64 id, u32 *reply_len, u6
 		err = railfs_get_u64(c, file_size);
 	}
 	if (!err) {
-		err = railfs_get_u8(c, &ok);
+		err = railfs_get_u8(c, ok);
 	}
-	if (err) {
-		return err;
-	}
-
-	if (replied != id) {
-		pr_err("railfs: read reply id %llu does not match request %llu\n", replied, id);
-		return -EPROTO;
-	}
-
-	return ok ? 0 : -EIO;
+	return err;
 }
 
 // The bytes themselves, off whichever channel this connection has. Returns how
@@ -684,6 +704,7 @@ int railfs_read(struct railfs_conn *conn, const char *path, u64 offset, void *bu
 	u64 pull;
 	size_t cap;
 	u64 id;
+	u8 ok = 0;
 	int err;
 
 	if (len > RAILFS_PAGE_SIZE) {
@@ -716,16 +737,19 @@ int railfs_read(struct railfs_conn *conn, const char *path, u64 offset, void *bu
 
 	// Held across both channels: the payload belongs to whoever asked for it,
 	// and a second reader taking it would leave this one waiting forever.
-	mutex_lock(&conn->lock);
+	err = railfs_conn_lock(conn);
+	if (err) {
+		goto out;
+	}
 
 	ctl = railfs_now();
 
-	err = send_all(conn->sock, frame, c.at);
+	err = railfs_lose_on(conn, send_all(conn->sock, frame, c.at));
 	if (err) {
 		goto unlock;
 	}
 
-	err = recv_frame(conn->sock, RAILFS_MSG_TRANSFER_REPLY, &payload, &payload_len);
+	err = railfs_lose_on(conn, recv_frame(conn->sock, RAILFS_MSG_TRANSFER_REPLY, &payload, &payload_len));
 	if (err) {
 		goto unlock;
 	}
@@ -736,15 +760,20 @@ int railfs_read(struct railfs_conn *conn, const char *path, u64 offset, void *bu
 	c.len = payload_len;
 	c.at = 0;
 
-	err = railfs_read_reply(&c, id, &reply_len, &file_size);
+	err = railfs_lose_on(conn, railfs_read_reply(conn, &c, id, &reply_len, &file_size, &ok));
 	if (err) {
 		goto unlock;
 	}
 
 	pull = railfs_now();
-	err = railfs_take_payload(conn, id, buf, len, &frame_len);
+	err = railfs_lose_on(conn, railfs_take_payload(conn, id, buf, len, &frame_len));
 	railfs_trace_add(RAILFS_PHASE_READ_PULL, pull, len);
 	if (err) {
+		goto unlock;
+	}
+
+	if (!ok) {
+		err = -EIO;
 		goto unlock;
 	}
 
@@ -842,7 +871,6 @@ int railfs_meta_send(struct railfs_conn *conn, const struct railfs_meta_req *req
 	u8 *payload = NULL;
 	u8 *frame = NULL;
 	u32 payload_len = 0;
-	u64 replied = 0;
 	u32 code = 0;
 	size_t cap;
 	u64 id;
@@ -883,7 +911,7 @@ int railfs_meta_send(struct railfs_conn *conn, const struct railfs_meta_req *req
 	// The daemon says why in the reply, and readlink says what it found in the
 	// same field a refusal leaves empty. Without reading both, every refusal
 	// reaches the caller as EIO and a link has no target.
-	err = railfs_get_u64(&c, &replied);
+	err = railfs_reply_for(conn, &c, id);
 	if (!err) {
 		err = railfs_get_u8(&c, &ok);
 	}
@@ -897,11 +925,6 @@ int railfs_meta_send(struct railfs_conn *conn, const struct railfs_meta_req *req
 		err = railfs_get_u32(&c, &code);
 	}
 	if (err) {
-		goto out;
-	}
-
-	if (replied != id) {
-		err = -EPROTO;
 		goto out;
 	}
 
@@ -972,7 +995,6 @@ static int railfs_write_from(struct railfs_conn *conn, const char *path, u64 off
 	u32 payload_len = 0;
 	u32 reply_len = 0;
 	u64 file_size = 0;
-	u64 replied = 0;
 	u64 mark;
 	u64 wire;
 	size_t cap;
@@ -1020,10 +1042,14 @@ static int railfs_write_from(struct railfs_conn *conn, const char *path, u64 off
 
 	railfs_frame(frame, RAILFS_MSG_WRITE, (u32)(c.at - RAILFS_HEADER_SIZE));
 
-	mutex_lock(&conn->lock);
+	err = railfs_conn_lock(conn);
+	if (err) {
+		goto out;
+	}
+
 	wire = railfs_now();
 
-	err = send_all(conn->sock, frame, c.at);
+	err = railfs_lose_on(conn, send_all(conn->sock, frame, c.at));
 	if (err) {
 		goto unlock;
 	}
@@ -1031,11 +1057,12 @@ static int railfs_write_from(struct railfs_conn *conn, const char *path, u64 off
 	// The daemon posts its receive as soon as it has the request, so the bytes
 	// follow immediately on the data channel with the request id as the key.
 	err = folios ? railfs_give_payload_folios(conn, id, folios, nr, len) : railfs_give_payload(conn, id, buf, len);
+	err = railfs_lose_on(conn, err);
 	if (err) {
 		goto unlock;
 	}
 
-	err = recv_frame(conn->sock, RAILFS_MSG_TRANSFER_REPLY, &payload, &payload_len);
+	err = railfs_lose_on(conn, recv_frame(conn->sock, RAILFS_MSG_TRANSFER_REPLY, &payload, &payload_len));
 	if (err) {
 		goto unlock;
 	}
@@ -1044,7 +1071,7 @@ static int railfs_write_from(struct railfs_conn *conn, const char *path, u64 off
 	c.len = payload_len;
 	c.at = 0;
 
-	err = railfs_get_u64(&c, &replied);
+	err = railfs_reply_for(conn, &c, id);
 	if (!err) {
 		err = railfs_get_u32(&c, &reply_len);
 	}
@@ -1055,12 +1082,6 @@ static int railfs_write_from(struct railfs_conn *conn, const char *path, u64 off
 		err = railfs_get_u8(&c, &ok);
 	}
 	if (err) {
-		goto unlock;
-	}
-
-	if (replied != id) {
-		pr_err("railfs: write reply id %llu does not match request %llu\n", replied, id);
-		err = -EPROTO;
 		goto unlock;
 	}
 
@@ -1149,6 +1170,8 @@ static int join_data_channel(struct railfs_conn *conn, const char *endpoint)
 		goto out;
 	}
 
+	railfs_set_deadlines(conn->data);
+
 	addr.sin_family = AF_INET;
 	addr.sin_port = htons((u16)port);
 
@@ -1175,9 +1198,8 @@ out:
 	return err;
 }
 
-struct railfs_conn *railfs_connect(const char *host, u16 port, bool rdma, bool verify)
+struct railfs_conn *railfs_connect(const struct railfs_peer *peer)
 {
-	struct __kernel_sock_timeval tv = { .tv_sec = 30, .tv_usec = 0 };
 	struct sockaddr_in addr = {};
 	struct railfs_conn *conn = NULL;
 	struct railfs_wire mine = {};
@@ -1186,7 +1208,7 @@ struct railfs_conn *railfs_connect(const char *host, u16 port, bool rdma, bool v
 	__be32 ip;
 	int err;
 
-	if (!host) {
+	if (!peer->host) {
 		err = -EINVAL;
 		goto fail;
 	}
@@ -1194,8 +1216,8 @@ struct railfs_conn *railfs_connect(const char *host, u16 port, bool rdma, bool v
 	// in_aton does not reject a name, it invents an address from one, so a
 	// mount naming a host rather than an address would dial somewhere
 	// arbitrary instead of failing.
-	if (!in4_pton(host, -1, (u8 *)&ip, -1, NULL)) {
-		pr_err("railfs: host=%s is not an IPv4 address\n", host);
+	if (!in4_pton(peer->host, -1, (u8 *)&ip, -1, NULL)) {
+		pr_err("railfs: host=%s is not an IPv4 address\n", peer->host);
 		err = -EINVAL;
 		goto fail;
 	}
@@ -1215,20 +1237,19 @@ struct railfs_conn *railfs_connect(const char *host, u16 port, bool rdma, bool v
 
 	// Without a deadline a peer that stops answering leaves every reader
 	// asleep holding the channel lock, and umount blocks behind them.
-	sock_setsockopt(conn->sock, SOL_SOCKET, SO_RCVTIMEO_NEW, KERNEL_SOCKPTR(&tv), sizeof(tv));
-	sock_setsockopt(conn->sock, SOL_SOCKET, SO_SNDTIMEO_NEW, KERNEL_SOCKPTR(&tv), sizeof(tv));
+	railfs_set_deadlines(conn->sock);
 
 	addr.sin_family = AF_INET;
 	addr.sin_addr.s_addr = ip;
-	addr.sin_port = htons(port);
+	addr.sin_port = htons(peer->port);
 
 	err = kernel_connect(conn->sock, (struct sockaddr *)&addr, sizeof(addr), 0);
 	if (err) {
-		pr_err("railfs: connect to %s:%u failed: %d\n", host, port, err);
+		pr_err_ratelimited("railfs: connect to %s:%u failed: %d\n", peer->host, peer->port, err);
 		goto fail;
 	}
 
-	if (rdma) {
+	if (peer->rdma) {
 		conn->rail = railfs_rdma_open(&mine);
 		if (IS_ERR(conn->rail)) {
 			err = PTR_ERR(conn->rail);
@@ -1237,14 +1258,14 @@ struct railfs_conn *railfs_connect(const char *host, u16 port, bool rdma, bool v
 		}
 	}
 
-	conn->verify = verify;
+	conn->verify = peer->verify;
 
-	err = say_hello(conn->sock, rdma, verify, &endpoint, &endpoint_len);
+	err = say_hello(conn->sock, peer->rdma, peer->verify, &endpoint, &endpoint_len);
 	if (err) {
 		goto fail;
 	}
 
-	err = rdma ? join_fabric(conn, endpoint, endpoint_len, &mine) : join_data_channel(conn, endpoint);
+	err = peer->rdma ? join_fabric(conn, endpoint, endpoint_len, &mine) : join_data_channel(conn, endpoint);
 	if (err) {
 		goto fail;
 	}
@@ -1258,7 +1279,7 @@ fail:
 	return ERR_PTR(err);
 }
 
-struct railfs_pool *railfs_pool_open(const char *host, u16 port, unsigned int count, bool rdma, bool verify)
+struct railfs_pool *railfs_pool_open(const struct railfs_peer *peer, unsigned int count)
 {
 	struct railfs_pool *pool;
 	unsigned int i;
@@ -1280,8 +1301,15 @@ struct railfs_pool *railfs_pool_open(const char *host, u16 port, unsigned int co
 	spin_lock_init(&pool->lock);
 	init_waitqueue_head(&pool->waiters);
 
+	pool->peer = *peer;
+	pool->peer.host = kstrdup(peer->host, GFP_NOFS);
+	if (!pool->peer.host) {
+		err = -ENOMEM;
+		goto fail;
+	}
+
 	for (i = 0; i < count; i++) {
-		struct railfs_conn *conn = railfs_connect(host, port, rdma, verify);
+		struct railfs_conn *conn = railfs_connect(&pool->peer);
 
 		if (IS_ERR(conn)) {
 			err = PTR_ERR(conn);
@@ -1311,7 +1339,85 @@ void railfs_pool_close(struct railfs_pool *pool)
 		railfs_disconnect(pool->conns[i]);
 	}
 
+	kfree(pool->peer.host);
 	kfree(pool);
+}
+
+static struct railfs_conn *railfs_pool_revive(struct railfs_pool *pool, unsigned int at)
+{
+	struct railfs_conn *old = pool->conns[at];
+	struct railfs_conn *fresh;
+	unsigned int nofs;
+
+	old->dead = true;
+
+	if (pool->retried[at] && time_before(jiffies, pool->retried[at] + RAILFS_REVIVE_INTERVAL)) {
+		return old;
+	}
+
+	nofs = memalloc_nofs_save();
+	fresh = railfs_connect(&pool->peer);
+	memalloc_nofs_restore(nofs);
+	pool->retried[at] = jiffies;
+	if (IS_ERR(fresh)) {
+		return old;
+	}
+
+	spin_lock(&pool->lock);
+	pool->conns[at] = fresh;
+	spin_unlock(&pool->lock);
+
+	railfs_disconnect(old);
+	pr_info_ratelimited("railfs: connection %u to %s reopened\n", at, pool->peer.host);
+	return fresh;
+}
+
+static bool railfs_conn_closed(const struct railfs_conn *conn)
+{
+	return conn->sock->sk->sk_state != TCP_ESTABLISHED || (conn->data && conn->data->sk->sk_state != TCP_ESTABLISHED);
+}
+
+static struct railfs_conn *railfs_pool_serve(struct railfs_pool *pool, unsigned int at)
+{
+	struct railfs_conn *conn = pool->conns[at];
+
+	if (conn->dead || railfs_conn_closed(conn)) {
+		conn = railfs_pool_revive(pool, at);
+	}
+
+	railfs_trace_busy(1);
+	return conn;
+}
+
+static bool railfs_pool_slot_free(const struct railfs_pool *pool, unsigned int slot, bool even_dead)
+{
+	return !test_bit(slot, &pool->busy) && (even_dead || !pool->conns[slot]->dead);
+}
+
+static int railfs_pool_claim(struct railfs_pool *pool, unsigned int first, unsigned int span)
+{
+	unsigned int i;
+	int even_dead;
+	int at = -1;
+
+	spin_lock(&pool->lock);
+
+	for (even_dead = 0; even_dead < 2 && at < 0; even_dead++) {
+		for (i = 0; i < span; i++) {
+			unsigned int slot = (first + i) % pool->count;
+
+			if (!railfs_pool_slot_free(pool, slot, even_dead)) {
+				continue;
+			}
+
+			__set_bit(slot, &pool->busy);
+			at = (int)slot;
+			break;
+		}
+	}
+
+	spin_unlock(&pool->lock);
+	return at;
 }
 
 // Waits rather than fails when every connection is busy: the caller is a
@@ -1329,9 +1435,9 @@ static unsigned long railfs_pool_all(const struct railfs_pool *pool)
 
 struct railfs_conn *railfs_pool_take_near(struct railfs_pool *pool, unsigned int hint, unsigned int span)
 {
-	struct railfs_conn *conn = NULL;
 	unsigned long window = 0;
 	unsigned int i;
+	int at;
 
 	if (span < 1 || span >= pool->count) {
 		return railfs_pool_take(pool);
@@ -1342,23 +1448,9 @@ struct railfs_conn *railfs_pool_take_near(struct railfs_pool *pool, unsigned int
 	}
 
 	for (;;) {
-		spin_lock(&pool->lock);
-
-		for (i = 0; i < span; i++) {
-			unsigned int at = (hint + i) % pool->count;
-
-			if (!test_bit(at, &pool->busy)) {
-				__set_bit(at, &pool->busy);
-				conn = pool->conns[at];
-				break;
-			}
-		}
-
-		spin_unlock(&pool->lock);
-
-		if (conn) {
-			railfs_trace_busy(1);
-			return conn;
+		at = railfs_pool_claim(pool, hint, span);
+		if (at >= 0) {
+			return railfs_pool_serve(pool, (unsigned int)at);
 		}
 
 		// On this window's own bits, not the pool's: waiting for any connection
@@ -1370,31 +1462,153 @@ struct railfs_conn *railfs_pool_take_near(struct railfs_pool *pool, unsigned int
 
 struct railfs_conn *railfs_pool_take(struct railfs_pool *pool)
 {
-	struct railfs_conn *conn = NULL;
-	unsigned int i;
+	int at;
 
 	for (;;) {
-		spin_lock(&pool->lock);
-
-		for (i = 0; i < pool->count; i++) {
-			if (!test_bit(i, &pool->busy)) {
-				__set_bit(i, &pool->busy);
-				conn = pool->conns[i];
-				break;
-			}
-		}
-
-		spin_unlock(&pool->lock);
-
-		if (conn) {
-			railfs_trace_busy(1);
-			return conn;
+		at = railfs_pool_claim(pool, 0, pool->count);
+		if (at >= 0) {
+			return railfs_pool_serve(pool, (unsigned int)at);
 		}
 
 		// Not (1UL << count) - 1: at count == BITS_PER_LONG that shift is
 		// undefined, and here yields a mask of zero, which spins.
 		wait_event(pool->waiters, pool->busy != railfs_pool_all(pool));
 	}
+}
+
+static bool railfs_any_loss(int err) { return true; }
+
+static bool railfs_never_sent(int err) { return err == -ENOTCONN; }
+
+static int railfs_pool_run(struct railfs_pool *pool, unsigned int hint, unsigned int span, railfs_wire_op op, void *arg,
+			   bool (*worth_retrying)(int err))
+{
+	unsigned int attempt;
+	int first = 0;
+	int err = -ENOTCONN;
+
+	for (attempt = 0; attempt < RAILFS_WIRE_ATTEMPTS; attempt++) {
+		u64 mark = railfs_now();
+		struct railfs_conn *conn = railfs_pool_take_near(pool, hint, span);
+		bool lost;
+
+		railfs_trace_add(RAILFS_PHASE_POOL_WAIT, mark, 0);
+		err = op(conn, arg);
+		lost = conn->dead;
+		railfs_pool_give(pool, conn);
+
+		if (err >= 0 || !lost || !worth_retrying(err)) {
+			return err;
+		}
+
+		if (!first) {
+			first = err;
+		}
+	}
+
+	return err == -ENOTCONN ? first : err;
+}
+
+int railfs_pool_call_near(struct railfs_pool *pool, unsigned int hint, unsigned int span, railfs_wire_op op, void *arg)
+{
+	return railfs_pool_run(pool, hint, span, op, arg, railfs_any_loss);
+}
+
+int railfs_pool_call(struct railfs_pool *pool, railfs_wire_op op, void *arg)
+{
+	return railfs_pool_run(pool, 0, pool->count, op, arg, railfs_any_loss);
+}
+
+int railfs_pool_apply(struct railfs_pool *pool, railfs_wire_op op, void *arg)
+{
+	return railfs_pool_run(pool, 0, pool->count, op, arg, railfs_never_sent);
+}
+
+struct railfs_stat_req {
+	const char *path;
+	struct railfs_attrs *out;
+	bool *found;
+};
+
+static int railfs_stat_op(struct railfs_conn *conn, void *arg)
+{
+	struct railfs_stat_req *req = arg;
+
+	return railfs_stat(conn, req->path, req->out, req->found);
+}
+
+int railfs_pool_stat(struct railfs_pool *pool, const char *path, struct railfs_attrs *out, bool *found)
+{
+	struct railfs_stat_req req = { .path = path, .out = out, .found = found };
+
+	return railfs_pool_call(pool, railfs_stat_op, &req);
+}
+
+struct railfs_list_req {
+	const char *path;
+	struct railfs_dirent **out;
+	u32 *count;
+};
+
+static int railfs_list_op(struct railfs_conn *conn, void *arg)
+{
+	struct railfs_list_req *req = arg;
+
+	return railfs_list(conn, req->path, req->out, req->count);
+}
+
+int railfs_pool_list(struct railfs_pool *pool, const char *path, struct railfs_dirent **out, u32 *count)
+{
+	struct railfs_list_req req = { .path = path, .out = out, .count = count };
+
+	return railfs_pool_call(pool, railfs_list_op, &req);
+}
+
+struct railfs_space_req {
+	const char *path;
+	struct railfs_space *out;
+};
+
+static int railfs_space_op(struct railfs_conn *conn, void *arg)
+{
+	struct railfs_space_req *req = arg;
+
+	return railfs_space_of(conn, req->path, req->out);
+}
+
+int railfs_pool_space_of(struct railfs_pool *pool, const char *path, struct railfs_space *out)
+{
+	struct railfs_space_req req = { .path = path, .out = out };
+
+	return railfs_pool_call(pool, railfs_space_op, &req);
+}
+
+static int railfs_meta_op(struct railfs_conn *conn, void *arg) { return railfs_meta_send(conn, arg); }
+
+int railfs_pool_meta_send(struct railfs_pool *pool, const struct railfs_meta_req *req)
+{
+	return railfs_pool_apply(pool, railfs_meta_op, (void *)req);
+}
+
+int railfs_pool_meta(struct railfs_pool *pool, u16 op, const char *path, u64 size)
+{
+	struct railfs_meta_req req = { .op = op, .path = path, .size = size };
+
+	return railfs_pool_meta_send(pool, &req);
+}
+
+int railfs_pool_meta_to(struct railfs_pool *pool, u16 op, const char *path, const char *target, u64 size)
+{
+	struct railfs_meta_req req = { .op = op, .path = path, .target = target, .size = size };
+
+	return railfs_pool_meta_send(pool, &req);
+}
+
+static int railfs_create_op(struct railfs_conn *conn, void *arg) { return railfs_create_file(conn, arg); }
+
+int railfs_pool_create_file(struct railfs_pool *pool, const char *path)
+{
+	return railfs_pool_apply(pool, railfs_create_op, (void *)path);
 }
 
 void railfs_pool_give(struct railfs_pool *pool, struct railfs_conn *conn)

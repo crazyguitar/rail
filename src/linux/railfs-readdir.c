@@ -54,15 +54,49 @@ out:
 	dput(dentry);
 }
 
+static int railfs_emit_entry(struct file *file, struct dir_context *ctx, const char *here, const struct railfs_dirent *entry)
+{
+	unsigned int type = entry->attrs.directory ? DT_DIR : DT_REG;
+	struct qstr name = QSTR_INIT(entry->name, strlen(entry->name));
+	char *path = railfs_path_under(here, entry->name);
+	int err = 0;
+
+	if (entry->attrs.link) {
+		type = DT_LNK;
+	}
+
+	if (!path) {
+		return -ENOMEM;
+	}
+
+	if (!railfs_name_is_usable(entry->name)) {
+		err = -EBADMSG;
+		goto out;
+	}
+
+	// The same number a later stat reports. Hashing the bare name here
+	// gave one file two inode numbers depending on which call asked.
+	if (!dir_emit(ctx, name.name, name.len, railfs_ino_of(path), type)) {
+		err = -ENOSPC;
+		goto out;
+	}
+
+	name.hash = full_name_hash(file_dentry(file), name.name, name.len);
+	railfs_prime(file_dentry(file), &entry->attrs, path, &name);
+	ctx->pos++;
+out:
+	kfree(path);
+	return err;
+}
+
 // Everything below a mount lives on the peer, so both of these are one List
 // away. The daemon answers a whole directory at once, which is why lookup
 // costs the same as readdir and neither caches yet.
 int railfs_readdir(struct file *file, struct dir_context *ctx)
 {
-	struct railfs_conn *conn;
 	struct inode *dir = file_inode(file);
 	struct railfs_options *opts = dir->i_sb->s_fs_info;
-	const char *here = dir->i_private ? dir->i_private : ".";
+	struct railfs_path *here = railfs_path_hold(dir);
 	struct railfs_dirent *entries = NULL;
 	u32 count = 0;
 	u32 i;
@@ -76,9 +110,7 @@ int railfs_readdir(struct file *file, struct dir_context *ctx)
 	// Listed before the dots are emitted: getdents reports the bytes it filled
 	// and drops the error behind them, so a directory the peer has lost would
 	// read as an empty one.
-	conn = railfs_pool_take(opts->pool);
-	err = railfs_list(conn, here, &entries, &count);
-	railfs_pool_give(opts->pool, conn);
+	err = railfs_pool_list(opts->pool, here ? here->name : ".", &entries, &count);
 	if (err) {
 		goto out;
 	}
@@ -88,38 +120,17 @@ int railfs_readdir(struct file *file, struct dir_context *ctx)
 	}
 
 	for (i = (u32)(ctx->pos - 2); ctx->pos >= 2 && i < count; i++) {
-		unsigned int type = entries[i].attrs.directory ? DT_DIR : DT_REG;
-		struct qstr name = QSTR_INIT(entries[i].name, strlen(entries[i].name));
-		char *path = railfs_path_under(here, entries[i].name);
-
-		if (entries[i].attrs.link) {
-			type = DT_LNK;
-		}
-
-		if (!path) {
-			err = -ENOMEM;
+		err = railfs_emit_entry(file, ctx, here ? here->name : ".", &entries[i]);
+		if (err == -ENOSPC) {
+			err = 0;
 			break;
 		}
-
-		if (!railfs_name_is_usable(entries[i].name)) {
-			kfree(path);
-			err = -EBADMSG;
+		if (err) {
 			break;
 		}
-
-		// The same number a later stat reports. Hashing the bare name here
-		// gave one file two inode numbers depending on which call asked.
-		if (!dir_emit(ctx, name.name, name.len, railfs_ino_of(path), type)) {
-			kfree(path);
-			break;
-		}
-
-		name.hash = full_name_hash(file_dentry(file), name.name, name.len);
-		railfs_prime(file_dentry(file), &entries[i].attrs, path, &name);
-		kfree(path);
-		ctx->pos++;
 	}
 out:
 	railfs_free_dirents(entries, count);
+	railfs_path_put(here);
 	return err;
 }

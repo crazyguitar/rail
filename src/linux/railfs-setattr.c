@@ -14,7 +14,7 @@
 
 // Each of these is its own operation on the wire, so one chmod -R that also
 // moves a timestamp costs two round trips rather than one.
-int railfs_push_attrs(struct railfs_conn *conn, const char *path, const struct iattr *attr)
+int railfs_push_attrs(struct railfs_pool *pool, const char *path, const struct iattr *attr)
 {
 	struct railfs_meta_req req = { .path = path };
 	int err = 0;
@@ -22,19 +22,19 @@ int railfs_push_attrs(struct railfs_conn *conn, const char *path, const struct i
 	if (attr->ia_valid & ATTR_SIZE) {
 		req.op = RAILFS_META_TRUNCATE;
 		req.size = attr->ia_size;
-		err = railfs_meta_send(conn, &req);
+		err = railfs_pool_meta_send(pool, &req);
 	}
 
 	if (!err && (attr->ia_valid & ATTR_MODE)) {
 		req.op = RAILFS_META_SETMODE;
 		req.mode = attr->ia_mode & RAILFS_MODE_BITS;
-		err = railfs_meta_send(conn, &req);
+		err = railfs_pool_meta_send(pool, &req);
 	}
 
 	if (!err && (attr->ia_valid & ATTR_MTIME)) {
 		req.op = RAILFS_META_SETMTIME;
 		req.mtime = attr->ia_mtime.tv_sec;
-		err = railfs_meta_send(conn, &req);
+		err = railfs_pool_meta_send(pool, &req);
 	}
 
 	return err;
@@ -45,10 +45,9 @@ int railfs_push_attrs(struct railfs_conn *conn, const char *path, const struct i
 int railfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *attr)
 {
 	const unsigned int forwarded = ATTR_SIZE | ATTR_MODE | ATTR_MTIME;
-	struct railfs_conn *conn;
 	struct inode *inode = d_inode(dentry);
 	struct railfs_options *opts = inode->i_sb->s_fs_info;
-	const char *path = inode->i_private;
+	struct railfs_path *path = NULL;
 	int err;
 
 	err = setattr_prepare(idmap, dentry, attr);
@@ -60,7 +59,8 @@ int railfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr 
 		goto apply;
 	}
 
-	if (!opts || !opts->pool || !path) {
+	path = opts && opts->pool ? railfs_path_hold(inode) : NULL;
+	if (!path) {
 		err = -ENOTCONN;
 		goto out;
 	}
@@ -72,9 +72,7 @@ int railfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr 
 		}
 	}
 
-	conn = railfs_pool_take(opts->pool);
-	err = railfs_push_attrs(conn, path, attr);
-	railfs_pool_give(opts->pool, conn);
+	err = railfs_push_attrs(opts->pool, path->name, attr);
 	if (err) {
 		goto out;
 	}
@@ -90,5 +88,6 @@ apply:
 	mark_inode_dirty(inode);
 	err = 0;
 out:
+	railfs_path_put(path);
 	return err;
 }

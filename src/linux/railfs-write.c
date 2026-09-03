@@ -22,7 +22,7 @@ struct railfs_flush {
 	struct work_struct work;
 	struct address_space *mapping;
 	struct railfs_pool *pool;
-	const char *path;
+	struct railfs_path *path;
 	unsigned int span;
 	unsigned int limit;
 	loff_t offset;
@@ -37,32 +37,52 @@ struct railfs_flush {
 
 static void railfs_flush_free(struct railfs_flush *flush)
 {
+	railfs_path_put(flush->path);
 	kvfree(flush->buf);
 	kfree(flush->folios);
 	kfree(flush);
+}
+
+// Straight out of the page cache while the folios fit one send; past that
+// they have already been staged into the buffer.
+static int railfs_flush_op(struct railfs_conn *conn, void *arg)
+{
+	struct railfs_flush *flush = arg;
+
+	if (flush->nr <= RAILFS_MAX_SEND_FOLIOS) {
+		return railfs_write_folios(conn, flush->path->name, flush->offset, flush->folios, flush->nr, (u32)flush->len, false);
+	}
+
+	return railfs_write(conn, flush->path->name, flush->offset, flush->buf, (u32)flush->len, false);
+}
+
+static int railfs_flush_retrying(struct railfs_flush *flush)
+{
+	return railfs_pool_call_near(flush->pool, flush->hint, flush->span, railfs_flush_op, flush);
+}
+
+struct railfs_write_req {
+	const char *path;
+	loff_t offset;
+	const void *buf;
+	u32 len;
+};
+
+static int railfs_write_op(struct railfs_conn *conn, void *arg)
+{
+	struct railfs_write_req *req = arg;
+
+	return railfs_write(conn, req->path, req->offset, req->buf, req->len, false);
 }
 
 static void railfs_flush_one(struct work_struct *work)
 {
 	struct railfs_flush *flush = container_of(work, struct railfs_flush, work);
 	u64 whole = railfs_now();
-	struct railfs_conn *conn;
 	unsigned int i;
-	u64 mark;
 	int put;
 
-	mark = railfs_now();
-	conn = railfs_pool_take_near(flush->pool, flush->hint, flush->span);
-	railfs_trace_add(RAILFS_PHASE_POOL_WAIT, mark, 0);
-
-	// Straight out of the page cache while the folios fit one send; past that
-	// they have already been staged into the buffer.
-	if (flush->nr <= RAILFS_MAX_SEND_FOLIOS) {
-		put = railfs_write_folios(conn, flush->path, flush->offset, flush->folios, flush->nr, (u32)flush->len, false);
-	} else {
-		put = railfs_write(conn, flush->path, flush->offset, flush->buf, (u32)flush->len, false);
-	}
-	railfs_pool_give(flush->pool, conn);
+	put = railfs_flush_retrying(flush);
 	railfs_trace_add(RAILFS_PHASE_WRITE_TOTAL, whole, put > 0 ? (u64)put : 0);
 
 	if (put < 0) {
@@ -100,14 +120,11 @@ static int railfs_flush_big(struct address_space *mapping, struct railfs_options
 
 	while (at < bytes) {
 		size_t piece = min_t(size_t, bytes - at, RAILFS_PAGE_SIZE);
-		struct railfs_conn *conn;
+		struct railfs_write_req req = { .path = path, .offset = pos + (loff_t)at, .buf = buf, .len = (u32)piece };
 		int put;
 
 		memcpy_from_folio(buf, folio, at, piece);
-
-		conn = railfs_pool_take(opts->pool);
-		put = railfs_write(conn, path, pos + (loff_t)at, buf, (u32)piece, false);
-		railfs_pool_give(opts->pool, conn);
+		put = railfs_pool_call(opts->pool, railfs_write_op, &req);
 
 		if (put < 0) {
 			err = put;
@@ -127,7 +144,8 @@ out:
 	return err;
 }
 
-static struct railfs_flush *railfs_flush_new(struct address_space *mapping, struct railfs_options *opts, const char *path, unsigned int room)
+static struct railfs_flush *railfs_flush_new(struct address_space *mapping, struct railfs_options *opts, struct railfs_path *path,
+					   unsigned int room)
 {
 	struct railfs_flush *flush = kzalloc(sizeof(*flush), GFP_NOFS);
 
@@ -148,7 +166,7 @@ static struct railfs_flush *railfs_flush_new(struct address_space *mapping, stru
 	flush->pool = opts->pool;
 	flush->span = opts->flush_span;
 	flush->limit = opts->flush_limit;
-	flush->path = path;
+	flush->path = railfs_path_get(path);
 	flush->room = room;
 	flush->hint = (unsigned int)hash_long(mapping->host->i_ino, 32);
 	INIT_WORK(&flush->work, railfs_flush_one);
@@ -160,7 +178,7 @@ int railfs_writepages(struct address_space *mapping, struct writeback_control *w
 {
 	struct inode *inode = mapping->host;
 	struct railfs_options *opts = inode->i_sb->s_fs_info;
-	const char *path = inode->i_private;
+	struct railfs_path *path = railfs_path_hold(inode);
 	unsigned int room = RAILFS_PAGE_SIZE / PAGE_SIZE;
 	struct railfs_flush *flush = NULL;
 	struct folio *folio = NULL;
@@ -193,7 +211,7 @@ int railfs_writepages(struct address_space *mapping, struct writeback_control *w
 		}
 
 		if (bytes > RAILFS_PAGE_SIZE) {
-			error = railfs_flush_big(mapping, opts, path, folio, bytes);
+			error = railfs_flush_big(mapping, opts, path->name, folio, bytes);
 			continue;
 		}
 
@@ -257,6 +275,7 @@ int railfs_writepages(struct address_space *mapping, struct writeback_control *w
 	}
 
 out:
+	railfs_path_put(path);
 	return error;
 }
 

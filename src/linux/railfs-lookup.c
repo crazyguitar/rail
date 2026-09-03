@@ -14,9 +14,7 @@
 
 struct dentry *railfs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
-	struct railfs_conn *conn;
 	struct railfs_options *opts = dir->i_sb->s_fs_info;
-	const char *here = dir->i_private ? dir->i_private : ".";
 	struct railfs_attrs attrs = {};
 	struct inode *inode = NULL;
 	struct dentry *result;
@@ -29,7 +27,7 @@ struct dentry *railfs_lookup(struct inode *dir, struct dentry *dentry, unsigned 
 		goto out;
 	}
 
-	path = railfs_path_under(here, dentry->d_name.name);
+	path = railfs_child_path(dir, dentry);
 	if (!path) {
 		result = ERR_PTR(-ENOMEM);
 		goto out;
@@ -37,9 +35,7 @@ struct dentry *railfs_lookup(struct inode *dir, struct dentry *dentry, unsigned 
 
 	// One name, not the whole directory. Listing the parent to resolve a
 	// single entry made a directory of n names cost n listings to walk.
-	conn = railfs_pool_take(opts->pool);
-	err = railfs_stat(conn, path, &attrs, &found);
-	railfs_pool_give(opts->pool, conn);
+	err = railfs_pool_stat(opts->pool, path, &attrs, &found);
 	if (err) {
 		result = ERR_PTR(err);
 		goto out;

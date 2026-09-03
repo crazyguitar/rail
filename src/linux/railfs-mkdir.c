@@ -16,7 +16,6 @@
 // was given has been instantiated, and an error is an ERR_PTR.
 struct dentry *railfs_mkdir_op(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode)
 {
-	struct railfs_conn *conn;
 	struct railfs_options *opts = dir->i_sb->s_fs_info;
 	struct railfs_attrs attrs = {};
 	struct inode *inode = NULL;
@@ -33,9 +32,7 @@ struct dentry *railfs_mkdir_op(struct mnt_idmap *idmap, struct inode *dir, struc
 		return ERR_PTR(-ENOMEM);
 	}
 
-	conn = railfs_pool_take(opts->pool);
-	err = railfs_meta(conn, RAILFS_META_MKDIR, path, 0);
-	railfs_pool_give(opts->pool, conn);
+	err = railfs_pool_meta(opts->pool, RAILFS_META_MKDIR, path, 0);
 	if (err) {
 		result = ERR_PTR(err);
 		goto out;

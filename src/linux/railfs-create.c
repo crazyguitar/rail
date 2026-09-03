@@ -14,7 +14,6 @@
 
 int railfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl)
 {
-	struct railfs_conn *conn;
 	struct railfs_options *opts = dir->i_sb->s_fs_info;
 	struct railfs_attrs attrs = {};
 	struct inode *inode = NULL;
@@ -30,9 +29,7 @@ int railfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 		return -ENOMEM;
 	}
 
-	conn = railfs_pool_take(opts->pool);
-	err = railfs_create_file(conn, path);
-	railfs_pool_give(opts->pool, conn);
+	err = railfs_pool_create_file(opts->pool, path);
 	if (err) {
 		goto out;
 	}
