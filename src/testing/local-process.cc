@@ -1,8 +1,10 @@
 #include "local-process.h"
 
 #include <array>
+#include <cerrno>
 #include <csignal>
 #include <poll.h>
+#include <spawn.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <thread>
@@ -20,29 +22,29 @@ Result<pid_t> spawn(const std::vector<std::string> &Argv, int &ReadFd, const std
   int Pipe[2];
   if (::pipe(Pipe) != 0) return failErrno("pipe");
 
-  const pid_t Pid = ::fork();
-  if (Pid < 0) {
-    ::close(Pipe[0]);
-    ::close(Pipe[1]);
-    return failErrno("fork");
-  }
+  posix_spawn_file_actions_t Actions;
+  posix_spawn_file_actions_init(&Actions);
+  if (!Cwd.empty()) posix_spawn_file_actions_addchdir_np(&Actions, Cwd.c_str());
+  posix_spawn_file_actions_adddup2(&Actions, Pipe[1], STDOUT_FILENO);
+  posix_spawn_file_actions_adddup2(&Actions, Pipe[1], STDERR_FILENO);
+  posix_spawn_file_actions_addclose(&Actions, Pipe[0]);
+  posix_spawn_file_actions_addclose(&Actions, Pipe[1]);
 
-  if (Pid == 0) {
-    if (!Cwd.empty() && ::chdir(Cwd.c_str()) != 0) ::_exit(126);
-    ::dup2(Pipe[1], STDOUT_FILENO);
-    ::dup2(Pipe[1], STDERR_FILENO);
-    ::close(Pipe[0]);
-    ::close(Pipe[1]);
+  std::vector<char *> Raw;
+  Raw.reserve(Argv.size() + 1);
+  for (const auto &A : Argv) Raw.push_back(const_cast<char *>(A.c_str()));
+  Raw.push_back(nullptr);
 
-    std::vector<char *> Raw;
-    Raw.reserve(Argv.size() + 1);
-    for (const auto &A : Argv) Raw.push_back(const_cast<char *>(A.c_str()));
-    Raw.push_back(nullptr);
-    ::execvp(Raw[0], Raw.data());
-    ::_exit(127);
-  }
-
+  pid_t Pid = -1;
+  const int Failed = ::posix_spawnp(&Pid, Raw[0], &Actions, nullptr, Raw.data(), environ);
+  posix_spawn_file_actions_destroy(&Actions);
   ::close(Pipe[1]);
+  if (Failed != 0) {
+    ::close(Pipe[0]);
+    errno = Failed;
+    return failErrno("posix_spawn");
+  }
+
   ReadFd = Pipe[0];
   return Pid;
 }

@@ -24,11 +24,12 @@
 #include <optional>
 #include <ranges>
 #include <set>
+#include <sstream>
 #include <string>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/sysmacros.h>
 #include <sys/statvfs.h>
+#include <sys/sysmacros.h>
 #include <sys/time.h>
 #include <thread>
 #include <unistd.h>
@@ -38,11 +39,34 @@ namespace rail::e2e {
 
 namespace {
 
-bool mounted(const std::filesystem::path &At) {
+std::vector<std::string> mountPointsUnder(const std::string &Prefix) {
+  std::vector<std::string> Found;
   std::ifstream In("/proc/self/mountinfo");
-  for (std::string Line; std::getline(In, Line);)
-    if (Line.find(" " + At.string() + " ") != std::string::npos) return true;
-  return false;
+  for (std::string Line; std::getline(In, Line);) {
+    std::istringstream Fields(Line);
+    std::string MountPoint;
+    for (int Field = 0; Field < 5 && Fields >> MountPoint; Field++) {}
+    if (MountPoint.rfind(Prefix, 0) == 0) Found.push_back(MountPoint);
+  }
+  return Found;
+}
+
+bool mounted(const std::filesystem::path &At) {
+  const auto Under = mountPointsUnder(At.string());
+  return std::ranges::find(Under, At.string()) != Under.end();
+}
+
+uint64_t numberBefore(const std::string &Log, const char *Label) {
+  const auto To = Log.rfind(Label);
+  if (To == std::string::npos) return 0;
+  const auto From = Log.rfind(", ", To);
+  if (From == std::string::npos) return 0;
+  return std::strtoull(Log.c_str() + From + 2, nullptr, 10);
+}
+
+double bytesFetchedPerByteServed(const std::string &Log) {
+  const auto Requested = static_cast<double>(numberBefore(Log, " bytes requested"));
+  return Requested > 0 ? static_cast<double>(numberBefore(Log, " bytes fetched")) / Requested : 0;
 }
 
 bool waitForMount(const std::filesystem::path &At, std::chrono::seconds Limit = std::chrono::seconds(30)) {
@@ -135,15 +159,8 @@ bool digestRecovers(const std::filesystem::path &Through, const std::string &Wan
 }
 
 void sweepStaleMounts() {
-  std::ifstream In("/proc/self/mountinfo");
-  const std::string Under = localDir().string() + "/mnt-";
-  for (std::string Line; std::getline(In, Line);) {
-    const auto At = Line.find(" " + Under);
-    if (At == std::string::npos) continue;
-    const auto From = At + 1;
-    const auto To = Line.find(' ', From);
-    if (To == std::string::npos) continue;
-    [[maybe_unused]] auto Ignored = runLocal({"fusermount3", "-u", "-z", Line.substr(From, To - From)});
+  for (const auto &Stale : mountPointsUnder(localDir().string() + "/mnt-")) {
+    [[maybe_unused]] auto Ignored = runLocal({"fusermount3", "-u", "-z", Stale});
   }
 }
 
@@ -229,6 +246,10 @@ TEST(Fuse, MountsAndUnmounts) {
   struct ::stat S{};
   ASSERT_EQ(::stat(At.c_str(), &S), 0) << "stat on the mount point failed";
   EXPECT_TRUE(S_ISDIR(S.st_mode));
+  EXPECT_TRUE(mounted(At));
+
+  [[maybe_unused]] const std::string Left = M.drain();
+  EXPECT_FALSE(mounted(At)) << "the mount did not come off";
 }
 
 TEST(Fuse, NullMountReportsTheFileSize) {
@@ -286,16 +307,17 @@ class Mount : public BackendTest {
 protected:
   void SetUp() override {
     Root = remoteDir() + "/fuse-root";
-    removeRemoteRecursive(Root);
-    ASSERT_TRUE(peer().makeDirectory(Root));
-    ASSERT_TRUE(peer().makeDirectory(Root + "/sub"));
+    const std::string Seeds = remoteDir() + "/seed";
 
     Alpha = makeFile("fuse-alpha.bin", 8u << 20, 21);
-    seedRemote(Alpha, Root + "/alpha.bin");
+    seedRemoteOnce(Alpha, Seeds + "/fuse-alpha.bin");
     Nested = makeFile("fuse-nested.bin", 2048, 22);
-    seedRemote(Nested, Root + "/sub/nested.bin");
+    seedRemoteOnce(Nested, Seeds + "/fuse-nested.bin");
     Big = makeFile("fuse-big.bin", 6u << 20, 23);
-    seedRemote(Big, Root + "/big.bin");
+    seedRemoteOnce(Big, Seeds + "/fuse-big.bin");
+    ASSERT_TRUE(resetRemoteRoot(
+        Root,
+        {{Seeds + "/fuse-alpha.bin", "alpha.bin"}, {Seeds + "/fuse-nested.bin", "sub/nested.bin"}, {Seeds + "/fuse-big.bin", "big.bin"}}));
 
     auto Address = peer().address();
     ASSERT_TRUE(Address) << "could not resolve the peer address";
@@ -318,25 +340,19 @@ protected:
   }
 
   void killDaemon() {
-    if (auto Killed = peer().run({"pkill", "-9", "-x", "raild"}); Killed) {
-      [[maybe_unused]] auto Line = Killed->readLine();
-    }
+    killPeerProcess("raild");
     Daemon.reset();
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
   }
 
   void stopDaemon() {
     Daemon.reset();
-    if (auto Killed = peer().run({"pkill", "-x", "raild"}); Killed) {
-      [[maybe_unused]] auto Line = Killed->readLine();
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    stopPeerProcess("raild");
   }
 
   void stopEverything() {
     Live.reset();
     sweepStaleMounts();
-    [[maybe_unused]] auto Killed = runLocal({"pkill", "-x", "mount.railfuse"});
+    endLocalProcess({"-x", "mount.railfuse"});
     stopDaemon();
   }
 
@@ -357,8 +373,7 @@ protected:
 
   void remountWith(std::vector<std::string> Extra, std::vector<std::string> Env = {}) {
     Live.reset();
-    [[maybe_unused]] auto Killed = runLocal({"pkill", "-x", "mount.railfuse"});
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    endLocalProcess({"-x", "mount.railfuse"});
     mountWith(std::move(Extra), std::move(Env));
   }
 
@@ -535,7 +550,7 @@ TEST_P(Mount, StreamCrossesChunkBoundaries) {
   const std::string Log = Live->drain();
   size_t Chunks = 0;
   for (const std::string &What : {std::string{"railfs: streaming"}, std::string{"railfs: prefetching"}}) {
-    for (size_t At2 = Log.find(What); At2 != std::string::npos; At2 = Log.find(What, At2 + What.size())) {
+    for (size_t Found = Log.find(What); Found != std::string::npos; Found = Log.find(What, Found + What.size())) {
       Chunks++;
     }
   }
@@ -667,17 +682,10 @@ TEST_P(Mount, DirectIoReadsAreLargerThanBuffered) {
   EXPECT_EQ(localDigest(At / "big.bin"), localDigest(Big));
   const std::string Buffered = Live->drain();
 
-  const auto Bytes = [](const std::string &Log) -> uint64_t {
-    const auto At2 = Log.rfind(" bytes per read");
-    if (At2 == std::string::npos) return 0;
-    const auto From = Log.rfind(", ", At2);
-    if (From == std::string::npos) return 0;
-    return std::strtoull(Log.c_str() + From + 2, nullptr, 10);
-  };
-
-  EXPECT_GT(Bytes(Direct), Bytes(Buffered)) << "direct io did not produce larger reads\n--- direct ---\n"
-                                            << Direct << "\n--- buffered ---\n"
-                                            << Buffered;
+  EXPECT_GT(numberBefore(Direct, " bytes per read"), numberBefore(Buffered, " bytes per read"))
+      << "direct io did not produce larger reads\n--- direct ---\n"
+      << Direct << "\n--- buffered ---\n"
+      << Buffered;
 }
 
 namespace {
@@ -785,18 +793,18 @@ TEST_P(Mount, AReadAcrossAWindowBoundaryIsWhole) {
   remountWith({"--readahead", "1"});
 
   const size_t Size = 1u << 20;
-  const off_t At2 = static_cast<off_t>(512u << 10);
+  const off_t Offset = static_cast<off_t>(512u << 10);
 
   const int Fd = ::open((At / "alpha.bin").c_str(), O_RDONLY);
   ASSERT_GE(Fd, 0);
   std::vector<char> Got(Size);
-  const ssize_t Read = ::pread(Fd, Got.data(), Size, At2);
+  const ssize_t Read = ::pread(Fd, Got.data(), Size, Offset);
   ::close(Fd);
 
   ASSERT_EQ(Read, static_cast<ssize_t>(Size)) << "a read across the window boundary came back short";
 
   std::ifstream Source(Alpha, std::ios::binary);
-  Source.seekg(At2);
+  Source.seekg(Offset);
   std::vector<char> Want(Size);
   Source.read(Want.data(), static_cast<std::streamsize>(Size));
   EXPECT_EQ(Got, Want) << "a read across the window boundary did not match the source";
@@ -813,15 +821,15 @@ TEST_P(Mount, AReadAcrossAChunkBoundaryIsWhole) {
   for (off_t Off = 0; Off < static_cast<off_t>(2u << 20); Off += static_cast<off_t>(Warm.size()))
     ASSERT_EQ(::pread(Fd, Warm.data(), Warm.size(), Off), static_cast<ssize_t>(Warm.size()));
 
-  const off_t At2 = static_cast<off_t>((3u << 20) + (512u << 10));
+  const off_t Offset = static_cast<off_t>((3u << 20) + (512u << 10));
   std::vector<char> Got(Size);
-  const ssize_t Read = ::pread(Fd, Got.data(), Size, At2);
+  const ssize_t Read = ::pread(Fd, Got.data(), Size, Offset);
   ::close(Fd);
 
   ASSERT_EQ(Read, static_cast<ssize_t>(Size)) << "a read across the chunk boundary came back short";
 
   std::ifstream Source(Alpha, std::ios::binary);
-  Source.seekg(At2);
+  Source.seekg(Offset);
   std::vector<char> Want(Size);
   Source.read(Want.data(), static_cast<std::streamsize>(Size));
   EXPECT_EQ(Got, Want) << "a read across the chunk boundary did not match the source";
@@ -845,36 +853,14 @@ TEST_P(Mount, ARandomReaderDoesNotPullAWholeWindow) {
   ::close(Fd);
 
   const std::string Log = Live->drain();
-  const auto count = [&Log](const char *Label) -> double {
-    const auto To = Log.rfind(Label);
-    if (To == std::string::npos) return 0;
-    const auto From = Log.rfind(", ", To);
-    if (From == std::string::npos) return 0;
-    return static_cast<double>(std::strtoull(Log.c_str() + From + 2, nullptr, 10));
-  };
-
-  const double Requested = count(" bytes requested");
-  ASSERT_GT(Requested, 0) << Log;
-  const double Pulled = count(" bytes fetched") / Requested;
+  ASSERT_GT(numberBefore(Log, " bytes requested"), 0u) << Log;
+  const double Pulled = bytesFetchedPerByteServed(Log);
   EXPECT_LE(Pulled, 32) << "a reader that jumps pulled " << Pulled << " bytes for every byte it asked for\n" << Log;
 }
 
 TEST_P(Mount, InterleavedReadersKeepTheirOwnWindow) {
   constexpr size_t kStep = 4096;
   constexpr size_t kSpan = 1u << 20;
-
-  const auto count = [](const std::string &Log, const char *Label) -> double {
-    const auto To = Log.rfind(Label);
-    if (To == std::string::npos) return 0;
-    const auto From = Log.rfind(", ", To);
-    if (From == std::string::npos) return 0;
-    return static_cast<double>(std::strtoull(Log.c_str() + From + 2, nullptr, 10));
-  };
-
-  const auto amplification = [&](const std::string &Log) {
-    const double Requested = count(Log, " bytes requested");
-    return Requested > 0 ? count(Log, " bytes fetched") / Requested : 0;
-  };
 
   const auto readInStep = [&](const std::vector<std::filesystem::path> &Paths) {
     std::vector<int> Fds;
@@ -899,8 +885,8 @@ TEST_P(Mount, InterleavedReadersKeepTheirOwnWindow) {
   readInStep({At / "alpha.bin", At / "big.bin"});
   const std::string Together = Live->drain();
 
-  const double One = amplification(Alone);
-  const double Two = amplification(Together);
+  const double One = bytesFetchedPerByteServed(Alone);
+  const double Two = bytesFetchedPerByteServed(Together);
   ASSERT_GT(One, 0) << "no read summary from a mount reading one file\n" << Alone;
   EXPECT_LE(Two, 3 * One) << "reading a second file made the mount refetch its window: " << Two << " bytes fetched per byte served against " << One
                           << " alone\n--- alone ---\n"
@@ -1065,6 +1051,12 @@ TEST_P(Mount, ADanglingLinkIsStillListed) {
   struct ::stat Followed{};
   EXPECT_NE(::stat((At / "dangling").c_str(), &Followed), 0) << "a link to nothing resolved to something";
   EXPECT_EQ(errno, ENOENT);
+
+  std::vector<std::string> Listed;
+  std::error_code Failed;
+  for (const auto &Entry : std::filesystem::directory_iterator(At, Failed)) Listed.push_back(Entry.path().filename().string());
+  EXPECT_NE(std::ranges::find(Listed, "dangling"), Listed.end()) << "the listing dropped the dangling link";
+
   EXPECT_EQ(::unlink((At / "dangling").c_str()), 0);
 }
 
@@ -1271,9 +1263,12 @@ TEST_P(Mount, SeesAFileThatGrewOnThePeer) {
   auto Grew = peer().run({"sh", "-c", "dd if=/dev/zero bs=1M count=1 >> " + Root + "/alpha.bin 2>/dev/null"});
   ASSERT_TRUE(Grew);
   [[maybe_unused]] auto Line = Grew->readLine();
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-  const auto N = ::pread(Fd, Buf.data(), Buf.size(), static_cast<off_t>(Was));
+  ssize_t N = 0;
+  for (int Attempt = 0; Attempt < 40 && N < static_cast<ssize_t>(Buf.size()); Attempt++) {
+    N = ::pread(Fd, Buf.data(), Buf.size(), static_cast<off_t>(Was));
+    if (N < static_cast<ssize_t>(Buf.size())) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
   ::close(Fd);
 
   const std::string Log = Live->drain();

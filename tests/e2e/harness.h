@@ -49,9 +49,25 @@ std::string localDigest(const std::filesystem::path &P);
 
 // Places a fixture on the peer and verifies it arrived intact, so a failed
 // copy surfaces here rather than later as "the delta matched nothing".
-void seedRemote(const std::filesystem::path &Local, const std::string &Remote);
+bool seedRemote(const std::filesystem::path &Local, const std::string &Remote);
+void expectFileMatches(const std::filesystem::path &Local, const std::string &Remote);
+std::filesystem::path freshLocal(const std::string &Name);
 
 void removeRemoteRecursive(const std::string &Remote);
+
+void seedRemoteOnce(const std::filesystem::path &Local, const std::string &Remote);
+
+struct RemoteCopy {
+  std::string From;
+  std::string To;
+};
+
+bool resetRemoteRoot(const std::string &Root, const std::vector<RemoteCopy> &Copies);
+
+void stopPeerProcess(const std::string &Name);
+void killPeerProcess(const std::string &Name);
+
+void endLocalProcess(const std::vector<std::string> &Match);
 
 // True when a partial transfer left a temp file behind.
 bool remoteHasTempFiles();

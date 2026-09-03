@@ -26,7 +26,7 @@ protected:
   }
 };
 
-TEST_P(Edge, EmptyFile) {
+TEST_P(Edge, EmptyFileArrivesWithNoLiterals) {
   const auto Local = makeEmptyFile("edge-empty.bin");
   const auto Remote = remotePath("edge-empty.bin");
   ASSERT_TRUE(peer().removeFile(Remote));
@@ -38,7 +38,7 @@ TEST_P(Edge, EmptyFile) {
   expectIdentical(Local, Remote);
 }
 
-TEST_P(Edge, SmallerThanOneBlock) {
+TEST_P(Edge, FileSmallerThanOneBlockSendsAllBytesAsLiterals) {
   const auto Local = makeFile("edge-tiny.bin", 100, 7);
   const auto Remote = remotePath("edge-tiny.bin");
   ASSERT_TRUE(peer().removeFile(Remote));
@@ -49,8 +49,8 @@ TEST_P(Edge, SmallerThanOneBlock) {
   expectIdentical(Local, Remote);
 }
 
-TEST_P(Edge, ExactlyOneBlock) {
-  const uint32_t Block = blockLengthFor(700 * 700);
+TEST_P(Edge, FileOfExactlyOneBlockCopiesIdentically) {
+  const uint32_t Block = blockLengthFor(uint64_t{kDefaultBlockSize} * kDefaultBlockSize);
   const auto Local = makeFile("edge-oneblock.bin", Block, 8);
   const auto Remote = remotePath("edge-oneblock.bin");
   ASSERT_TRUE(peer().removeFile(Remote));
@@ -59,7 +59,7 @@ TEST_P(Edge, ExactlyOneBlock) {
   expectIdentical(Local, Remote);
 }
 
-TEST_P(Edge, ExactlyNBlocks) {
+TEST_P(Edge, ExactlyNBlocksMatchEveryBlockOnResend) {
   const uint32_t Block = blockLengthFor(64u << 20);
   const auto Local = makeFile("edge-nblocks.bin", uint64_t(Block) * 64, 9);
   const auto Remote = remotePath("edge-nblocks.bin");
@@ -76,7 +76,7 @@ TEST_P(Edge, ExactlyNBlocks) {
   EXPECT_EQ(Again.MatchedBytes, uint64_t(Block) * 64);
 }
 
-TEST_P(Edge, DestinationLongerThanSource) {
+TEST_P(Edge, ALongerDestinationIsTruncatedToTheSource) {
   const auto Seed = makeFile("edge-long-seed.bin", 32u << 20, 11);
   const auto Remote = remotePath("edge-shrink.bin");
   seedRemote(Seed, Remote);
@@ -90,7 +90,7 @@ TEST_P(Edge, DestinationLongerThanSource) {
   expectIdentical(Local, Remote);
 }
 
-TEST_P(Edge, DestinationShorterThanSource) {
+TEST_P(Edge, AShorterDestinationGrowsToMatchTheSource) {
   const auto Seed = makeFile("edge-short-seed.bin", 8u << 20, 12);
   const auto Remote = remotePath("edge-grow.bin");
   seedRemote(Seed, Remote);

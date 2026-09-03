@@ -5,20 +5,7 @@
 
 namespace rail::e2e {
 
-class Tree : public BackendTest {
-protected:
-  void expectFileMatches(const std::filesystem::path &Local, const std::string &Remote) {
-    EXPECT_TRUE(peer().exists(Remote).value_or(false)) << Remote << " is missing";
-    EXPECT_EQ(peer().digest(Remote).value_or(""), localDigest(Local)) << Remote << " differs";
-  }
-
-  std::filesystem::path freshLocal(const std::string &Name) {
-    const auto Root = localDir() / Name;
-    std::filesystem::remove_all(Root);
-    std::filesystem::create_directories(Root);
-    return Root;
-  }
-};
+class Tree : public BackendTest {};
 
 TEST_P(Tree, ManyFilesArrive) {
   const std::string Name = "tree-many";

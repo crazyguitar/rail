@@ -6,11 +6,6 @@ namespace rail::e2e {
 
 class Directory : public BackendTest {
 protected:
-  void expectFileMatches(const std::filesystem::path &Local, const std::string &Remote) {
-    EXPECT_TRUE(peer().exists(Remote).value_or(false)) << Remote << " is missing";
-    EXPECT_EQ(peer().digest(Remote).value_or(""), localDigest(Local)) << Remote << " differs";
-  }
-
   void removeRemoteTree(const std::string &Remote) {
     for (const auto &Leaf : {"/sub/nested.bin", "/top.bin"}) peer().removeFile(Remote + Leaf);
   }

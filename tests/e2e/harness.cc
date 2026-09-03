@@ -1,7 +1,7 @@
 #include "harness.h"
 
-#include "rail/app/checksum.h"
 #include "local-process.h"
+#include "rail/app/checksum.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -9,6 +9,7 @@
 #include <fstream>
 #include <gtest/gtest.h>
 #include <random>
+#include <set>
 #include <thread>
 
 namespace rail::e2e {
@@ -171,14 +172,14 @@ std::string localDigest(const std::filesystem::path &P) {
   return toHex(H.digest());
 }
 
-void seedRemote(const std::filesystem::path &Local, const std::string &Remote) {
+bool seedRemote(const std::filesystem::path &Local, const std::string &Remote) {
   if (auto R = peer().makeDirectory(remoteDir()); !R) {
     ADD_FAILURE() << R.error().message();
-    return;
+    return false;
   }
   if (auto R = peer().upload(Local, Remote); !R) {
     ADD_FAILURE() << R.error().message();
-    return;
+    return false;
   }
 
   // Check the size rather than the digest: sftp reads are slow enough that
@@ -187,10 +188,24 @@ void seedRemote(const std::filesystem::path &Local, const std::string &Remote) {
   auto Stat = peer().stat(Remote);
   if (!Stat) {
     ADD_FAILURE() << Stat.error().message();
-    return;
+    return false;
   }
   const auto Expected = std::filesystem::file_size(Local);
-  if (Stat->Size != Expected) ADD_FAILURE() << std::format("seeded {} is {} bytes, expected {}", Remote, Stat->Size, Expected);
+  if (Stat->Size == Expected) return true;
+  ADD_FAILURE() << std::format("seeded {} is {} bytes, expected {}", Remote, Stat->Size, Expected);
+  return false;
+}
+
+void expectFileMatches(const std::filesystem::path &Local, const std::string &Remote) {
+  EXPECT_TRUE(peer().exists(Remote).value_or(false)) << Remote << " is missing";
+  EXPECT_EQ(peer().digest(Remote).value_or(""), localDigest(Local)) << Remote << " differs";
+}
+
+std::filesystem::path freshLocal(const std::string &Name) {
+  const auto Root = localDir() / Name;
+  std::filesystem::remove_all(Root);
+  std::filesystem::create_directories(Root);
+  return Root;
 }
 
 void removeRemoteRecursive(const std::string &Remote) {
@@ -204,6 +219,80 @@ void removeRemoteRecursive(const std::string &Remote) {
     removeRemoteRecursive(Remote + "/" + Entry);
   }
   [[maybe_unused]] auto Removed = peer().removeDirectory(Remote);
+}
+
+void seedRemoteOnce(const std::filesystem::path &Local, const std::string &Remote) {
+  static std::set<std::string> Seeded;
+  if (Seeded.contains(Remote)) return;
+  if (auto R = peer().makeDirectory(Remote.substr(0, Remote.rfind('/'))); !R) {
+    ADD_FAILURE() << R.error().message();
+    return;
+  }
+  if (seedRemote(Local, Remote)) Seeded.insert(Remote);
+}
+
+namespace {
+
+void runOnPeerToCompletion(const std::vector<std::string> &Argv) {
+  auto Ran = peer().run(Argv);
+  if (!Ran) return;
+  while (Ran->readLine()) {}
+}
+
+bool peerHasProcess(const std::string &Name) {
+  auto Ran = peer().run({"pgrep", "-x", "--", Name});
+  return Ran && Ran->readLine().has_value();
+}
+
+void endPeerProcess(const std::string &Name, const std::string &Signal) {
+  runOnPeerToCompletion({"pkill", "-" + Signal, "-x", "--", Name});
+  for (int Attempt = 0; Attempt < 100; Attempt++) {
+    if (!peerHasProcess(Name)) return;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  ADD_FAILURE() << Name << " is still running on the peer";
+}
+
+bool makeRemoteParents(const std::string &Root, const std::string &Relative) {
+  for (size_t Slash = Relative.find('/'); Slash != std::string::npos; Slash = Relative.find('/', Slash + 1)) {
+    if (!peer().makeDirectory(Root + "/" + Relative.substr(0, Slash))) return false;
+  }
+  return true;
+}
+
+} // namespace
+
+bool resetRemoteRoot(const std::string &Root, const std::vector<RemoteCopy> &Copies) {
+  runOnPeerToCompletion({"rm", "-rf", "--", Root});
+  if (peer().exists(Root).value_or(true)) return false;
+  if (!peer().makeDirectory(Root)) return false;
+
+  for (const auto &Copy : Copies) {
+    const std::string Target = Root + "/" + Copy.To;
+    if (!makeRemoteParents(Root, Copy.To)) return false;
+    runOnPeerToCompletion({"cp", "--", Copy.From, Target});
+    if (!peer().exists(Target).value_or(false)) return false;
+  }
+  return true;
+}
+
+void stopPeerProcess(const std::string &Name) { endPeerProcess(Name, "TERM"); }
+
+void killPeerProcess(const std::string &Name) { endPeerProcess(Name, "KILL"); }
+
+void endLocalProcess(const std::vector<std::string> &Match) {
+  std::vector<std::string> Kill{"pkill"};
+  Kill.insert(Kill.end(), Match.begin(), Match.end());
+  [[maybe_unused]] auto Killed = runLocal(Kill);
+
+  std::vector<std::string> Find{"pgrep"};
+  Find.insert(Find.end(), Match.begin(), Match.end());
+  for (int Attempt = 0; Attempt < 250; Attempt++) {
+    auto Found = runLocal(Find);
+    if (!Found || Found->ExitStatus != 0) return;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  ADD_FAILURE() << "a local process matching " << Match.back() << " is still running";
 }
 
 bool remoteHasTempFiles() {
@@ -296,6 +385,22 @@ bool pushThenKillOnceWriting(const std::filesystem::path &Local, const std::stri
   return Writing;
 }
 
+Report reportIn(const std::string &Out) {
+  Report R;
+  R.Files = jsonNumber(Out, "files");
+  R.FileSize = jsonNumber(Out, "file_size");
+  R.LiteralBytes = jsonNumber(Out, "literal_bytes");
+  R.MatchedBytes = jsonNumber(Out, "matched_bytes");
+  R.HashHits = jsonNumber(Out, "hash_hits");
+  R.FalseAlarms = jsonNumber(Out, "false_alarms");
+  R.ScanTime = std::chrono::nanoseconds(jsonNumber(Out, "scan_ns"));
+  R.TransferTime = std::chrono::nanoseconds(jsonNumber(Out, "transfer_ns"));
+  R.Backend = jsonString(Out, "backend");
+  R.Rails = jsonString(Out, "rails");
+  R.DeltaUsed = Out.find("\"delta_used\":true") != std::string::npos;
+  return R;
+}
+
 Report push(const std::filesystem::path &Local, const std::string &Remote, const PushOptions &Opts) {
   const auto Argv = pushArgv(Local, Remote, Opts);
 
@@ -310,19 +415,7 @@ Report push(const std::filesystem::path &Local, const std::string &Remote, const
     return R;
   }
 
-  const std::string &Out = Ran->Output;
-  R.Files = jsonNumber(Out, "files");
-  R.FileSize = jsonNumber(Out, "file_size");
-  R.LiteralBytes = jsonNumber(Out, "literal_bytes");
-  R.MatchedBytes = jsonNumber(Out, "matched_bytes");
-  R.HashHits = jsonNumber(Out, "hash_hits");
-  R.FalseAlarms = jsonNumber(Out, "false_alarms");
-  R.ScanTime = std::chrono::nanoseconds(jsonNumber(Out, "scan_ns"));
-  R.TransferTime = std::chrono::nanoseconds(jsonNumber(Out, "transfer_ns"));
-  R.Backend = jsonString(Out, "backend");
-  R.Rails = jsonString(Out, "rails");
-  R.DeltaUsed = Out.find("\"delta_used\":true") != std::string::npos;
-  return R;
+  return reportIn(Ran->Output);
 }
 
 Report pull(const std::string &Remote, const std::filesystem::path &Local, const PushOptions &Opts) {
@@ -339,19 +432,7 @@ Report pull(const std::string &Remote, const std::filesystem::path &Local, const
     return R;
   }
 
-  const std::string &Out = Ran->Output;
-  R.Files = jsonNumber(Out, "files");
-  R.FileSize = jsonNumber(Out, "file_size");
-  R.LiteralBytes = jsonNumber(Out, "literal_bytes");
-  R.MatchedBytes = jsonNumber(Out, "matched_bytes");
-  R.HashHits = jsonNumber(Out, "hash_hits");
-  R.FalseAlarms = jsonNumber(Out, "false_alarms");
-  R.ScanTime = std::chrono::nanoseconds(jsonNumber(Out, "scan_ns"));
-  R.TransferTime = std::chrono::nanoseconds(jsonNumber(Out, "transfer_ns"));
-  R.Backend = jsonString(Out, "backend");
-  R.Rails = jsonString(Out, "rails");
-  R.DeltaUsed = Out.find("\"delta_used\":true") != std::string::npos;
-  return R;
+  return reportIn(Ran->Output);
 }
 
 FailedPush pullExpectingFailure(const std::string &Remote, const std::filesystem::path &Local, const PushOptions &Opts) {
