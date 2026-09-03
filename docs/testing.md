@@ -18,8 +18,7 @@ tree at the same path. A peer that is behind fails as a refused connection.
 
 | | |
 | --- | --- |
-| `RAIL_PEER` | ssh name of the far host; required, no default |
-| `RAIL_FABRIC` | its address on the fast network, default `RAIL_PEER` |
+| `RAIL_PEER` | the far host, as both ssh and the data channel reach it; required, no default |
 | `RAIL_DIR` | working directory on both sides, default `/tmp/rail-e2e` |
 | `RAIL_KERNEL_TESTS` | ask for the privileged suites; without it they are left out |
 
@@ -38,14 +37,14 @@ Grant `sudo` for the one binary, not for everything:
 ```bash
 sudo tee /etc/sudoers.d/rail-e2e >/dev/null <<'RULE'
 %rail-test ALL=(root) NOPASSWD: SETENV: /home/you/rail/build/tests/e2e/rail-e2e
+%rail-test ALL=(root) NOPASSWD: /usr/bin/umount -l /tmp/rail-e2e/kernel-mnt, /usr/sbin/rmmod railfs, /usr/bin/rm -rf /tmp/rail-e2e
 RULE
 sudo chmod 0440 /etc/sudoers.d/rail-e2e
 sudo visudo -c
 ```
 
-`SETENV:` lets `sudo -E` carry `RAIL_PEER` through. Keep the path exact: a rule
-ending in a directory grants root to anything dropped in it. Run `visudo -c`
-before logging out — a malformed file locks everyone out of `sudo`.
+`SETENV:` carries `RAIL_PEER` through; the second line is the launcher's
+cleanup. Keep the path exact, and run `visudo -c` before logging out.
 
 ## In Kubernetes
 
@@ -93,7 +92,7 @@ and install again.
 ## The CSI driver
 
 Its tests mount for real, so they take the peer from the environment and skip
-without it. Six of the nine need neither peer nor root:
+without it. Five of the nine need neither peer nor root:
 
 ```bash
 cd csi && sudo RAILFS_CSI_HOST=<peer> RAILFS_CSI_EXPORT=models go test ./...
