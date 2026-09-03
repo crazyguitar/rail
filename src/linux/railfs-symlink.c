@@ -19,7 +19,6 @@ int railfs_symlink(struct mnt_idmap *idmap, struct inode *dir, struct dentry *de
 	struct railfs_options *opts = dir->i_sb->s_fs_info;
 	struct railfs_meta_req req = { .op = RAILFS_META_SYMLINK, .target = symname };
 	struct railfs_attrs attrs = {};
-	struct railfs_conn *conn;
 	struct inode *inode;
 	char *path;
 	int err;
@@ -35,9 +34,7 @@ int railfs_symlink(struct mnt_idmap *idmap, struct inode *dir, struct dentry *de
 
 	req.path = path;
 
-	conn = railfs_pool_take(opts->pool);
-	err = railfs_meta_send(conn, &req);
-	railfs_pool_give(opts->pool, conn);
+	err = railfs_pool_meta_send(opts->pool, &req);
 	if (err) {
 		goto out;
 	}
@@ -64,9 +61,8 @@ out:
 const char *railfs_get_link(struct dentry *dentry, struct inode *inode, struct delayed_call *done)
 {
 	struct railfs_options *opts = inode->i_sb->s_fs_info;
-	const char *path = inode->i_private;
-	struct railfs_meta_req req = { .op = RAILFS_META_READLINK, .path = path };
-	struct railfs_conn *conn;
+	struct railfs_meta_req req = { .op = RAILFS_META_READLINK };
+	struct railfs_path *path;
 	char *target = NULL;
 	int err;
 
@@ -74,15 +70,20 @@ const char *railfs_get_link(struct dentry *dentry, struct inode *inode, struct d
 		return ERR_PTR(-ECHILD);
 	}
 
-	if (!opts || !opts->pool || !path) {
+	if (!opts || !opts->pool) {
 		return ERR_PTR(-ENOTCONN);
 	}
 
+	path = railfs_path_hold(inode);
+	if (!path) {
+		return ERR_PTR(-ENOTCONN);
+	}
+
+	req.path = path->name;
 	req.link = &target;
 
-	conn = railfs_pool_take(opts->pool);
-	err = railfs_meta_send(conn, &req);
-	railfs_pool_give(opts->pool, conn);
+	err = railfs_pool_meta_send(opts->pool, &req);
+	railfs_path_put(path);
 	if (err) {
 		return ERR_PTR(err);
 	}

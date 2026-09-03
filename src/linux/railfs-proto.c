@@ -69,7 +69,7 @@ int railfs_get_str(struct railfs_cursor *c, char **out)
 		return -EBADMSG;
 	}
 
-	*out = kmalloc(n + 1, GFP_KERNEL);
+	*out = kmalloc(n + 1, GFP_NOFS);
 	if (!*out) {
 		return -ENOMEM;
 	}

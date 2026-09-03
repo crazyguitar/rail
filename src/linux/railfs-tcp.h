@@ -6,6 +6,13 @@
 
 #include "railfs-rdma.h"
 
+struct railfs_peer {
+	char *host;
+	u16 port;
+	bool rdma;
+	bool verify;
+};
+
 struct railfs_conn {
 	struct socket *sock;
 	struct socket *data;
@@ -17,11 +24,12 @@ struct railfs_conn {
 	 * absent, so the reader has to know not to look at it.
 	 */
 	bool verify;
+	bool dead;
 };
 
 #include "railfs-proto.h"
 
-struct railfs_conn *railfs_connect(const char *host, u16 port, bool rdma, bool verify);
+struct railfs_conn *railfs_connect(const struct railfs_peer *peer);
 void railfs_disconnect(struct railfs_conn *conn);
 
 /* Several connections to the same peer. Every operation holds one for its whole
@@ -31,6 +39,7 @@ void railfs_disconnect(struct railfs_conn *conn);
  */
 /* Bounded by the busy bitmap below, which is one unsigned long. */
 #define RAILFS_MAX_CONNS 64
+#define RAILFS_WIRE_ATTEMPTS 2
 
 struct railfs_pool {
 	struct railfs_conn *conns[RAILFS_MAX_CONNS];
@@ -38,9 +47,13 @@ struct railfs_pool {
 	unsigned long busy;
 	spinlock_t lock;
 	wait_queue_head_t waiters;
+	struct railfs_peer peer;
+	unsigned long retried[RAILFS_MAX_CONNS];
 };
 
-struct railfs_pool *railfs_pool_open(const char *host, u16 port, unsigned int count, bool rdma, bool verify);
+typedef int (*railfs_wire_op)(struct railfs_conn *conn, void *arg);
+
+struct railfs_pool *railfs_pool_open(const struct railfs_peer *peer, unsigned int count);
 void railfs_pool_close(struct railfs_pool *pool);
 struct railfs_conn *railfs_pool_take(struct railfs_pool *pool);
 
@@ -53,6 +66,10 @@ struct railfs_conn *railfs_pool_take(struct railfs_pool *pool);
  */
 struct railfs_conn *railfs_pool_take_near(struct railfs_pool *pool, unsigned int hint, unsigned int span);
 void railfs_pool_give(struct railfs_pool *pool, struct railfs_conn *conn);
+
+int railfs_pool_call(struct railfs_pool *pool, railfs_wire_op op, void *arg);
+int railfs_pool_call_near(struct railfs_pool *pool, unsigned int hint, unsigned int span, railfs_wire_op op, void *arg);
+int railfs_pool_apply(struct railfs_pool *pool, railfs_wire_op op, void *arg);
 
 /* Lists a directory on the peer. On success *out holds *count entries the
  * caller frees with railfs_free_dirents().
@@ -109,5 +126,13 @@ int railfs_write(struct railfs_conn *conn, const char *path, u64 offset, const v
  */
 int railfs_write_folios(struct railfs_conn *conn, const char *path, u64 offset, struct folio **folios, unsigned int nr, u32 len,
 		      bool truncate);
+
+int railfs_pool_stat(struct railfs_pool *pool, const char *path, struct railfs_attrs *out, bool *found);
+int railfs_pool_list(struct railfs_pool *pool, const char *path, struct railfs_dirent **out, u32 *count);
+int railfs_pool_space_of(struct railfs_pool *pool, const char *path, struct railfs_space *out);
+int railfs_pool_meta_send(struct railfs_pool *pool, const struct railfs_meta_req *req);
+int railfs_pool_meta(struct railfs_pool *pool, u16 op, const char *path, u64 size);
+int railfs_pool_meta_to(struct railfs_pool *pool, u16 op, const char *path, const char *target, u64 size);
+int railfs_pool_create_file(struct railfs_pool *pool, const char *path);
 
 #endif

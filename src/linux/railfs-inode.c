@@ -39,12 +39,61 @@ void railfs_init_once(void *p)
 	inode_init_once(&self->vfs);
 }
 
+struct railfs_path *railfs_path_new(const char *name)
+{
+	size_t len = strlen(name) + 1;
+	struct railfs_path *path = kmalloc(sizeof(*path) + len, GFP_NOFS);
+
+	if (!path) {
+		return NULL;
+	}
+
+	kref_init(&path->ref);
+	memcpy(path->name, name, len);
+	return path;
+}
+
+static void railfs_path_release(struct kref *ref)
+{
+	kfree(container_of(ref, struct railfs_path, ref));
+}
+
+void railfs_path_put(struct railfs_path *path)
+{
+	if (path) {
+		kref_put(&path->ref, railfs_path_release);
+	}
+}
+
+struct railfs_path *railfs_path_hold(struct inode *inode)
+{
+	struct railfs_path *path;
+
+	spin_lock(&inode->i_lock);
+	path = inode->i_private;
+	if (path) {
+		kref_get(&path->ref);
+	}
+	spin_unlock(&inode->i_lock);
+	return path;
+}
+
+void railfs_path_replace(struct inode *inode, struct railfs_path *fresh)
+{
+	struct railfs_path *old;
+
+	spin_lock(&inode->i_lock);
+	old = inode->i_private;
+	inode->i_private = fresh;
+	spin_unlock(&inode->i_lock);
+	railfs_path_put(old);
+}
+
 void railfs_evict_inode(struct inode *inode)
 {
 	truncate_inode_pages_final(&inode->i_data);
 	clear_inode(inode);
-	kfree(inode->i_private);
-	inode->i_private = NULL;
+	railfs_path_replace(inode, NULL);
 }
 
 // Only ever from the inode constructor: the page cache says not to tune this
@@ -65,22 +114,30 @@ void railfs_tune_folios(struct inode *inode)
 				      railfs_fetch_order(opts));
 }
 
-struct inode *railfs_make_inode(struct super_block *sb, umode_t mode, loff_t size)
+static int railfs_inode_names(struct inode *inode, void *wanted)
 {
-	struct railfs_options *opts = sb->s_fs_info;
-	struct inode *inode = new_inode(sb);
+	const struct railfs_path *asked = wanted;
+	struct railfs_path *path;
+	bool same;
 
-	if (!inode) {
-		return NULL;
-	}
+	spin_lock(&inode->i_lock);
+	path = inode->i_private;
+	same = path && strcmp(path->name, asked->name) == 0;
+	spin_unlock(&inode->i_lock);
+	return same;
+}
 
-	inode->i_ino = get_next_ino();
-	inode->i_mode = mode;
-	inode->i_uid = opts ? opts->uid : GLOBAL_ROOT_UID;
-	inode->i_gid = opts ? opts->gid : GLOBAL_ROOT_GID;
-	simple_inode_init_ts(inode);
-	i_size_write(inode, size);
+static int railfs_inode_take_name(struct inode *inode, void *wanted)
+{
+	struct railfs_path *path = wanted;
 
+	inode->i_private = railfs_path_get(path);
+	inode->i_ino = railfs_ino_of(path->name);
+	return 0;
+}
+
+static void railfs_install_ops(struct inode *inode, umode_t mode)
+{
 	if (S_ISDIR(mode)) {
 		inode->i_op = &railfs_dir_inode_ops;
 		inode->i_fop = &railfs_dir_ops;
@@ -97,33 +154,33 @@ struct inode *railfs_make_inode(struct super_block *sb, umode_t mode, loff_t siz
 		// at a time, measured 1.47 against 3.77 GiB/s.
 		railfs_tune_folios(inode);
 	}
-
-	insert_inode_hash(inode);
-	return inode;
 }
 
-struct inode *railfs_inode_for(struct super_block *sb, const struct railfs_attrs *a, const char *path)
+static umode_t railfs_mode_of(const struct railfs_attrs *a)
 {
 	umode_t mode = a->mode & RAILFS_MODE_BITS;
-	struct inode *inode;
 
 	if (a->directory) {
-		mode |= S_IFDIR;
-	} else if (a->link) {
-		mode |= S_IFLNK;
-	} else {
-		mode |= S_IFREG;
+		return mode | S_IFDIR;
 	}
 
-	// The daemon reports the mode it has, and a read-only mount would be a
-	// separate decision; nothing here narrows it further.
-
-	inode = railfs_make_inode(sb, mode, a->size);
-	if (!inode) {
-		return NULL;
+	if (a->link) {
+		return mode | S_IFLNK;
 	}
 
-	inode->i_ino = railfs_ino_of(path);
+	return mode | S_IFREG;
+}
+
+static void railfs_fill_new_inode(struct inode *inode, const struct railfs_attrs *a)
+{
+	struct railfs_options *opts = inode->i_sb->s_fs_info;
+
+	inode->i_mode = railfs_mode_of(a);
+	inode->i_uid = opts ? opts->uid : GLOBAL_ROOT_UID;
+	inode->i_gid = opts ? opts->gid : GLOBAL_ROOT_GID;
+	simple_inode_init_ts(inode);
+	i_size_write(inode, a->size);
+	railfs_install_ops(inode, inode->i_mode);
 
 	// Without these a listing dates every file to the moment the mount saw it,
 	// and a second name for one file reads as the only one.
@@ -143,16 +200,38 @@ struct inode *railfs_inode_for(struct super_block *sb, const struct railfs_attrs
 	RAILFS_I(inode)->mtime = a->mtime;
 	RAILFS_I(inode)->checked = jiffies;
 	RAILFS_I(inode)->mine = false;
+}
 
-	// The peer names files, not inode numbers, so a read asks for this one by
-	// the path it was found at.
-	inode->i_private = kstrdup(path, GFP_NOFS);
-	if (!inode->i_private) {
-		iput(inode);
+struct inode *railfs_inode_for(struct super_block *sb, const struct railfs_attrs *a, const char *path)
+{
+	struct railfs_path *name = railfs_path_new(path);
+	struct inode *inode;
+
+	if (!name) {
 		return NULL;
 	}
 
+	inode = iget5_locked(sb, railfs_ino_of(path), railfs_inode_names, railfs_inode_take_name, name);
+	railfs_path_put(name);
+	if (!inode) {
+		return NULL;
+	}
+
+	if (!(inode->i_state & I_NEW)) {
+		return inode;
+	}
+
+	railfs_fill_new_inode(inode, a);
+	unlock_new_inode(inode);
 	return inode;
+}
+
+void railfs_rehash_inode(struct inode *inode, struct railfs_path *fresh)
+{
+	remove_inode_hash(inode);
+	railfs_path_replace(inode, fresh);
+	inode->i_ino = railfs_ino_of(fresh->name);
+	__insert_inode_hash(inode, inode->i_ino);
 }
 
 // Asks the peer what it holds now. Nothing else in this mount ever notices a
@@ -162,13 +241,12 @@ int railfs_refresh(struct inode *inode, bool force)
 {
 	struct railfs_options *opts = inode->i_sb->s_fs_info;
 	struct railfs_inode *self = RAILFS_I(inode);
-	const char *path = inode->i_private;
 	struct railfs_attrs attrs = {};
-	struct railfs_conn *conn;
+	struct railfs_path *path;
 	bool found = false;
 	int err;
 
-	if (!opts || !opts->pool || !path) {
+	if (!opts || !opts->pool) {
 		return 0;
 	}
 
@@ -176,9 +254,13 @@ int railfs_refresh(struct inode *inode, bool force)
 		return 0;
 	}
 
-	conn = railfs_pool_take(opts->pool);
-	err = railfs_stat(conn, path, &attrs, &found);
-	railfs_pool_give(opts->pool, conn);
+	path = railfs_path_hold(inode);
+	if (!path) {
+		return 0;
+	}
+
+	err = railfs_pool_stat(opts->pool, path->name, &attrs, &found);
+	railfs_path_put(path);
 	if (err) {
 		return err;
 	}

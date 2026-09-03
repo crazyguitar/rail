@@ -14,7 +14,6 @@
 
 int railfs_remove(struct inode *dir, struct dentry *dentry, u16 op)
 {
-	struct railfs_conn *conn;
 	struct railfs_options *opts = dir->i_sb->s_fs_info;
 	char *path;
 	int err;
@@ -28,9 +27,7 @@ int railfs_remove(struct inode *dir, struct dentry *dentry, u16 op)
 		return -ENOMEM;
 	}
 
-	conn = railfs_pool_take(opts->pool);
-	err = railfs_meta(conn, op, path, 0);
-	railfs_pool_give(opts->pool, conn);
+	err = railfs_pool_meta(opts->pool, op, path, 0);
 	if (err) {
 		goto out;
 	}

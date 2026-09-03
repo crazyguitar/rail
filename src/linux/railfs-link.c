@@ -20,18 +20,24 @@ int railfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *den
 	struct railfs_options *opts = dir->i_sb->s_fs_info;
 	struct railfs_meta_req req = { .op = RAILFS_META_HARDLINK };
 	struct railfs_attrs attrs = {};
-	struct railfs_conn *conn;
+	struct railfs_path *first = NULL;
 	struct inode *second;
-	char *path;
+	char *path = NULL;
 	int err;
 
-	if (!opts || !opts->pool || !inode->i_private) {
+	if (!opts || !opts->pool) {
+		return -ENOTCONN;
+	}
+
+	first = railfs_path_hold(inode);
+	if (!first) {
 		return -ENOTCONN;
 	}
 
 	path = railfs_child_path(dir, dentry);
 	if (!path) {
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto out;
 	}
 
 	err = filemap_write_and_wait(inode->i_mapping);
@@ -39,12 +45,10 @@ int railfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *den
 		goto out;
 	}
 
-	req.path = inode->i_private;
+	req.path = first->name;
 	req.target = path;
 
-	conn = railfs_pool_take(opts->pool);
-	err = railfs_meta_send(conn, &req);
-	railfs_pool_give(opts->pool, conn);
+	err = railfs_pool_meta_send(opts->pool, &req);
 	if (err) {
 		goto out;
 	}
@@ -69,5 +73,6 @@ int railfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *den
 	err = 0;
 out:
 	kfree(path);
+	railfs_path_put(first);
 	return err;
 }

@@ -1,7 +1,9 @@
 #include "harness.h"
 #include "local-process.h"
 #include "privileged.h"
+#include "rail/proto/codec.h"
 
+#include <arpa/inet.h>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -10,7 +12,10 @@
 #include <fstream>
 #include <gtest/gtest.h>
 #include <iterator>
+#include <netinet/in.h>
+#include <optional>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <thread>
@@ -21,6 +26,7 @@ namespace rail::e2e {
 namespace {
 
 constexpr uint16_t kPort = 18719;
+constexpr uint16_t kStallPort = 18723;
 
 // The repo root, reached from a tool the harness already knows how to find.
 std::filesystem::path repoRoot() { return serviceBinary().parent_path().parent_path().parent_path().parent_path(); }
@@ -42,6 +48,183 @@ std::string output(const std::vector<std::string> &Argv) {
   return R ? R->Output : std::string{};
 }
 
+constexpr uint64_t kStalledFileBytes = 4096;
+constexpr size_t kFrameHeaderBytes = 10;
+
+int listenOnLoopback(uint16_t Port) {
+  const int Fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (Fd < 0) return -1;
+
+  const int One = 1;
+  ::setsockopt(Fd, SOL_SOCKET, SO_REUSEADDR, &One, sizeof(One));
+
+  sockaddr_in Where{};
+  Where.sin_family = AF_INET;
+  Where.sin_port = ::htons(Port);
+  Where.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+  if (::bind(Fd, (sockaddr *)&Where, sizeof(Where)) != 0 || ::listen(Fd, 4) != 0) {
+    ::close(Fd);
+    return -1;
+  }
+
+  return Fd;
+}
+
+bool readExact(int Fd, void *Buf, size_t Len) {
+  size_t Done = 0;
+  while (Done < Len) {
+    const ssize_t Got = ::recv(Fd, static_cast<std::byte *>(Buf) + Done, Len - Done, MSG_WAITALL);
+    if (Got <= 0) return false;
+    Done += static_cast<size_t>(Got);
+  }
+  return true;
+}
+
+std::optional<proto::Message> readFrame(int Fd) {
+  std::byte Header[kFrameHeaderBytes];
+  if (!readExact(Fd, Header, sizeof(Header))) return std::nullopt;
+
+  uint32_t Magic = 0;
+  uint16_t Kind = 0;
+  uint32_t Length = 0;
+  std::memcpy(&Magic, Header, 4);
+  std::memcpy(&Kind, Header + 4, 2);
+  std::memcpy(&Length, Header + 6, 4);
+  if (Magic != proto::kMagic || Length > proto::kMaxFrame) return std::nullopt;
+
+  std::vector<std::byte> Payload(Length);
+  if (Length && !readExact(Fd, Payload.data(), Length)) return std::nullopt;
+
+  auto Decoded = proto::decode(static_cast<proto::Type>(Kind), Payload);
+  if (!Decoded) return std::nullopt;
+  return *Decoded;
+}
+
+bool writeFrame(int Fd, const proto::Message &M) {
+  std::vector<std::byte> Frame(kFrameHeaderBytes);
+  proto::encode(M, Frame);
+
+  const uint32_t Magic = proto::kMagic;
+  const uint16_t Kind = static_cast<uint16_t>(proto::typeOf(M));
+  const uint32_t Length = static_cast<uint32_t>(Frame.size() - kFrameHeaderBytes);
+  std::memcpy(Frame.data(), &Magic, 4);
+  std::memcpy(Frame.data() + 4, &Kind, 2);
+  std::memcpy(Frame.data() + 6, &Length, 4);
+
+  return ::send(Fd, Frame.data(), Frame.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(Frame.size());
+}
+
+proto::FileAttrs attrsFor(const std::string &Path) {
+  proto::FileAttrs Attrs;
+  Attrs.Directory = Path.empty() || Path == ".";
+  Attrs.Mode = Attrs.Directory ? 0755 : 0644;
+  Attrs.Size = Attrs.Directory ? 0 : kStalledFileBytes;
+  Attrs.Mtime = 1;
+  return Attrs;
+}
+
+class StallingDaemon {
+public:
+  StallingDaemon(uint16_t ControlPort, uint16_t DataPort) : ControlListener(listenOnLoopback(ControlPort)), DataListener(listenOnLoopback(DataPort)) {
+    if (listening()) Server = std::thread([this] { serve(); });
+  }
+
+  ~StallingDaemon() {
+    for (int *Fd : {&Control, &Data, &ControlListener, &DataListener}) {
+      if (*Fd >= 0) ::shutdown(*Fd, SHUT_RDWR);
+    }
+    if (Server.joinable()) Server.join();
+    for (int *Fd : {&Control, &Data, &ControlListener, &DataListener}) {
+      if (*Fd >= 0) ::close(*Fd);
+    }
+  }
+
+  bool listening() const { return ControlListener >= 0 && DataListener >= 0; }
+
+private:
+  void serve() {
+    if (!acceptHello()) return;
+
+    proto::HelloAck Ack;
+    Ack.Backend = "tcp";
+    Ack.ChannelEndpoint = "127.0.0.1:" + std::to_string(dataPort());
+    if (!writeFrame(Control, Ack)) return;
+
+    Data = ::accept4(DataListener, nullptr, nullptr, SOCK_CLOEXEC);
+    if (Data < 0) return;
+
+    auto Endpoint = readFrame(Control);
+    if (!Endpoint || !std::holds_alternative<proto::PeerEndpoint>(*Endpoint)) return;
+
+    while (auto Request = readFrame(Control)) {
+      auto Reply = answer(*Request);
+      if (!Reply || !writeFrame(Control, *Reply)) return;
+    }
+  }
+
+  bool acceptHello() {
+    while (true) {
+      Control = ::accept4(ControlListener, nullptr, nullptr, SOCK_CLOEXEC);
+      if (Control < 0) return false;
+
+      auto First = readFrame(Control);
+      if (First && std::holds_alternative<proto::Hello>(*First)) break;
+
+      ::close(Control);
+      Control = -1;
+    }
+
+    ::close(ControlListener);
+    ControlListener = -1;
+    return true;
+  }
+
+  uint16_t dataPort() const {
+    sockaddr_in Where{};
+    socklen_t Len = sizeof(Where);
+    ::getsockname(DataListener, (sockaddr *)&Where, &Len);
+    return ::ntohs(Where.sin_port);
+  }
+
+  static std::optional<proto::Message> answer(const proto::Message &Request) {
+    if (const auto *Stat = std::get_if<proto::StatRequest>(&Request)) {
+      proto::StatReply Reply;
+      Reply.Id = Stat->Id;
+      Reply.Found = true;
+      Reply.Attrs = attrsFor(Stat->Path);
+      return Reply;
+    }
+    if (const auto *List = std::get_if<proto::ListRequest>(&Request)) {
+      proto::ListReply Reply;
+      Reply.Id = List->Id;
+      Reply.Found = true;
+      return Reply;
+    }
+    if (const auto *Space = std::get_if<proto::StatFsRequest>(&Request)) {
+      proto::StatFsReply Reply;
+      Reply.Id = Space->Id;
+      Reply.Ok = true;
+      Reply.BlockSize = 4096;
+      return Reply;
+    }
+    if (const auto *Read = std::get_if<proto::ReadRequest>(&Request)) {
+      proto::TransferReply Reply;
+      Reply.Id = Read->Id;
+      Reply.Length = Read->Length;
+      Reply.FileSize = kStalledFileBytes;
+      Reply.Ok = true;
+      return Reply;
+    }
+    return std::nullopt;
+  }
+
+  int ControlListener = -1;
+  int DataListener = -1;
+  int Control = -1;
+  int Data = -1;
+  std::thread Server;
+};
+
 } // namespace
 
 // Loading a module and mounting needs root, so these are opt-in: a suite that
@@ -54,21 +237,13 @@ protected:
     ASSERT_TRUE(runningAsRoot()) << "the privileged suites need the binary run under sudo";
 
     Export = remoteDir() + "/kernel-export";
-    removeRemoteRecursive(Export);
-    ASSERT_TRUE(peer().makeDirectory(Export));
+    ASSERT_TRUE(resetRemoteRoot(Export, {{seedOnce("a.txt", "hello-from-daemon\n"), "a.txt"}, {seedOnce("b.txt", "second\n"), "b.txt"}}));
 
     auto Address = peer().address();
     ASSERT_TRUE(Address) << "could not resolve the peer address";
     Host = *Address;
 
-    seed("a.txt", "hello-from-daemon\n");
-    seed("b.txt", "second\n");
-
-    stopDaemon();
-    auto Started = peer().run({serviceBinary().string(), "--serve", Export, "--port", std::to_string(kPort), "--backend", "tcp"});
-    ASSERT_TRUE(Started) << "could not start raild: " << Started.error().message();
-    Daemon.emplace(std::move(*Started));
-    ASSERT_TRUE(waitForListener(Host, kPort, std::chrono::seconds(10))) << "the daemon never started listening";
+    ASSERT_NO_FATAL_FAILURE(restartDaemonOn("tcp"));
 
     unmountAndUnload();
     ASSERT_TRUE(loadModule(modulePath())) << "loading the module failed";
@@ -87,6 +262,14 @@ protected:
     const auto Local = localDir() / Name;
     std::ofstream(Local, std::ios::binary | std::ios::trunc) << Body;
     seedRemote(Local, Export + "/" + Name);
+  }
+
+  std::string seedOnce(const std::string &Name, const std::string &Body) {
+    const auto Local = localDir() / ("kernel-seed-" + Name);
+    std::ofstream(Local, std::ios::binary | std::ios::trunc) << Body;
+    const std::string Remote = remoteDir() + "/seed/kernel-" + Name;
+    seedRemoteOnce(Local, Remote);
+    return Remote;
   }
 
   // -i so mount never hands off to an installed /sbin/mount.railfs, which takes
@@ -124,6 +307,13 @@ protected:
   std::string digestOf(const std::filesystem::path &P) { return digestFile(P); }
 
   std::string digestThrough(const std::string &Name) { return digestFile(Mountpoint + "/" + Name); }
+
+  std::string firstLineFromPeer(const std::vector<std::string> &Argv) {
+    auto OnPeer = peer().run(Argv);
+    if (!OnPeer) return {};
+    auto Line = OnPeer->readLine();
+    return Line ? *Line : std::string{};
+  }
 
   std::string listing(const std::string &Of) {
     std::string Joined;
@@ -167,20 +357,19 @@ protected:
   }
 
   // The fabric tests need the daemon speaking rdma; the rest want tcp.
-  void restartDaemonOnRdma() {
+  void restartDaemonOnRdma() { restartDaemonOn("rdma"); }
+
+  void restartDaemonOn(const std::string &Backend) {
     stopDaemon();
-    auto Started = peer().run({serviceBinary().string(), "--serve", Export, "--port", std::to_string(kPort), "--backend", "rdma"});
-    ASSERT_TRUE(Started) << "could not start raild on rdma";
+    auto Started = peer().run({serviceBinary().string(), "--serve", Export, "--port", std::to_string(kPort), "--backend", Backend});
+    ASSERT_TRUE(Started) << "could not start raild on " << Backend;
     Daemon.emplace(std::move(*Started));
     ASSERT_TRUE(waitForListener(Host, kPort, std::chrono::seconds(10))) << "the daemon never started listening";
   }
 
   void stopDaemon() {
     Daemon.reset();
-    if (auto Killed = peer().run({"pkill", "-x", "raild"}); Killed) {
-      [[maybe_unused]] auto Line = Killed->readLine();
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    stopPeerProcess("raild");
   }
 
   std::string Export;
@@ -351,6 +540,38 @@ TEST_F(Kernel, ReadFailsRatherThanHangsWhenTheDaemonGoesAway) {
   EXPECT_NE(Ran->ExitStatus, 0) << "read succeeded with no daemon: " << Ran->Output.substr(0, 80);
 }
 
+TEST_F(Kernel, SurvivesADaemonRestartWithoutARemount) {
+  const auto Proof = makeFile("kernel-restart-proof.bin", 20000, 41);
+  const auto Later = makeFile("kernel-restart-later.bin", 20000, 42);
+  seedRemote(Proof, Export + "/proof.bin");
+  seedRemote(Later, Export + "/later.bin");
+
+  ASSERT_TRUE(mountIt(defaultOptions()));
+  ASSERT_EQ(digestThrough("proof.bin"), digestOf(Proof));
+
+  restartDaemonOn("tcp");
+
+  EXPECT_EQ(digestThrough("later.bin"), digestOf(Later)) << "a mount whose daemon came back stayed broken";
+  EXPECT_TRUE(writeWholeFile(Mountpoint + "/after.txt", "written-after-restart\n"));
+  EXPECT_EQ(readWholeFile(Mountpoint + "/after.txt"), "written-after-restart\n");
+}
+
+TEST_F(Kernel, AStalledPayloadFailsInsteadOfHanging) {
+  StallingDaemon Stalling(kStallPort, kStallPort + 1);
+  ASSERT_TRUE(Stalling.listening()) << "could not listen on the loopback ports";
+
+  ASSERT_TRUE(mountIt("host=127.0.0.1,export=/,port=" + std::to_string(kStallPort) + ",conns=1"));
+
+  const auto Began = std::chrono::steady_clock::now();
+  auto Ran = runLocal({"timeout", "180", "cat", Mountpoint + "/stuck.bin"});
+  const double Took = std::chrono::duration<double>(std::chrono::steady_clock::now() - Began).count();
+
+  ASSERT_TRUE(Ran) << "cat never returned";
+  EXPECT_NE(Ran->ExitStatus, 124) << "the read was still waiting after three minutes";
+  EXPECT_NE(Ran->ExitStatus, 0) << "read succeeded with no payload: " << Ran->Output.substr(0, 80);
+  EXPECT_LT(Took, 120.0) << "the read took " << Took << "s to give up";
+}
+
 // Every inode carries the path it was found at, not just its last component.
 // Asking the daemon about "." from inside a subdirectory would list the root.
 TEST_F(Kernel, ListsASubdirectory) {
@@ -498,11 +719,8 @@ TEST_F(Kernel, TruncateShrinksTheFileOnThePeer) {
 
   // The peer is the only place that can confirm it, since the mount would
   // happily report a size it never sent anywhere.
-  auto OnPeer = peer().run({"stat", "-c", "%s", Export + "/trunc.bin"});
-  ASSERT_TRUE(OnPeer);
-  auto Line = OnPeer->readLine();
-  ASSERT_TRUE(Line);
-  EXPECT_EQ(Line->substr(0, 2), "10");
+  const std::string Line = firstLineFromPeer({"stat", "-c", "%s", Export + "/trunc.bin"});
+  EXPECT_EQ(std::strtoull(Line.c_str(), nullptr, 10), 10u);
 }
 
 TEST_F(Kernel, CreatesAFileOnThePeer) {
@@ -645,11 +863,7 @@ TEST_F(Kernel, ReadsTheSameBytesOverEitherTransport) {
   const std::string OverFabric = digestThrough("either.bin");
   ASSERT_TRUE(unmountFilesystem(Mountpoint).has_value());
 
-  stopDaemon();
-  auto Started = peer().run({serviceBinary().string(), "--serve", Export, "--port", std::to_string(kPort), "--backend", "tcp"});
-  ASSERT_TRUE(Started);
-  Daemon.emplace(std::move(*Started));
-  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+  ASSERT_NO_FATAL_FAILURE(restartDaemonOn("tcp"));
 
   ASSERT_TRUE(mountIt(defaultOptions()));
   EXPECT_EQ(OverFabric, digestThrough("either.bin"));
@@ -771,7 +985,7 @@ TEST_F(Kernel, MountsWithoutARailWhenNotAsked) {
 
   // The fabric costs a queue pair and a pinned ring, so a mount that did not
   // ask for one should not be paying for it.
-  EXPECT_EQ(kernelLog().find("rdma rail on"), std::string::npos);
+  EXPECT_EQ(kernelLog().find("rdma rail 0 on"), std::string::npos);
 }
 
 TEST_F(Kernel, RefusesAnOptionItDoesNotKnow) {
@@ -809,11 +1023,8 @@ TEST_F(Kernel, ChmodReachesThePeer) {
 
   // The mount would report a mode it kept to itself, so the peer is the only
   // witness that the chmod went anywhere.
-  auto OnPeer = peer().run({"stat", "-c", "%a", Export + "/mode.bin"});
-  ASSERT_TRUE(OnPeer);
-  auto Line = OnPeer->readLine();
-  ASSERT_TRUE(Line);
-  EXPECT_EQ(*Line, "640");
+  const std::string Line = firstLineFromPeer({"stat", "-c", "%a", Export + "/mode.bin"});
+  EXPECT_EQ(Line, "640");
 }
 
 TEST_F(Kernel, TouchSetsTheTimeOnThePeer) {
@@ -823,11 +1034,8 @@ TEST_F(Kernel, TouchSetsTheTimeOnThePeer) {
   ASSERT_TRUE(mountIt(defaultOptions()));
   ASSERT_TRUE(setModifiedTime(Mountpoint + "/mtime.bin", 1600000000));
 
-  auto OnPeer = peer().run({"stat", "-c", "%Y", Export + "/mtime.bin"});
-  ASSERT_TRUE(OnPeer);
-  auto Line = OnPeer->readLine();
-  ASSERT_TRUE(Line);
-  EXPECT_EQ(*Line, "1600000000");
+  const std::string Line = firstLineFromPeer({"stat", "-c", "%Y", Export + "/mtime.bin"});
+  EXPECT_EQ(Line, "1600000000");
 }
 
 TEST_F(Kernel, ReportsTheTimeThePeerHas) {
@@ -848,11 +1056,8 @@ TEST_F(Kernel, SymlinkReachesThePeer) {
   ASSERT_TRUE(mountIt(defaultOptions()));
   ASSERT_TRUE(makeSymlink("a.txt", Mountpoint + "/points.txt"));
 
-  auto OnPeer = peer().run({"readlink", Export + "/points.txt"});
-  ASSERT_TRUE(OnPeer);
-  auto Line = OnPeer->readLine();
-  ASSERT_TRUE(Line);
-  EXPECT_EQ(*Line, "a.txt");
+  const std::string Line = firstLineFromPeer({"readlink", Export + "/points.txt"});
+  EXPECT_EQ(Line, "a.txt");
 }
 
 TEST_F(Kernel, ReadsALinkThePeerHas) {
@@ -875,11 +1080,8 @@ TEST_F(Kernel, HardLinkGivesOneFileASecondName) {
   ASSERT_TRUE(mountIt(defaultOptions()));
   ASSERT_TRUE(makeHardLink(Mountpoint + "/linked.bin", Mountpoint + "/second.bin"));
 
-  auto OnPeer = peer().run({"stat", "-c", "%h", Export + "/linked.bin"});
-  ASSERT_TRUE(OnPeer);
-  auto Line = OnPeer->readLine();
-  ASSERT_TRUE(Line);
-  EXPECT_EQ(*Line, "2");
+  const std::string Line = firstLineFromPeer({"stat", "-c", "%h", Export + "/linked.bin"});
+  EXPECT_EQ(Line, "2");
 
   // A second name for the same bytes, not a copy of them.
   EXPECT_EQ(digestThrough("second.bin"), digestOf(Local));
@@ -899,11 +1101,8 @@ TEST_F(Kernel, ASecondNameOutlivesTheFirst) {
   EXPECT_EQ(digestThrough("other.bin"), digestOf(Local));
 
   // And zeroing that inode's link count made the surviving name look deleted.
-  auto OnPeer = peer().run({"stat", "-c", "%h", Export + "/other.bin"});
-  ASSERT_TRUE(OnPeer);
-  auto Line = OnPeer->readLine();
-  ASSERT_TRUE(Line);
-  EXPECT_EQ(*Line, "1");
+  const std::string Line = firstLineFromPeer({"stat", "-c", "%h", Export + "/other.bin"});
+  EXPECT_EQ(Line, "1");
 }
 
 TEST_F(Kernel, MapsAFileIntoMemory) {
@@ -961,8 +1160,7 @@ protected:
   std::string helperSays(const std::vector<std::string> &Args) {
     std::vector<std::string> Argv{helperPath().string()};
     Argv.insert(Argv.end(), Args.begin(), Args.end());
-    auto R = runLocal(Argv);
-    return R ? R->Output : std::string{};
+    return output(Argv);
   }
 };
 
@@ -983,9 +1181,7 @@ TEST_F(MountHelper, RefusesAMountpointThatIsNotADirectory) {
 }
 
 // The module has no resolver, so a name has to become an address here.
-TEST_F(MountHelper, ResolvesANameBeforeHandingItToTheKernel) {
-  EXPECT_TRUE(ran({helperPath().string(), "localhost:models", Mountpoint, "-f"}));
-}
+TEST_F(MountHelper, ResolvesANameBeforeHandingItToTheKernel) { EXPECT_TRUE(ran({helperPath().string(), "localhost:models", Mountpoint, "-f"})); }
 
 TEST_F(MountHelper, MountsThroughTheSpec) {
   ASSERT_TRUE(ran({helperPath().string(), Host + ":.", Mountpoint, "-o", "port=" + std::to_string(kPort)}));
@@ -1022,11 +1218,12 @@ TEST_F(Kernel, WritesAFileFarBelowTheFolioFloor) {
   ASSERT_TRUE(mountIt(defaultOptions() + ",minfolio=262144"));
 
   const std::string Body = "written-through-a-large-folio\n";
-  ASSERT_TRUE(writeWholeFile(createEmpty(Mountpoint + "/short.bin") ? Mountpoint + "/short.bin" : "", Body));
+  ASSERT_TRUE(createEmpty(Mountpoint + "/short.bin"));
+  ASSERT_TRUE(writeWholeFile(Mountpoint + "/short.bin", Body));
   ASSERT_TRUE(syncFilesystem(Mountpoint));
 
   EXPECT_EQ(output({"ssh", peerHost(), "cat", Export + "/short.bin"}), Body);
-  EXPECT_EQ(output({"ssh", peerHost(), "stat", "-c", "%s", Export + "/short.bin"}).substr(0, 2), std::to_string(Body.size()).substr(0, 2));
+  EXPECT_EQ(std::strtoull(output({"ssh", peerHost(), "stat", "-c", "%s", Export + "/short.bin"}).c_str(), nullptr, 10), Body.size());
 }
 
 TEST_F(Kernel, RefusesAMinfolioThatIsNotAPowerOfTwo) {

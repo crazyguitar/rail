@@ -63,6 +63,11 @@ static const struct fs_parameter_spec railfs_parameters[] = {
 	{}
 };
 
+static u16 railfs_port_of(const struct railfs_options *opts)
+{
+	return opts->port ? opts->port : RAILFS_DEFAULT_PORT;
+}
+
 static void railfs_free_options(struct railfs_options *opts)
 {
 	if (!opts) {
@@ -112,7 +117,7 @@ static int railfs_show_options(struct seq_file *m, struct dentry *root)
 	// The root it actually serves, so a trimmed or empty option reads back as
 	// the "." it became rather than as nothing at all.
 	seq_printf(m, ",export=%s", railfs_export_root(opts));
-	seq_printf(m, ",port=%u", opts->port ? opts->port : RAILFS_DEFAULT_PORT);
+	seq_printf(m, ",port=%u", railfs_port_of(opts));
 
 	seq_printf(m, ",conns=%u", opts->conns);
 	seq_printf(m, ",fetch=%u", opts->fetch);
@@ -160,17 +165,19 @@ const struct file_operations railfs_dir_ops = {
 // drop the dentry to match.
 char *railfs_child_path(struct inode *dir, struct dentry *dentry)
 {
-	const char *here = dir->i_private ? dir->i_private : ".";
+	struct railfs_path *here = railfs_path_hold(dir);
 	char *name;
 	char *path;
 
 	name = kstrndup(dentry->d_name.name, dentry->d_name.len, GFP_NOFS);
 	if (!name) {
+		railfs_path_put(here);
 		return NULL;
 	}
 
-	path = railfs_path_under(here, name);
+	path = railfs_path_under(here ? here->name : ".", name);
 	kfree(name);
+	railfs_path_put(here);
 	return path;
 }
 
@@ -235,14 +242,12 @@ static const struct super_operations railfs_super_ops = {
 static int railfs_adopt_root_mode(struct super_block *sb, struct railfs_options *opts)
 {
 	struct inode *root = d_inode(sb->s_root);
+	const char *served = railfs_export_root(opts);
 	struct railfs_attrs attrs = {};
-	struct railfs_conn *conn;
 	bool found = false;
 	int err;
 
-	conn = railfs_pool_take(opts->pool);
-	err = railfs_stat(conn, root->i_private, &attrs, &found);
-	railfs_pool_give(opts->pool, conn);
+	err = railfs_pool_stat(opts->pool, served, &attrs, &found);
 
 	// An export the peer does not have is refused here. Left to the first
 	// read, it looks like an empty directory instead of a wrong mount. A
@@ -252,13 +257,13 @@ static int railfs_adopt_root_mode(struct super_block *sb, struct railfs_options 
 	}
 
 	if (!found) {
-		pr_err("railfs: the peer has no %s\n", (const char *)root->i_private);
+		pr_err("railfs: the peer has no %s\n", served);
 		err = -ENOENT;
 		goto out;
 	}
 
 	if (!attrs.directory) {
-		pr_err("railfs: %s is not a directory on the peer\n", (const char *)root->i_private);
+		pr_err("railfs: %s is not a directory on the peer\n", served);
 		err = -ENOTDIR;
 		goto out;
 	}
@@ -289,9 +294,23 @@ const char *railfs_export_root(const struct railfs_options *opts)
 	return opts->export;
 }
 
+static struct railfs_peer railfs_peer_of(const struct railfs_options *opts)
+{
+	struct railfs_peer peer = {
+		.host = opts->host,
+		.port = railfs_port_of(opts),
+		.rdma = opts->rdma,
+		.verify = !opts->noverify,
+	};
+
+	return peer;
+}
+
 static int railfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct railfs_options *opts = fc->fs_private;
+	struct railfs_attrs root_attrs = { .mode = 0755, .directory = 1 };
+	struct railfs_peer peer;
 	struct railfs_pool *pool;
 	struct inode *root;
 	int err;
@@ -318,7 +337,7 @@ static int railfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
 	pr_debug("railfs: fill_super enter sb=%p\n", sb);
 
-	root = railfs_make_inode(sb, S_IFDIR | 0755, 0);
+	root = railfs_inode_for(sb, &root_attrs, railfs_export_root(opts));
 	if (!root) {
 		err = -ENOMEM;
 		goto out;
@@ -328,13 +347,6 @@ static int railfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	// cannot read the options the way every later one does.
 	root->i_uid = opts->uid;
 	root->i_gid = opts->gid;
-
-	root->i_private = kstrdup(railfs_export_root(opts), GFP_KERNEL);
-	if (!root->i_private) {
-		iput(root);
-		err = -ENOMEM;
-		goto out;
-	}
 
 	// Nothing may be owned by the superblock until s_root exists:
 	// generic_shutdown_super skips put_super without it, so anything hung off
@@ -355,7 +367,8 @@ static int railfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
 	// A mount that names a host dials it now, so a daemon that is not there
 	// fails the mount rather than every read after it.
-	pool = railfs_pool_open(opts->host, opts->port ? opts->port : RAILFS_DEFAULT_PORT, opts->conns, opts->rdma, !opts->noverify);
+	peer = railfs_peer_of(opts);
+	pool = railfs_pool_open(&peer, opts->conns);
 	if (IS_ERR(pool)) {
 		err = PTR_ERR(pool);
 		goto out;

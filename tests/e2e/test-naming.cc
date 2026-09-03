@@ -22,20 +22,7 @@ const std::vector<std::string> &awkwardNames() {
 
 } // namespace
 
-class Naming : public BackendTest {
-protected:
-  void expectFileMatches(const std::filesystem::path &Local, const std::string &Remote) {
-    EXPECT_TRUE(peer().exists(Remote).value_or(false)) << Remote << " is missing";
-    EXPECT_EQ(peer().digest(Remote).value_or(""), localDigest(Local)) << Remote << " differs";
-  }
-
-  std::filesystem::path freshLocal(const std::string &Name) {
-    const auto Root = localDir() / Name;
-    std::filesystem::remove_all(Root);
-    std::filesystem::create_directories(Root);
-    return Root;
-  }
-};
+class Naming : public BackendTest {};
 
 TEST_P(Naming, OddFileNamesWork) {
   const std::string Name = "naming-files";
@@ -55,7 +42,7 @@ TEST_P(Naming, OddFileNamesWork) {
   for (const auto &Leaf : awkwardNames()) expectFileMatches(Local / Leaf, Remote + "/" + Leaf);
 }
 
-TEST_P(Naming, DestWithSpace) {
+TEST_P(Naming, ADestinationWithASpaceArrives) {
   const auto Local = makeFile("naming-space.bin", 64u << 10, 71);
   const std::string Remote = remotePath("dest dir with space") + "/naming-space.bin";
   removeRemoteRecursive(remotePath("dest dir with space"));
@@ -66,7 +53,7 @@ TEST_P(Naming, DestWithSpace) {
   expectFileMatches(Local, Remote);
 }
 
-TEST_P(Naming, DestWithQuote) {
+TEST_P(Naming, ADestinationWithAQuoteArrives) {
   const auto Local = makeFile("naming-quote.bin", 64u << 10, 72);
   const std::string Dir = remotePath("dest'quote");
   const std::string Remote = Dir + "/naming-quote.bin";

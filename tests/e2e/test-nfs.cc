@@ -42,6 +42,15 @@ constexpr uint32_t kNfsReadDirPlus = 17;
 constexpr uint32_t kNfsFsInfo = 19;
 constexpr uint32_t kNfsCommit = 21;
 
+constexpr size_t kHandleSize = 64;
+constexpr uint32_t kNf3Dir = 2;
+constexpr uint32_t kNfs3ErrNoEnt = 2;
+constexpr uint32_t kNfs3ErrIo = 5;
+constexpr uint32_t kNfs3ErrExist = 17;
+constexpr uint32_t kNfs3ErrNameTooLong = 63;
+constexpr uint32_t kNfs3ErrStale = 70;
+constexpr uint32_t kLastFragment = 0x80000000u;
+
 struct Reply {
   uint32_t Accept = 0;
   std::vector<std::byte> Body;
@@ -79,6 +88,15 @@ public:
   }
 
   Result<Reply> call(uint32_t Program, uint32_t Procedure, std::span<const std::byte> Args) {
+    if (auto R = sendCall(Program, Procedure, Args); !R) return std::unexpected(R.error());
+
+    auto Record = receiveRecord();
+    if (!Record) return std::unexpected(Record.error());
+    return replyIn(*Record);
+  }
+
+private:
+  Result<void> sendCall(uint32_t Program, uint32_t Procedure, std::span<const std::byte> Args) {
     nfs::XdrWriter Header;
     Header.u32(++Xid);
     Header.u32(0);
@@ -86,18 +104,17 @@ public:
     Header.u32(Program);
     Header.u32(nfs::kProgramVersion);
     Header.u32(Procedure);
-    Header.u32(0);
-    Header.u32(0);
-    Header.u32(0);
-    Header.u32(0);
+    for (int I = 0; I < 4; I++) Header.u32(0);
 
     nfs::XdrWriter Marker;
-    Marker.u32(static_cast<uint32_t>(Header.size() + Args.size()) | 0x80000000);
+    Marker.u32(static_cast<uint32_t>(Header.size() + Args.size()) | kLastFragment);
 
-    if (auto R = writeAll(Marker.bytes()); !R) return std::unexpected(R.error());
-    if (auto R = writeAll(Header.bytes()); !R) return std::unexpected(R.error());
-    if (auto R = writeAll(Args); !R) return std::unexpected(R.error());
+    if (auto R = writeAll(Marker.bytes()); !R) return R;
+    if (auto R = writeAll(Header.bytes()); !R) return R;
+    return writeAll(Args);
+  }
 
+  Result<std::vector<std::byte>> receiveRecord() {
     std::vector<std::byte> Record;
     for (;;) {
       std::byte Head[4];
@@ -107,11 +124,13 @@ public:
       for (std::byte B : Head) Fragment = (Fragment << 8) | static_cast<uint32_t>(B);
 
       const size_t At = Record.size();
-      Record.resize(At + (Fragment & ~0x80000000u));
+      Record.resize(At + (Fragment & ~kLastFragment));
       if (auto R = readExact(std::span(Record).subspan(At)); !R) return std::unexpected(R.error());
-      if (Fragment & 0x80000000u) break;
+      if (Fragment & kLastFragment) return Record;
     }
+  }
 
+  Result<Reply> replyIn(const std::vector<std::byte> &Record) const {
     nfs::XdrReader R(Record);
     if (R.u32() != Xid) return failMessage("reply for another call");
     if (R.u32() != 1) return failMessage("not an rpc reply");
@@ -126,7 +145,6 @@ public:
     return Out;
   }
 
-private:
   Result<void> writeAll(std::span<const std::byte> Src) {
     while (!Src.empty()) {
       const ssize_t N = ::write(Fd, Src.data(), Src.size());
@@ -168,13 +186,12 @@ class Nfs : public BackendTest {
 protected:
   void SetUp() override {
     Root = remoteDir() + "/nfs-root";
-    removeRemoteRecursive(Root);
-    ASSERT_TRUE(peer().makeDirectory(Root));
-    ASSERT_TRUE(peer().makeDirectory(Root + "/sub"));
+    const std::string Seeds = remoteDir() + "/seed";
 
     Alpha = makeFile("nfs-alpha.bin", 4096, 21);
-    seedRemote(Alpha, Root + "/alpha.bin");
-    seedRemote(makeFile("nfs-nested.bin", 2048, 22), Root + "/sub/nested.bin");
+    seedRemoteOnce(Alpha, Seeds + "/nfs-alpha.bin");
+    seedRemoteOnce(makeFile("nfs-nested.bin", 2048, 22), Seeds + "/nfs-nested.bin");
+    ASSERT_TRUE(resetRemoteRoot(Root, {{Seeds + "/nfs-alpha.bin", "alpha.bin"}, {Seeds + "/nfs-nested.bin", "sub/nested.bin"}}));
 
     auto Address = peer().address();
     ASSERT_TRUE(Address) << "could not resolve the peer address";
@@ -208,22 +225,18 @@ protected:
 
   void stopDaemon() {
     Daemon.reset();
-    if (auto Killed = peer().run({"pkill", "-x", "raild"}); Killed) {
-      [[maybe_unused]] auto Line = Killed->readLine();
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    stopPeerProcess("raild");
   }
 
   void stopEverything() {
     Export.reset();
-    [[maybe_unused]] auto Local = runLocal({"pkill", "-f", "mount.railnfs --serve"});
+    endLocalProcess({"-f", "mount.railnfs --serve"});
     stopDaemon();
   }
 
   void restartExportAs(const std::string &Target) {
     Export.reset();
-    [[maybe_unused]] auto Killed = runLocal({"pkill", "-f", "mount.railnfs --serve"});
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    endLocalProcess({"-f", "mount.railnfs --serve"});
 
     auto Started = BackgroundProcess::start({exportBinary().string(),
                                              "--serve",
@@ -302,23 +315,51 @@ protected:
   std::string Root;
   std::string Host;
   std::filesystem::path Alpha;
+  void mountThroughProbe() {
+    ASSERT_TRUE(connectProbe(Probe));
+    RootHandle = mountRoot(Probe);
+    ASSERT_EQ(RootHandle.size(), kHandleSize);
+  }
+
   std::optional<RemoteProcess> Daemon;
   std::optional<BackgroundProcess> Export;
+  RpcProbe Probe;
+  std::vector<std::byte> RootHandle;
 };
 
-TEST_P(Nfs, MountReturnsARootHandle) {
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
+struct DirListing {
+  std::vector<std::string> Names;
+  uint64_t LastCookie = 0;
+};
 
-  const auto Handle = mountRoot(Probe);
-  EXPECT_EQ(Handle.size(), 64u);
+DirListing readDirEntries(nfs::XdrReader &Body) {
+  DirListing Listing;
+  while (Body.boolean()) {
+    EXPECT_NE(Body.u64(), 0u) << "every entry needs a fileid";
+    Listing.Names.push_back(Body.text(255));
+    Listing.LastCookie = Body.u64();
+    if (!Body.ok()) break;
+  }
+  EXPECT_TRUE(Body.ok());
+  EXPECT_TRUE(Body.boolean()) << "the listing should say it reached the end";
+  return Listing;
+}
+
+uint64_t sizeFromFattr3(nfs::XdrReader &Attrs) {
+  for (int I = 0; I < 5; I++) Attrs.u32();
+  return Attrs.u64();
+}
+
+TEST_P(Nfs, MountReturnsARootHandle) {
+  RpcProbe Fresh;
+  ASSERT_TRUE(connectProbe(Fresh));
+
+  const auto Handle = mountRoot(Fresh);
+  EXPECT_EQ(Handle.size(), kHandleSize);
 }
 
 TEST_P(Nfs, GetAttrReportsTheDirectory) {
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  const auto RootHandle = mountRoot(Probe);
-  ASSERT_EQ(RootHandle.size(), 64u);
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   nfs::XdrWriter Args;
   Args.opaque(RootHandle);
@@ -328,33 +369,27 @@ TEST_P(Nfs, GetAttrReportsTheDirectory) {
 
   nfs::XdrReader Body(R->Body);
   EXPECT_EQ(Body.u32(), 0u);
-  EXPECT_EQ(Body.u32(), 2u) << "the export root is not a directory";
+  EXPECT_EQ(Body.u32(), kNf3Dir) << "the export root is not a directory";
 }
 
-TEST_P(Nfs, LookupWalksIntoASubdirectory) {
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  const auto RootHandle = mountRoot(Probe);
-  ASSERT_EQ(RootHandle.size(), 64u);
+TEST_P(Nfs, LookupWalksIntoASubdirectoryAndRefusesAMissingName) {
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   uint32_t Status = 0;
   const auto Sub = lookup(Probe, RootHandle, "sub", Status);
   ASSERT_EQ(Status, 0u);
-  ASSERT_EQ(Sub.size(), 64u);
+  ASSERT_EQ(Sub.size(), kHandleSize);
 
   const auto Nested = lookup(Probe, Sub, "nested.bin", Status);
   ASSERT_EQ(Status, 0u);
-  EXPECT_EQ(Nested.size(), 64u);
+  EXPECT_EQ(Nested.size(), kHandleSize);
 
   lookup(Probe, RootHandle, "absent.bin", Status);
-  EXPECT_EQ(Status, 2u) << "a missing name should be NFS3ERR_NOENT";
+  EXPECT_EQ(Status, kNfs3ErrNoEnt) << "a missing name should be NFS3ERR_NOENT";
 }
 
 TEST_P(Nfs, ReadReturnsTheFileBytes) {
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  const auto RootHandle = mountRoot(Probe);
-  ASSERT_EQ(RootHandle.size(), 64u);
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   uint32_t Status = 0;
   const auto File = lookup(Probe, RootHandle, "alpha.bin", Status);
@@ -396,10 +431,7 @@ TEST_P(Nfs, ReadReturnsTheFileBytes) {
 }
 
 TEST_P(Nfs, ReadDirPlusListsDotAndEveryEntry) {
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  const auto RootHandle = mountRoot(Probe);
-  ASSERT_EQ(RootHandle.size(), 64u);
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   nfs::XdrWriter Args;
   Args.opaque(RootHandle);
@@ -445,10 +477,7 @@ TEST_P(Nfs, ReadDirPlusListsDotAndEveryEntry) {
 }
 
 TEST_P(Nfs, ReadDirListsEveryEntryWithoutAttributes) {
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  const auto RootHandle = mountRoot(Probe);
-  ASSERT_EQ(RootHandle.size(), 64u);
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   nfs::XdrWriter Args;
   Args.opaque(RootHandle);
@@ -464,26 +493,15 @@ TEST_P(Nfs, ReadDirListsEveryEntryWithoutAttributes) {
   Body.boolean();
   Body.fixed(8);
 
-  std::vector<std::string> Names;
-  uint64_t Last = 0;
-  while (Body.boolean()) {
-    EXPECT_NE(Body.u64(), 0u) << "every entry needs a fileid";
-    Names.push_back(Body.text(255));
-    Last = Body.u64();
-    ASSERT_TRUE(Body.ok());
-  }
-  EXPECT_TRUE(Body.boolean());
-  EXPECT_EQ(Last, Names.size()) << "the last cookie should name the next entry";
+  auto Listing = readDirEntries(Body);
+  EXPECT_EQ(Listing.LastCookie, Listing.Names.size()) << "the last cookie should name the next entry";
 
-  std::ranges::sort(Names);
-  EXPECT_EQ(Names, (std::vector<std::string>{".", "..", "alpha.bin", "sub"}));
+  std::ranges::sort(Listing.Names);
+  EXPECT_EQ(Listing.Names, (std::vector<std::string>{".", "..", "alpha.bin", "sub"}));
 }
 
 TEST_P(Nfs, ReadDirResumesFromACookie) {
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  const auto RootHandle = mountRoot(Probe);
-  ASSERT_EQ(RootHandle.size(), 64u);
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   nfs::XdrWriter Args;
   Args.opaque(RootHandle);
@@ -499,22 +517,11 @@ TEST_P(Nfs, ReadDirResumesFromACookie) {
   Body.boolean();
   Body.fixed(8);
 
-  std::vector<std::string> Names;
-  while (Body.boolean()) {
-    Body.u64();
-    Names.push_back(Body.text(255));
-    Body.u64();
-    ASSERT_TRUE(Body.ok());
-  }
-  EXPECT_TRUE(Body.boolean());
-  EXPECT_EQ(Names, (std::vector<std::string>{"sub"})) << "a cookie should skip what was already returned";
+  EXPECT_EQ(readDirEntries(Body).Names, (std::vector<std::string>{"sub"})) << "a cookie should skip what was already returned";
 }
 
 TEST_P(Nfs, FsInfoAnnouncesAReadSize) {
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  const auto RootHandle = mountRoot(Probe);
-  ASSERT_EQ(RootHandle.size(), 64u);
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   nfs::XdrWriter Args;
   Args.opaque(RootHandle);
@@ -529,10 +536,7 @@ TEST_P(Nfs, FsInfoAnnouncesAReadSize) {
 }
 
 TEST_P(Nfs, AccessGrantsReadAndWrite) {
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  const auto RootHandle = mountRoot(Probe);
-  ASSERT_EQ(RootHandle.size(), 64u);
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   uint32_t Status = 0;
   const auto File = lookup(Probe, RootHandle, "alpha.bin", Status);
@@ -572,10 +576,7 @@ void putNoAttrs(nfs::XdrWriter &Args) {
 }
 
 TEST_P(Nfs, WriteLandsOnThePeer) {
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  const auto RootHandle = mountRoot(Probe);
-  ASSERT_EQ(RootHandle.size(), 64u);
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   uint32_t Status = 0;
   const auto File = lookup(Probe, RootHandle, "alpha.bin", Status);
@@ -624,10 +625,7 @@ TEST_P(Nfs, WriteLandsOnThePeer) {
 }
 
 TEST_P(Nfs, CreateMakesAFileThatLookupFinds) {
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  const auto RootHandle = mountRoot(Probe);
-  ASSERT_EQ(RootHandle.size(), 64u);
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   nfs::XdrWriter Args;
   Args.opaque(RootHandle);
@@ -641,19 +639,16 @@ TEST_P(Nfs, CreateMakesAFileThatLookupFinds) {
   nfs::XdrReader Body(R->Body);
   ASSERT_EQ(Body.u32(), 0u);
   ASSERT_TRUE(Body.boolean()) << "a handle for what was made";
-  ASSERT_EQ(Body.opaque(64).size(), 64u);
+  ASSERT_EQ(Body.opaque(64).size(), kHandleSize);
 
   uint32_t Status = 0;
   const auto Found = lookup(Probe, RootHandle, "made-by-create.bin", Status);
   EXPECT_EQ(Status, 0u) << "lookup should find what create made";
-  EXPECT_EQ(Found.size(), 64u);
+  EXPECT_EQ(Found.size(), kHandleSize);
 }
 
-TEST_P(Nfs, CommitSucceeds) {
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  const auto RootHandle = mountRoot(Probe);
-  ASSERT_EQ(RootHandle.size(), 64u);
+TEST_P(Nfs, CommitOnAFileAnswersOk) {
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   uint32_t Status = 0;
   const auto File = lookup(Probe, RootHandle, "alpha.bin", Status);
@@ -672,10 +667,7 @@ TEST_P(Nfs, CommitSucceeds) {
 }
 
 TEST_P(Nfs, SetAttrTruncates) {
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  const auto RootHandle = mountRoot(Probe);
-  ASSERT_EQ(RootHandle.size(), 64u);
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   nfs::XdrWriter Made;
   Made.opaque(RootHandle);
@@ -722,15 +714,11 @@ TEST_P(Nfs, SetAttrTruncates) {
 
   nfs::XdrReader Attrs(Stat->Body);
   ASSERT_EQ(Attrs.u32(), 0u);
-  for (int I = 0; I < 5; I++) Attrs.u32();
-  EXPECT_EQ(Attrs.u64(), 1024u) << "the size the truncate asked for";
+  EXPECT_EQ(sizeFromFattr3(Attrs), 1024u) << "the size the truncate asked for";
 }
 
 TEST_P(Nfs, RemoveDeletesAFile) {
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  const auto RootHandle = mountRoot(Probe);
-  ASSERT_EQ(RootHandle.size(), 64u);
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   nfs::XdrWriter Made;
   Made.opaque(RootHandle);
@@ -754,14 +742,11 @@ TEST_P(Nfs, RemoveDeletesAFile) {
   ASSERT_EQ(Body.u32(), 0u);
 
   lookup(Probe, RootHandle, "to-remove.bin", Status);
-  EXPECT_EQ(Status, 2u) << "lookup should answer NFS3ERR_NOENT after a remove";
+  EXPECT_EQ(Status, kNfs3ErrNoEnt) << "lookup should answer NFS3ERR_NOENT after a remove";
 }
 
 TEST_P(Nfs, MakeDirectoryAndRemoveIt) {
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  const auto RootHandle = mountRoot(Probe);
-  ASSERT_EQ(RootHandle.size(), 64u);
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   nfs::XdrWriter Args;
   Args.opaque(RootHandle);
@@ -774,7 +759,7 @@ TEST_P(Nfs, MakeDirectoryAndRemoveIt) {
   nfs::XdrReader Body(R->Body);
   ASSERT_EQ(Body.u32(), 0u);
   ASSERT_TRUE(Body.boolean());
-  ASSERT_EQ(Body.opaque(64).size(), 64u);
+  ASSERT_EQ(Body.opaque(64).size(), kHandleSize);
 
   uint32_t Status = 0;
   lookup(Probe, RootHandle, "a-directory", Status);
@@ -791,14 +776,11 @@ TEST_P(Nfs, MakeDirectoryAndRemoveIt) {
   ASSERT_EQ(After.u32(), 0u);
 
   lookup(Probe, RootHandle, "a-directory", Status);
-  EXPECT_EQ(Status, 2u) << "and not find it afterwards";
+  EXPECT_EQ(Status, kNfs3ErrNoEnt) << "and not find it afterwards";
 }
 
 TEST_P(Nfs, MakeDirectoryRefusesAnExistingName) {
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  const auto RootHandle = mountRoot(Probe);
-  ASSERT_EQ(RootHandle.size(), 64u);
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   nfs::XdrWriter Args;
   Args.opaque(RootHandle);
@@ -809,7 +791,7 @@ TEST_P(Nfs, MakeDirectoryRefusesAnExistingName) {
   ASSERT_TRUE(R) << R.error().message();
 
   nfs::XdrReader Body(R->Body);
-  EXPECT_EQ(Body.u32(), 17u) << "NFS3ERR_EXIST";
+  EXPECT_EQ(Body.u32(), kNfs3ErrExist);
 
   // The failure reply carries dir_wcc and nothing else, so a reader that
   // expects exactly that finds the end of the message where it should be.
@@ -820,10 +802,7 @@ TEST_P(Nfs, MakeDirectoryRefusesAnExistingName) {
 }
 
 TEST_P(Nfs, RenameMovesAName) {
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  const auto RootHandle = mountRoot(Probe);
-  ASSERT_EQ(RootHandle.size(), 64u);
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   nfs::XdrWriter Made;
   Made.opaque(RootHandle);
@@ -848,14 +827,11 @@ TEST_P(Nfs, RenameMovesAName) {
   lookup(Probe, RootHandle, "after-rename.bin", Status);
   EXPECT_EQ(Status, 0u) << "the new name is there";
   lookup(Probe, RootHandle, "before-rename.bin", Status);
-  EXPECT_EQ(Status, 2u) << "the old name is not";
+  EXPECT_EQ(Status, kNfs3ErrNoEnt) << "the old name is not";
 }
 
 TEST_P(Nfs, SymlinkIsMadeAndRead) {
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  const auto RootHandle = mountRoot(Probe);
-  ASSERT_EQ(RootHandle.size(), 64u);
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   nfs::XdrWriter Args;
   Args.opaque(RootHandle);
@@ -870,7 +846,7 @@ TEST_P(Nfs, SymlinkIsMadeAndRead) {
   ASSERT_EQ(Body.u32(), 0u);
   ASSERT_TRUE(Body.boolean());
   const auto Made = Body.opaque(64);
-  ASSERT_EQ(Made.size(), 64u);
+  ASSERT_EQ(Made.size(), kHandleSize);
 
   nfs::XdrWriter Ask;
   Ask.opaque(Made);
@@ -884,10 +860,7 @@ TEST_P(Nfs, SymlinkIsMadeAndRead) {
 }
 
 TEST_P(Nfs, HardLinkSharesTheFile) {
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  const auto RootHandle = mountRoot(Probe);
-  ASSERT_EQ(RootHandle.size(), 64u);
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   uint32_t Status = 0;
   const auto File = lookup(Probe, RootHandle, "alpha.bin", Status);
@@ -914,14 +887,11 @@ TEST_P(Nfs, HardLinkSharesTheFile) {
 
   nfs::XdrReader Attrs(Stat->Body);
   ASSERT_EQ(Attrs.u32(), 0u);
-  for (int I = 0; I < 5; I++) Attrs.u32();
-  EXPECT_EQ(Attrs.u64(), localBytes(Alpha).size()) << "and it is the same file";
+  EXPECT_EQ(sizeFromFattr3(Attrs), localBytes(Alpha).size()) << "and it is the same file";
 }
 
 TEST_P(Nfs, StaleHandleIsRefused) {
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  ASSERT_EQ(mountRoot(Probe).size(), 64u);
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   std::vector<std::byte> Bogus(64, std::byte{0});
   Bogus[0] = std::byte{2};
@@ -934,22 +904,22 @@ TEST_P(Nfs, StaleHandleIsRefused) {
   ASSERT_TRUE(R) << R.error().message();
 
   nfs::XdrReader Body(R->Body);
-  EXPECT_EQ(Body.u32(), 70u) << "an unknown handle should be NFS3ERR_STALE";
+  EXPECT_EQ(Body.u32(), kNfs3ErrStale) << "an unknown handle should be NFS3ERR_STALE";
 }
 
-TEST_P(Nfs, ALongPathsHandleResolvesOnEveryConnection) {
+TEST_P(Nfs, ALongPathHandleResolvesOnEveryConnection) {
   const std::string Long(70, 'n');
   ASSERT_TRUE(peer().makeDirectory(Root + "/" + Long));
 
   RpcProbe Minting;
   ASSERT_TRUE(connectProbe(Minting));
-  const auto RootHandle = mountRoot(Minting);
-  ASSERT_EQ(RootHandle.size(), 64u);
+  const auto Minted = mountRoot(Minting);
+  ASSERT_EQ(Minted.size(), kHandleSize);
 
   uint32_t Status = 1;
-  const auto Handle = lookup(Minting, RootHandle, Long, Status);
+  const auto Handle = lookup(Minting, Minted, Long, Status);
   ASSERT_EQ(Status, 0u);
-  ASSERT_EQ(Handle.size(), 64u);
+  ASSERT_EQ(Handle.size(), kHandleSize);
   ASSERT_EQ(Handle[0], std::byte{2}) << "a path this long should not fit inline";
 
   for (int I = 0; I < 16; I++) {
@@ -960,35 +930,27 @@ TEST_P(Nfs, ALongPathsHandleResolvesOnEveryConnection) {
 }
 
 TEST_P(Nfs, TooLongNameIsRefused) {
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  const auto RootHandle = mountRoot(Probe);
-  ASSERT_EQ(RootHandle.size(), 64u);
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   uint32_t Status = 0;
   lookup(Probe, RootHandle, std::string(300, 'x'), Status);
-  EXPECT_EQ(Status, 63u) << "a name past the limit should be NFS3ERR_NAMETOOLONG";
+  EXPECT_EQ(Status, kNfs3ErrNameTooLong) << "a name past the limit should be NFS3ERR_NAMETOOLONG";
 }
 
 TEST_P(Nfs, ForgedHandleStaysInTheExport) {
   restartExportAs(Host + ":sub");
 
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  ASSERT_EQ(mountRoot(Probe).size(), 64u);
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   EXPECT_EQ(statusOfGetAttr(Probe, forged("sub/nested.bin")), 0u) << "a handle inside the export should still work, or this proves nothing";
-  EXPECT_EQ(statusOfGetAttr(Probe, forged("alpha.bin")), 70u) << "a handle above the exported directory must not resolve";
-  EXPECT_EQ(statusOfGetAttr(Probe, forged("../alpha.bin")), 70u) << "a parent reference must not resolve";
+  EXPECT_EQ(statusOfGetAttr(Probe, forged("alpha.bin")), kNfs3ErrStale) << "a handle above the exported directory must not resolve";
+  EXPECT_EQ(statusOfGetAttr(Probe, forged("../alpha.bin")), kNfs3ErrStale) << "a parent reference must not resolve";
 }
 
 TEST_P(Nfs, ParentOfTheExportRootIsTheExportRoot) {
   restartExportAs(Host + ":sub");
 
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  const auto RootHandle = mountRoot(Probe);
-  ASSERT_EQ(RootHandle.size(), 64u);
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   uint32_t Status = 0;
   const auto Up = lookup(Probe, RootHandle, "..", Status);
@@ -997,17 +959,14 @@ TEST_P(Nfs, ParentOfTheExportRootIsTheExportRoot) {
 }
 
 TEST_P(Nfs, SurvivesTheDaemonRestarting) {
-  RpcProbe Probe;
-  ASSERT_TRUE(connectProbe(Probe));
-  const auto RootHandle = mountRoot(Probe);
-  ASSERT_EQ(RootHandle.size(), 64u);
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 
   uint32_t Status = 0;
   const auto File = lookup(Probe, RootHandle, "alpha.bin", Status);
   ASSERT_EQ(Status, 0u);
 
   stopDaemon();
-  EXPECT_EQ(statusOfGetAttr(Probe, File), 5u) << "a dead daemon should answer NFS3ERR_IO, not drop the connection";
+  EXPECT_EQ(statusOfGetAttr(Probe, File), kNfs3ErrIo) << "a dead daemon should answer NFS3ERR_IO, not drop the connection";
 
   startDaemon();
 

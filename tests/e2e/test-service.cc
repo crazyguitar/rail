@@ -33,11 +33,7 @@ protected:
     ASSERT_TRUE(Address) << "could not resolve the peer address";
     Host = *Address;
 
-    stopDaemon();
-
-    auto Started = peer().run({serviceBinary().string(), "--serve", Root, "--port", std::to_string(Opts.Port), "--backend", Opts.Backend});
-    ASSERT_TRUE(Started) << "could not start raild on the peer: " << Started.error().message();
-    Daemon.emplace(std::move(*Started));
+    ASSERT_NO_FATAL_FAILURE(restartDaemonWith({}));
   }
 
   void TearDown() override { stopDaemon(); }
@@ -47,10 +43,7 @@ protected:
   // first daemon whatever options it was given.
   void stopDaemon() {
     Daemon.reset();
-    if (auto Killed = peer().run({"pkill", "-x", "raild"}); Killed) {
-      [[maybe_unused]] auto Line = Killed->readLine();
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    stopPeerProcess("raild");
   }
 
   void restartDaemonWith(std::vector<std::string> Extra) {
