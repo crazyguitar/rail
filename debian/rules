@@ -1,0 +1,30 @@
+#!/usr/bin/make -f
+
+include /usr/share/dpkg/pkg-info.mk
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+DKMS_SRC = debian/railfs-dkms/usr/src/railfs-$(DEB_VERSION_UPSTREAM)
+
+%:
+	dh $@ --buildsystem=cmake+ninja
+
+override_dh_auto_configure:
+	dh_auto_configure -- -DFETCHCONTENT_FULLY_DISCONNECTED=OFF -DRAIL_BUILD_TESTS=OFF -DRAIL_BUILD_BENCH=OFF -DRAILFS_KDIR=/nonexistent
+
+override_dh_auto_install:
+	dh_auto_install --destdir=debian/rail
+	install -d $(DKMS_SRC)
+	install -m 0644 src/linux/*.c src/linux/*.h src/linux/Makefile src/linux/LICENSE $(DKMS_SRC)/
+	sed 's/#VERSION#/$(DEB_VERSION_UPSTREAM)/' src/linux/dkms.conf > $(DKMS_SRC)/dkms.conf
+
+override_dh_installdeb:
+	sed 's/#VERSION#/$(DEB_VERSION_UPSTREAM)/' debian/railfs-dkms.postinst.in > debian/railfs-dkms.postinst
+	sed 's/#VERSION#/$(DEB_VERSION_UPSTREAM)/' debian/railfs-dkms.prerm.in > debian/railfs-dkms.prerm
+	dh_installdeb
+
+override_dh_auto_test:
+
+override_dh_clean:
+	rm -f debian/railfs-dkms.postinst debian/railfs-dkms.prerm
+	dh_clean

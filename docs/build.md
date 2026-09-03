@@ -24,3 +24,17 @@ sudo modprobe railfs
 ```
 
 Nothing loads it at boot; `/etc/modules-load.d/railfs.conf` does.
+
+## Packages
+
+Every tag builds two Debian packages for amd64 and arm64 and attaches them to
+the release, with a tarball of the same binaries:
+
+```bash
+sudo apt install ./rail_0.1.0-1_arm64.deb ./railfs-dkms_0.1.0-1_all.deb
+```
+
+`rail` holds the daemon, the command and the mount helpers. `railfs-dkms`
+holds the module source and DKMS builds it for the running kernel, and again
+after a kernel upgrade; it needs `linux-headers-$(uname -r)`. Locally,
+`dpkg-buildpackage -us -uc -b` produces the same packages.

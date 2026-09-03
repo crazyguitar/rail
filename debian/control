@@ -1,0 +1,35 @@
+Source: rail
+Section: net
+Priority: optional
+Maintainer: Chang Ning Tsai <spiderpower02@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               cmake,
+               ninja-build,
+               pkg-config,
+               git,
+               libfuse3-dev,
+               libibverbs-dev,
+               librdmacm-dev,
+               liburing-dev
+Standards-Version: 4.6.2
+Homepage: https://github.com/crazyguitar/rail
+Vcs-Git: https://github.com/crazyguitar/rail.git
+Vcs-Browser: https://github.com/crazyguitar/rail
+Rules-Requires-Root: no
+
+Package: rail
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, fuse3, nfs-common, ibverbs-providers
+Recommends: railfs-dkms
+Description: filesystem over RDMA
+ rail serves a directory over RDMA or TCP and mounts it as a local path
+ through the kernel module, FUSE or an NFS gateway. It also carries files
+ directly with rsync's delta algorithm over an ssh control channel.
+ .
+ This package holds the daemon, the rail command and the mount helpers.
+
+Package: railfs-dkms
+Architecture: all
+Depends: ${misc:Depends}, dkms
+Description: filesystem over RDMA - kernel module source
+ The railfs kernel module, built for the running kernel by DKMS.

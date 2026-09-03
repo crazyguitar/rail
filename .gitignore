@@ -12,3 +12,15 @@ src/linux/Module.symvers
 src/linux/modules.order
 src/linux/MOK.priv
 src/linux/MOK.der
+
+# dpkg-buildpackage leaves these beside debian/
+debian/rail/
+debian/railfs-dkms/
+debian/.debhelper/
+debian/files
+debian/*.substvars
+debian/*.debhelper
+debian/debhelper-build-stamp
+debian/railfs-dkms.postinst
+debian/railfs-dkms.prerm
+obj-*/
