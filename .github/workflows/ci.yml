@@ -60,7 +60,7 @@ jobs:
           dpkg-buildpackage -us -uc -b
           mv ../*.deb .
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: debs-ci
           path: '*.deb'

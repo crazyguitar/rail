@@ -65,7 +65,7 @@ jobs:
           tar czf "rail-${TAG_NAME}-${{ matrix.arch }}.tar.gz" -C stage .
           mv ../*.deb .
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rail-${{ matrix.arch }}
           path: |
