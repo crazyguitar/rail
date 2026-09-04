@@ -144,6 +144,9 @@ struct railfs_inode {
 	// will differ on the next look either way, and only this tells the two
 	// cases apart.
 	bool mine;
+	// Which part of the pool this file's writeback keeps to, handed out in
+	// turn rather than hashed, so two files rarely want the same connections.
+	unsigned int window;
 };
 
 struct railfs_path {

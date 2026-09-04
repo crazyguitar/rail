@@ -1455,7 +1455,10 @@ struct railfs_conn *railfs_pool_take_near(struct railfs_pool *pool, unsigned int
 
 		// On this window's own bits, not the pool's: waiting for any connection
 		// returns at once while anything outside the window is idle, which
-		// spins rather than sleeps.
+		// spins rather than sleeps. Taking one of those idle connections instead
+		// was measured worse everywhere - a lone writer went 2.22 to 1.82 GiB/s -
+		// because it puts the whole pool on one file and the peer then contends
+		// on that inode.
 		wait_event(pool->waiters, (pool->busy & window) != window);
 	}
 }

@@ -24,6 +24,7 @@ struct inode *railfs_alloc_inode(struct super_block *sb)
 	self->mtime = 0;
 	self->size = 0;
 	self->mine = false;
+	self->window = UINT_MAX;
 	return &self->vfs;
 }
 

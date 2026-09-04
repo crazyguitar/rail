@@ -16,6 +16,7 @@
 #include "railfs-trace.h"
 
 static atomic_t railfs_flushes = ATOMIC_INIT(0);
+static atomic_t railfs_next_window = ATOMIC_INIT(0);
 static DECLARE_WAIT_QUEUE_HEAD(railfs_flush_room);
 
 struct railfs_flush {
@@ -144,6 +145,32 @@ out:
 	return err;
 }
 
+// One window per file, taken in turn. Hashing the inode instead let two files
+// land on windows that overlap by three connections of four, so those
+// connections carried every flush both files made while others carried none.
+static unsigned int railfs_window_for(struct inode *inode, const struct railfs_options *opts)
+{
+	struct railfs_inode *self = RAILFS_I(inode);
+	unsigned int windows;
+	unsigned int mine;
+
+	if (READ_ONCE(self->window) != UINT_MAX) {
+		return READ_ONCE(self->window);
+	}
+
+	windows = max(opts->pool->count / opts->flush_span, 1u);
+	mine = (unsigned int)atomic_inc_return(&railfs_next_window) % windows * opts->flush_span;
+
+	// An fsync and the flusher can both reach a file's first writeback, and two
+	// windows for one inode is the collision this exists to avoid, so the first
+	// one to land is the one that stays.
+	if (cmpxchg(&self->window, UINT_MAX, mine) != UINT_MAX) {
+		return READ_ONCE(self->window);
+	}
+
+	return mine;
+}
+
 static struct railfs_flush *railfs_flush_new(struct address_space *mapping, struct railfs_options *opts, struct railfs_path *path,
 					   unsigned int room)
 {
@@ -168,7 +195,7 @@ static struct railfs_flush *railfs_flush_new(struct address_space *mapping, stru
 	flush->limit = opts->flush_limit;
 	flush->path = railfs_path_get(path);
 	flush->room = room;
-	flush->hint = (unsigned int)hash_long(mapping->host->i_ino, 32);
+	flush->hint = railfs_window_for(mapping->host, opts);
 	INIT_WORK(&flush->work, railfs_flush_one);
 out:
 	return flush;
