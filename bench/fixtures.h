@@ -58,6 +58,11 @@ inline std::string kernelMountDir() { return envOr("RAIL_KERNEL_MOUNT", "/tmp/ra
 inline std::string localDir() { return envOr("RAIL_LOCAL", "/tmp/rail-bench-local"); }
 
 inline std::string localTmpfsDir() { return envOr("RAIL_LOCAL_TMPFS", "/tmp/rail-bench-ltmpfs"); }
+inline std::string tmpfsHuge() { return envOr("RAIL_TMPFS_HUGE", "always"); }
+
+inline std::string mountTmpfsUnlessMounted(const std::string &Dir, const std::string &Size) {
+  return "mountpoint -q " + Dir + " || sudo -n mount -t tmpfs -o size=" + Size + ",huge=" + tmpfsHuge() + " tmpfs " + Dir;
+}
 
 inline std::string localTmpfsSize() { return envOr("RAIL_LOCAL_TMPFS_SIZE", "40G"); }
 
@@ -124,7 +129,7 @@ private:
   // the command returned, so a refused mount would leave the export on the
   // peer's disk and every row would carry a tmpfs label over nvme numbers.
   static bool mountTmpfsOnPeer() {
-    onPeer("mountpoint -q " + exportDir() + " || sudo -n mount -t tmpfs -o size=" + tmpfsSize() + " tmpfs " + exportDir());
+    onPeer(mountTmpfsUnlessMounted(exportDir(), tmpfsSize()));
     return peerSays("mountpoint -q " + exportDir() + " && echo mounted") == "mounted";
   }
 
@@ -518,8 +523,7 @@ private:
     std::filesystem::create_directories(localTmpfsDir(), EC);
     if (EC) return false;
 
-    auto Mounted = runLocal(
-        {"sh", "-c", "mountpoint -q " + localTmpfsDir() + " || sudo -n mount -t tmpfs -o size=" + localTmpfsSize() + " tmpfs " + localTmpfsDir()});
+    auto Mounted = runLocal({"sh", "-c", mountTmpfsUnlessMounted(localTmpfsDir(), localTmpfsSize())});
     return Mounted && Mounted->ExitStatus == 0;
   }
 

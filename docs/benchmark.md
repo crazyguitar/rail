@@ -4,6 +4,7 @@
 salloc -N2 make bench                                    # everything, 5 repetitions
 salloc -N2 make bench FILTER=BM_RdmaSend                 # the fabric alone
 salloc -N2 make bench BENCH='--cpus 8-15'                # pinned, for comparable numbers
+salloc -N2 make bench BENCH='--cpus 8-15 --backing tmpfs' # the peer serves from memory
 scripts/run-bench.sh --local --peer 10.0.0.2 --fabric 10.10.0.2
 ```
 
@@ -64,6 +65,26 @@ of that column on its own reads higher than a pass inside the whole table.
 `--daemon-cpus LIST` pins `raild` on the peer as well. It costs every write
 column 5 to 20%, because the daemon's io_uring workers inherit the mask, so it
 is off unless asked for.
+
+## Served from memory
+
+`--backing tmpfs` puts the peer's export on a tmpfs instead of its nvme. The
+`tmpfs` column is this machine's own memory with no network under it, the
+counterpart of `nvme` above. Each tmpfs is mounted with 2 MiB pages
+(`huge=always`; `RAIL_TMPFS_HUGE` overrides it), since 4 KiB pages cost a
+1 MiB write 0.22 ms on the peer against 0.06.
+
+```bash
+salloc -N2 make bench BENCH='--cpus 8-15 --backing tmpfs'
+```
+
+Median of seven with the standard deviation beside it, `--cpus 8-15`:
+
+| q | read tmpfs | read railfs | write tmpfs | write railfs |
+| --- | --- | --- | --- | --- |
+| 4 | 55.42 ±5.55 | 18.47 ±1.04 | 74.69 ±22.75 | 12.07 ±0.81 |
+| 8 | 82.06 ±4.46 | 19.16 ±0.35 | 46.75 ±1.47 | 14.46 ±0.30 |
+| 16 | 92.50 ±4.11 | 19.25 ±0.23 | 66.14 ±2.58 | 14.21 ±0.36 |
 
 ## By thread count
 
