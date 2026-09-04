@@ -28,7 +28,13 @@ inline constexpr uint16_t kServicePort = 18690;
 
 inline constexpr uint16_t kNfsPort = 20490;
 
-inline constexpr uint64_t kTargetSize = 32ull << 30;
+inline std::string backing() { return envOr("RAIL_BACKING", "nvme"); }
+
+inline bool exportOnTmpfs() { return backing() == "tmpfs"; }
+
+inline std::string tmpfsSize() { return envOr("RAIL_TMPFS_SIZE", "48G"); }
+
+inline uint64_t targetSize() { return exportOnTmpfs() ? 8ull << 30 : 32ull << 30; }
 
 inline constexpr size_t kParallelFiles = 16;
 
@@ -40,7 +46,7 @@ inline std::string targetFor(uint64_t Size) { return "bench-" + std::to_string(S
 
 inline std::string parallelFile(size_t I) { return "bench-par-" + std::to_string(I) + ".bin"; }
 
-inline std::string exportDir() { return envOr("RAIL_DIR", "/tmp/rail-bench-export"); }
+inline std::string exportDir() { return envOr("RAIL_DIR", exportOnTmpfs() ? "/tmp/rail-bench-tmpfs" : "/tmp/rail-bench-export"); }
 
 inline std::string mountDir() { return envOr("RAIL_MOUNT", "/tmp/rail-bench-mnt"); }
 
@@ -50,6 +56,10 @@ inline std::string kernelMountDir() { return envOr("RAIL_KERNEL_MOUNT", "/tmp/ra
 // the disk's ceiling with no network under it at all, which is what says
 // whether a row is bound by the fabric or by a drive.
 inline std::string localDir() { return envOr("RAIL_LOCAL", "/tmp/rail-bench-local"); }
+
+inline std::string localTmpfsDir() { return envOr("RAIL_LOCAL_TMPFS", "/tmp/rail-bench-ltmpfs"); }
+
+inline std::string localTmpfsSize() { return envOr("RAIL_LOCAL_TMPFS_SIZE", "40G"); }
 
 inline std::string nfsMountDir() { return envOr("RAIL_NFS_MOUNT", "/tmp/rail-bench-nmnt"); }
 
@@ -96,6 +106,7 @@ private:
     [[maybe_unused]] auto Local = runLocal({"pkill", "-f", "mount.railnfs --serve"});
     if (!onPeer("pkill -x raild")) return false;
     if (!onPeer("mkdir -p " + exportDir())) return false;
+    if (exportOnTmpfs() && !mountTmpfsOnPeer()) return false;
     if (!onPeer("chmod 0777 " + exportDir())) return false;
     if (!seedFixtures()) return false;
     if (!onPeer(forgetOnPeer(3))) return false;
@@ -107,12 +118,18 @@ private:
     return true;
   }
 
-  static void dropLocalCache() {
-    [[maybe_unused]] auto Dropped = runLocal({"sh", "-c", forgetHere(3)});
+  static void dropLocalCache() { [[maybe_unused]] auto Dropped = runLocal({"sh", "-c", forgetHere(3)}); }
+
+  // Checked rather than trusted: onPeer reports whether the ssh ran, not what
+  // the command returned, so a refused mount would leave the export on the
+  // peer's disk and every row would carry a tmpfs label over nvme numbers.
+  static bool mountTmpfsOnPeer() {
+    onPeer("mountpoint -q " + exportDir() + " || sudo -n mount -t tmpfs -o size=" + tmpfsSize() + " tmpfs " + exportDir());
+    return peerSays("mountpoint -q " + exportDir() + " && echo mounted") == "mounted";
   }
 
   bool seedFixtures() {
-    for (const uint64_t Size : {uint64_t{1} << 30, uint64_t{8} << 30, kTargetSize}) {
+    for (const uint64_t Size : {uint64_t{1} << 30, uint64_t{8} << 30, targetSize()}) {
       const std::string Target = exportDir() + "/" + targetFor(Size);
       if (!onPeer("[ -s " + Target + " ] || dd if=/dev/urandom of=" + Target + " bs=1M count=" + std::to_string(Size >> 20) + " status=none"))
         return false;
@@ -141,6 +158,18 @@ private:
     if (!Started) return false;
     Serving.emplace(std::move(*Started));
     return true;
+  }
+
+  static std::string peerSays(const std::string &Command) {
+    auto Opened = RemoteHost::open(peerHost());
+    if (!Opened) return {};
+
+    auto Ran = Opened->run({"sh", "-c", Command});
+    if (!Ran) return {};
+
+    auto Line = Ran->readLine();
+    while (Ran->readLine()) {}
+    return Line ? *Line : std::string{};
   }
 
   static bool onPeer(const std::string &Command) {
@@ -225,7 +254,7 @@ private:
     if (!ran(asRoot({"mount", "-i", "-t", "railfs", "-o", Options, "none", kernelMountDir()}))) return refuse("mount -t railfs failed; see dmesg");
 
     Mounted = true;
-    if (!std::filesystem::exists(std::filesystem::path(kernelMountDir()) / targetFor(kTargetSize)))
+    if (!std::filesystem::exists(std::filesystem::path(kernelMountDir()) / targetFor(targetSize())))
       return refuse("the fixture is not visible through the kernel mount");
 
     return true;
@@ -243,6 +272,24 @@ private:
   bool Ready = false;
   const char *Why = "the kernel mount is not up";
 };
+
+inline bool seedParallelFiles(const std::filesystem::path &Dir) {
+  std::error_code EC;
+  std::filesystem::create_directories(Dir, EC);
+  if (EC) return false;
+
+  for (size_t I = 0; I < kParallelFiles; I++) {
+    const std::filesystem::path One = Dir / parallelFile(I);
+    if (std::filesystem::exists(One, EC) && std::filesystem::file_size(One, EC) == kLocalEach) continue;
+
+    const std::string Make = "dd if=/dev/urandom of=" + One.string() + " bs=1M count=" + std::to_string(kLocalEach >> 20) + " status=none";
+    auto Done = runLocal({"sh", "-c", Make});
+    if (!Done || Done->ExitStatus != 0) return false;
+  }
+
+  auto Synced = runLocal({"sync"});
+  return Synced && Synced->ExitStatus == 0;
+}
 
 class Local {
 public:
@@ -268,29 +315,8 @@ private:
   Local() { Ready = seed() && widen(); }
 
   bool seed() {
-    std::error_code EC;
-    std::filesystem::create_directories(localDir(), EC);
-    if (EC) {
-      Why = "could not make the local fixture directory";
-      return false;
-    }
-
-    for (size_t I = 0; I < kParallelFiles; I++) {
-      const std::filesystem::path One = std::filesystem::path(localDir()) / parallelFile(I);
-      if (std::filesystem::exists(One, EC) && std::filesystem::file_size(One, EC) == kLocalEach) {
-        continue;
-      }
-
-      const std::string Make = "dd if=/dev/urandom of=" + One.string() + " bs=1M count=" + std::to_string(kLocalEach >> 20) + " status=none";
-      auto Done = runLocal({"sh", "-c", Make});
-      if (!Done || Done->ExitStatus != 0) {
-        Why = "could not seed the local fixtures";
-        return false;
-      }
-    }
-
-    auto Synced = runLocal({"sync"});
-    return Synced && Synced->ExitStatus == 0;
+    Why = "could not seed the local fixtures";
+    return seedParallelFiles(localDir());
   }
 
   // 128 KiB of readahead is what a stock disk gives a sequential reader, and it
@@ -373,7 +399,7 @@ private:
     if (!ran(asRoot({"mount", "-t", "nfs", "-o", Options, "127.0.0.1:/", nfsMountDir()}))) return refuse("mount -t nfs failed");
 
     Mounted = true;
-    if (!std::filesystem::exists(std::filesystem::path(nfsMountDir()) / targetFor(kTargetSize)))
+    if (!std::filesystem::exists(std::filesystem::path(nfsMountDir()) / targetFor(targetSize())))
       return refuse("the fixture is not visible through the nfs mount");
 
     return true;
@@ -421,14 +447,14 @@ private:
     std::error_code EC;
     std::filesystem::create_directories(mountDir(), EC);
 
-    const std::string Command = "exec " + toolPath("mount.railfuse") + " " + fabricHost() + " " + mountDir() + " --port " + std::to_string(kServicePort) +
-                                " --sessions " + sessions() + threads() + chunk() + " --backend rdma" +
+    const std::string Command = "exec " + toolPath("mount.railfuse") + " " + fabricHost() + " " + mountDir() + " --port " +
+                                std::to_string(kServicePort) + " --sessions " + sessions() + threads() + chunk() + " --backend rdma" +
                                 std::string(Verifying ? "" : " --no-checksum") + " > /tmp/railfs-bench.log 2>&1";
     auto Started = BackgroundProcess::start({"sh", "-c", Command});
     if (!Started) return false;
     Serving.emplace(std::move(*Started));
 
-    return appears(std::filesystem::path(mountDir()) / targetFor(kTargetSize));
+    return appears(std::filesystem::path(mountDir()) / targetFor(targetSize()));
   }
 
   static bool appears(const std::filesystem::path &Fixture) {
@@ -469,6 +495,46 @@ inline bool nfsMountReady(benchmark::State &State) { return available(State, Nfs
 inline bool localReady(benchmark::State &State) { return available(State, Local::get().ready(), Local::get().why()); }
 
 inline std::string onLocal(const std::string &Name) { return (std::filesystem::path(localDir()) / Name).string(); }
+
+class LocalTmpfs {
+public:
+  static LocalTmpfs &get() {
+    static LocalTmpfs Only;
+    return Only;
+  }
+
+  LocalTmpfs(const LocalTmpfs &) = delete;
+  LocalTmpfs &operator=(const LocalTmpfs &) = delete;
+
+  bool ready() const { return Ready; }
+  const char *why() const { return Why; }
+
+private:
+  LocalTmpfs() { Ready = mount() && seed(); }
+
+  bool mount() {
+    Why = "could not mount the local tmpfs; these need root, or passwordless sudo";
+    std::error_code EC;
+    std::filesystem::create_directories(localTmpfsDir(), EC);
+    if (EC) return false;
+
+    auto Mounted = runLocal(
+        {"sh", "-c", "mountpoint -q " + localTmpfsDir() + " || sudo -n mount -t tmpfs -o size=" + localTmpfsSize() + " tmpfs " + localTmpfsDir()});
+    return Mounted && Mounted->ExitStatus == 0;
+  }
+
+  bool seed() {
+    Why = "could not seed the local tmpfs fixtures";
+    return seedParallelFiles(localTmpfsDir());
+  }
+
+  bool Ready = false;
+  const char *Why = "the local tmpfs is not up";
+};
+
+inline bool localTmpfsReady(benchmark::State &State) { return available(State, LocalTmpfs::get().ready(), LocalTmpfs::get().why()); }
+
+inline std::string onLocalTmpfs(const std::string &Name) { return (std::filesystem::path(localTmpfsDir()) / Name).string(); }
 
 inline std::string onNfsMount(const std::string &Name) { return (std::filesystem::path(nfsMountDir()) / Name).string(); }
 
@@ -529,7 +595,7 @@ Coro<Result<void>> readRound(Client &Reader, const File &Which, uint64_t &Offset
   for (size_t I = 0; I < Depth; I++)
     if (auto Got = co_await Reader.collectRead(); !Got) co_return std::unexpected(Got.error());
 
-  Offset = (Offset + Depth * Block) % (kTargetSize - Depth * Block);
+  Offset = (Offset + Depth * Block) % (targetSize() - Depth * Block);
   co_return Result<void>{};
 }
 

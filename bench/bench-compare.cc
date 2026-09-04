@@ -49,6 +49,7 @@ void BM_Write(benchmark::State &State, Via How) {
 BENCHMARK_CAPTURE(BM_Read, p2p, Via::P2p)->Arg(4)->Arg(8)->Arg(16)->Apply(wholeFile);
 BENCHMARK_CAPTURE(BM_Read, rail, Via::Rail)->Arg(4)->Arg(8)->Arg(16)->Apply(wholeFile);
 BENCHMARK_CAPTURE(BM_Read, nvme, Via::Nvme)->Arg(4)->Arg(8)->Arg(16)->Apply(wholeFile);
+BENCHMARK_CAPTURE(BM_Read, tmpfs, Via::Tmpfs)->Arg(4)->Arg(8)->Arg(16)->Apply(wholeFile);
 BENCHMARK_CAPTURE(BM_Read, nfs, Via::Nfs)->Arg(4)->Arg(8)->Arg(16)->Apply(wholeFile);
 BENCHMARK_CAPTURE(BM_Read, fuse, Via::Fuse)->Arg(4)->Arg(8)->Arg(16)->Apply(wholeFile);
 BENCHMARK_CAPTURE(BM_Read, railfs, Via::Railfs)->Arg(4)->Arg(8)->Arg(16)->Apply(wholeFile);
@@ -56,6 +57,7 @@ BENCHMARK_CAPTURE(BM_Read, railfs, Via::Railfs)->Arg(4)->Arg(8)->Arg(16)->Apply(
 BENCHMARK_CAPTURE(BM_Write, p2p, Via::P2p)->Arg(4)->Arg(8)->Arg(16)->Apply(wholeFile);
 BENCHMARK_CAPTURE(BM_Write, rail, Via::Rail)->Arg(4)->Arg(8)->Arg(16)->Apply(wholeFile);
 BENCHMARK_CAPTURE(BM_Write, nvme, Via::Nvme)->Arg(4)->Arg(8)->Arg(16)->Apply(wholeFile);
+BENCHMARK_CAPTURE(BM_Write, tmpfs, Via::Tmpfs)->Arg(4)->Arg(8)->Arg(16)->Apply(wholeFile);
 BENCHMARK_CAPTURE(BM_Write, nfs, Via::Nfs)->Arg(4)->Arg(8)->Arg(16)->Apply(wholeFile);
 BENCHMARK_CAPTURE(BM_Write, fuse, Via::Fuse)->Arg(4)->Arg(8)->Arg(16)->Apply(wholeFile);
 BENCHMARK_CAPTURE(BM_Write, railfs, Via::Railfs)->Arg(4)->Arg(8)->Arg(16)->Apply(wholeFile);

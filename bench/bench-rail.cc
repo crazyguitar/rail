@@ -19,7 +19,7 @@ void BM_RailRead(benchmark::State &State) {
 
   const size_t Depth = std::min(Asked, Client.maxOutstanding());
   std::vector<std::vector<std::byte>> Landing(Depth, std::vector<std::byte>(Block));
-  const std::string Source = targetFor(kTargetSize);
+  const std::string Source = targetFor(targetSize());
   uint64_t Offset = 0;
 
   measure(State, Depth * Block, [&] { return run(readRound(Client, Source, Offset, Block, Landing)); });

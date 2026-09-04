@@ -13,7 +13,7 @@ void BM_NfsRead(benchmark::State &State) {
 
   if (!exportReady(State)) return;
 
-  auto Opened = openOverNfs(targetFor(kTargetSize));
+  auto Opened = openOverNfs(targetFor(targetSize()));
   if (!orSkip(State, Opened)) return;
 
   std::vector<std::vector<std::byte>> Landing(Depth, std::vector<std::byte>(Block));

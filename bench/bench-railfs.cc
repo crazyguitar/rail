@@ -17,7 +17,7 @@ void BM_KernelRead(benchmark::State &State) {
   AlignedPages Landing(1, Block);
   if (!allocated(State, Landing)) return;
 
-  const std::string Source = onKernelMount(targetFor(kTargetSize));
+  const std::string Source = onKernelMount(targetFor(targetSize()));
   measure(State, Size, [&]() -> Result<void> {
     OpenFd Fd(Source, O_RDONLY);
     if (!Fd.valid()) return failErrno("open the fixture through the kernel mount");

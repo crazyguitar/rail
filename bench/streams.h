@@ -13,7 +13,7 @@ inline constexpr uint64_t kCompareEach = 1ull << 30;
 inline constexpr size_t kCompareWindow = 16;
 inline constexpr size_t kP2pDepth = 256;
 
-enum class Via { P2p, Rail, Nvme, Nfs, Fuse, Railfs };
+enum class Via { P2p, Rail, Nvme, Tmpfs, Nfs, Fuse, Railfs };
 
 // Every write case runs against a drive the previous ones have just filled, and
 // a drive that has taken a hundred gigabytes back to back reports its sustained
@@ -40,6 +40,7 @@ inline void settlePeer() {
 inline void settleFor(Via How) {
   switch (How) {
   case Via::P2p:
+  case Via::Tmpfs:
     return;
   case Via::Nvme:
     settleLocal();
@@ -51,9 +52,7 @@ inline void settleFor(Via How) {
 }
 
 // Without this a second case is answered from the local page cache.
-inline void coldLocal() {
-  [[maybe_unused]] auto Dropped = runLocal({"sh", "-c", forgetHere(3)});
-}
+inline void coldLocal() { [[maybe_unused]] auto Dropped = runLocal({"sh", "-c", forgetHere(3)}); }
 
 inline bool reachable(benchmark::State &State, Via How) {
   switch (How) {
@@ -62,6 +61,8 @@ inline bool reachable(benchmark::State &State, Via How) {
     return exportReady(State);
   case Via::Nvme:
     return localReady(State);
+  case Via::Tmpfs:
+    return localTmpfsReady(State);
   case Via::Nfs:
     return nfsMountReady(State);
   case Via::Fuse:
@@ -76,6 +77,8 @@ inline std::string pathFor(Via How, const std::string &Name) {
   switch (How) {
   case Via::Nvme:
     return onLocal(Name);
+  case Via::Tmpfs:
+    return onLocalTmpfs(Name);
   case Via::Nfs:
     return onNfsMount(Name);
   case Via::Fuse:

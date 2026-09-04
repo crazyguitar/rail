@@ -17,7 +17,7 @@ void BM_FuseRead(benchmark::State &State) {
   AlignedPages Landing(1, Block);
   if (!allocated(State, Landing)) return;
 
-  const std::string Source = onMount(targetFor(kTargetSize));
+  const std::string Source = onMount(targetFor(targetSize()));
   measure(State, Size, [&]() -> Result<void> {
     OpenFd Fd(Source, O_RDONLY);
     if (!Fd.valid()) return failErrno("open the fixture through the mount");
@@ -66,7 +66,7 @@ void BM_FuseReadNoVerify(benchmark::State &State) {
   AlignedPages Landing(1, Block);
   if (!allocated(State, Landing)) return;
 
-  const std::string Source = onMount(targetFor(kTargetSize));
+  const std::string Source = onMount(targetFor(targetSize()));
   measure(State, Size, [&]() -> Result<void> {
     OpenFd Fd(Source, O_RDONLY);
     if (!Fd.valid()) return failErrno("open the fixture through the mount");
