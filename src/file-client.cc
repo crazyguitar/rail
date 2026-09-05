@@ -161,6 +161,7 @@ struct FileClient::Impl {
   };
 
   bool FlipOneBit = false;
+  size_t AbortAfterPages = 0;
   bool Verify = true;
   Sum Agreed = Sum::XxH3;
 
@@ -224,6 +225,7 @@ Coro<Result<std::unique_ptr<FileClient>>> FileClient::connect(const std::string 
   auto P = std::make_unique<Impl>();
   P->Control = proto::ControlChannel(std::move(*Sock));
   P->FlipOneBit = Opts.FlipOneBit;
+  P->AbortAfterPages = Opts.AbortAfterPages;
   P->Verify = Opts.Verify;
   P->Agreed = Opts.Checksum;
   P->Channel = makeDataChannel(Opts.Backend, Opts.PageCount, Opts.PageSize, Host);
@@ -632,7 +634,8 @@ Coro<Result<uint64_t>> FileClient::store(const std::filesystem::path &Local, con
   if (!Accepted->Ok) co_return failMessage(Accepted->Error);
 
   FileSource Reading(*Source);
-  PageSender Sender(*P->Channel, Reading, St.TagBase, StreamGeometry::forChannel(*P->Channel), P->FlipOneBit, P->Verify, P->Agreed);
+  const StreamGeometry Geometry = StreamGeometry::forChannel(*P->Channel);
+  PageSender Sender(*P->Channel, Reading, St.TagBase, Geometry, P->FlipOneBit, P->Verify, P->Agreed, P->AbortAfterPages);
 
   proto::StreamDigest Digest;
   Digest.Id = St.Id;
@@ -752,7 +755,8 @@ FileClient::storeThrough(const std::string &Path, uint64_t Offset, uint64_t Leng
   if (!Accepted) co_return std::unexpected(Accepted.error());
   if (!Accepted->Ok) co_return failMessage(Accepted->Error);
 
-  PageSender Sender(*P->Channel, Outgoing, St.TagBase, StreamGeometry::forChannel(*P->Channel), P->FlipOneBit, P->Verify, P->Agreed);
+  const StreamGeometry Geometry = StreamGeometry::forChannel(*P->Channel);
+  PageSender Sender(*P->Channel, Outgoing, St.TagBase, Geometry, P->FlipOneBit, P->Verify, P->Agreed, P->AbortAfterPages);
 
   proto::StreamDigest Digest;
   Digest.Id = St.Id;

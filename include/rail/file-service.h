@@ -24,6 +24,7 @@ struct ServiceOptions {
   size_t PageCount = 12;
   size_t PageSize = 8u << 20;
   bool FlipOneBit = false;
+  size_t AbortAfterPages = 0;
   // Hash every page and check it on arrival. Costs bandwidth on a fabric that
   // already checks its own CRC, so a mount that trusts the wire can turn it
   // off; the client asks and the daemon follows, so both ends always agree.

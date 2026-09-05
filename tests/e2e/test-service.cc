@@ -332,6 +332,21 @@ TEST_P(Service, StoreCatchesBadData) {
   run((*C)->close());
 }
 
+TEST_P(Service, AnAbortedStoreFailsInsteadOfHanging) {
+  const auto Local = makeFile("service-store-abort.bin", 6u << 20, 62);
+
+  ServiceOptions Aborting = Opts;
+  Aborting.AbortAfterPages = 2;
+  auto C = clientWith(Aborting);
+  ASSERT_TRUE(C) << C.error().message();
+
+  auto Put = run((*C)->store(Local, "store-abort.bin"));
+  EXPECT_FALSE(Put) << "a store the sender abandoned mid-stream reported success";
+  EXPECT_FALSE(peer().exists(Root + "/store-abort.bin").value_or(false)) << "an aborted store still landed a file";
+
+  run((*C)->close());
+}
+
 TEST_P(Service, FetchIntoMemoryMatchesSource) {
   const uint64_t Size = 6u << 20;
   const auto Local = makeFile("service-fetch-into.bin", Size, 61);

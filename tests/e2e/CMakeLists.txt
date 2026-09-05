@@ -23,6 +23,7 @@ add_executable(rail-e2e
   test-uring.cc
   test-codec.cc
   test-paths.cc
+  test-stream.cc
 )
 target_link_libraries(rail-e2e PRIVATE rail-testing GTest::gtest_main)
 add_dependencies(rail-e2e rail-cli raild-cli mount-railnfs mount-railfuse)

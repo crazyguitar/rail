@@ -26,6 +26,18 @@ StreamGeometry StreamGeometry::forChannel(DataChannel &Channel) {
   return G;
 }
 
+// A page whose read failed. Drop it and the peer hangs on its posted receive;
+// await its read and quiesce hangs on a completion that never comes.
+//
+//   drop        -->  x            peer recv waits forever
+//   this: zeros -->  [00000000]   peer recv completes, digest fails it
+//         op.Done -->  await returns 0 at once, never blocks
+void PageSender::markFailed(Reading &R) {
+  R.Failed = true;
+  R.Op.Done = true;
+  R.Op.Result = 0;
+}
+
 Coro<Result<void>> PageSender::fill(uint64_t &Cursor, uint64_t End) {
   const uint64_t PageBytes = Channel.pool().pageSize();
 
@@ -60,10 +72,19 @@ Coro<Result<void>> PageSender::fill(uint64_t &Cursor, uint64_t End) {
     R.Key = Cursor;
     R.Length = static_cast<uint32_t>(R.Buf.size());
 
+    const bool Abort = AbortAfterPages > 0 && Pooled >= AbortAfterPages;
+    Pooled++;
+    if (Abort) {
+      if (Failure) Failure = failMessage("stream aborted before reading a page");
+      markFailed(R);
+      Cursor += R.Length;
+      continue;
+    }
+
     const size_t Ask = Source.direct() ? std::min<size_t>(alignUp(R.Length), R.Buf.capacity()) : R.Length;
     if (auto S = Source.submitRead(R.Op, {R.Buf.bytes(), Ask}, R.Key); !S) {
-      Prefetch.pop_back();
-      co_return std::unexpected(S.error());
+      if (Failure) Failure = std::unexpected(S.error());
+      markFailed(R);
     }
     Cursor += R.Length;
   }
@@ -90,20 +111,10 @@ Coro<Result<void>> PageSender::shipReady() {
     co_return Result<void>{};
   }
 
-  Result<size_t> Got;
-  {
-    Scoped T("tx.read");
-    Got = co_await Source.awaitRead(Ready.Op);
-  }
-
-  if (!Got) {
-    if (Failure) Failure = std::unexpected(Got.error());
-    std::memset(Ready.Buf.bytes(), 0, Ready.Length);
-    Got = static_cast<size_t>(Ready.Length);
-  }
+  const size_t Got = co_await readOrZero(Ready);
 
   const uint64_t Key = Ready.Key;
-  Ready.Buf.resize(std::min<size_t>(Ready.Length, *Got));
+  Ready.Buf.resize(std::min<size_t>(Ready.Length, Got));
 
   {
     Scoped T("tx.hash");
@@ -123,6 +134,17 @@ Coro<Result<void>> PageSender::shipReady() {
   InFlight.back().Op = Channel.send(InFlight.back().Buf, TagBase + Key);
   InFlight.back().Op.start();
   co_return Result<void>{};
+}
+
+Coro<size_t> PageSender::readOrZero(Reading &Ready) {
+  if (!Ready.Failed) {
+    Scoped T("tx.read");
+    auto Got = co_await Source.awaitRead(Ready.Op);
+    if (Got) co_return *Got;
+    if (Failure) Failure = std::unexpected(Got.error());
+  }
+  std::memset(Ready.Buf.bytes(), 0, Ready.Length);
+  co_return Ready.Length;
 }
 
 Coro<Result<void>> PageSender::drain(size_t Keep) {
