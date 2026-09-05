@@ -558,7 +558,7 @@ private:
       if (Done()) co_return Result<void>{};
       if (!Failure.empty()) co_return failMessage(Failure);
 
-      co_await Either{this, Alive};
+      co_await Either{this};
       absorb();
 
       // The peer only has to be there while we are waiting on it. If its end
@@ -636,12 +636,11 @@ private:
     }
   }
 
-  // Woken by whichever comes first: a completion, or the peer's connection
-  // going away. Cancelling on resume takes the handle off the other list, and
-  // the loop is single threaded so nothing can fire in between.
+  // Woken by a completion or the tick, never by the control fd: the loop wakes
+  // every waiter on a descriptor, so that would resume every in-flight op on
+  // each frame. until() checks the peer on the tick instead.
   struct Either {
     RdmaDataChannel *C;
-    int Alive;
     std::coroutine_handle<> H{};
 
     bool await_ready() const noexcept { return false; }
@@ -654,7 +653,6 @@ private:
         else Loop::get().wait(One->channel()->fd, EPOLLIN, H);
         First = false;
       }
-      if (Alive >= 0) Loop::get().wait(Alive, EPOLLIN | EPOLLRDHUP | EPOLLHUP, H);
     }
 
     void await_resume() {

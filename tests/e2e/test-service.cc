@@ -907,6 +907,46 @@ TEST_P(Service, MetadataStaysInRoot) {
   run((*C)->close());
 }
 
+TEST_P(Service, PipelinedReadsSurviveConcurrentControlTraffic) {
+  const auto Local = makeFile("service-storm.bin", 512 << 10, 73);
+  seedRemote(Local, Root + "/storm.bin");
+  const auto Expected = localBytes(Local);
+
+  auto C = client();
+  ASSERT_TRUE(C) << C.error().message();
+
+  constexpr size_t kBlock = 32 << 10;
+  const size_t Blocks = Expected.size() / kBlock;
+  const size_t Window = std::min(Blocks, (*C)->maxOutstanding());
+
+  std::vector<std::vector<std::byte>> Landing(Window, std::vector<std::byte>(kBlock));
+  std::vector<uint64_t> Ids(Window);
+  size_t Asked = 0;
+  size_t Got = 0;
+  while (Got < Blocks) {
+    while (Asked < Blocks && Asked - Got < Window) {
+      const size_t Which = Asked % Window;
+      auto Id = run((*C)->submitRead("storm.bin", Asked * kBlock, Landing[Which]));
+      ASSERT_TRUE(Id) << Id.error().message();
+      Ids[Which] = *Id;
+      Asked++;
+    }
+    // Control frames while a full window of fabric reads is outstanding must
+    // leave those reads intact.
+    ASSERT_TRUE(run((*C)->stat("storm.bin"))) << "stat should answer while reads are in flight";
+    ASSERT_TRUE(run((*C)->statFs("."))) << "statfs should answer while reads are in flight";
+
+    const size_t Which = Got % Window;
+    auto R = run((*C)->collectRead(Ids[Which]));
+    ASSERT_TRUE(R) << "read " << Got << ": " << R.error().message();
+    ASSERT_EQ(R->Bytes, kBlock);
+    EXPECT_TRUE(std::equal(Landing[Which].begin(), Landing[Which].end(), Expected.begin() + static_cast<long>(Got * kBlock)))
+        << "read " << Got << " returned the wrong bytes under control traffic";
+    Got++;
+  }
+  run((*C)->close());
+}
+
 TEST_P(Service, MixesReadsWithOtherCalls) {
   const auto Local = makeFile("service-mix.bin", 128 << 10, 71);
   seedRemote(Local, Root + "/mix.bin");
