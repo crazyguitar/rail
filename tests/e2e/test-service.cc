@@ -4,6 +4,7 @@
 #include "rail/io/runner.h"
 #include "rail/proto/message.h"
 
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
@@ -55,6 +56,17 @@ protected:
     Argv.insert(Argv.end(), Extra.begin(), Extra.end());
     auto Started = peer().run(Argv);
     ASSERT_TRUE(Started) << "could not restart raild";
+    Daemon.emplace(std::move(*Started));
+  }
+
+  // Under a descriptor limit low enough for a test to reach. None of the
+  // arguments carries a space or a quote, so joining them is safe.
+  void restartDaemonUnderLimit(size_t Descriptors, std::vector<std::string> Extra) {
+    stopDaemon();
+    std::string Command = serviceBinary().string() + " --serve " + Root + " --port " + std::to_string(Opts.Port) + " --backend " + Opts.Backend;
+    for (const auto &Word : Extra) Command += " " + Word;
+    auto Started = peer().run({"bash", "-c", "ulimit -n " + std::to_string(Descriptors) + " && exec " + Command});
+    ASSERT_TRUE(Started) << "could not restart raild under a descriptor limit";
     Daemon.emplace(std::move(*Started));
   }
 
@@ -716,6 +728,44 @@ TEST_P(Service, ClosedSessionsFreeTheirDescriptorsWhileIdle) {
     After = fdCount();
   }
   EXPECT_LE(After, Base + 2) << "closed sessions kept their descriptors through an idle daemon";
+}
+
+TEST_P(Service, OneClientCannotExhaustTheDaemonsDescriptors) {
+  const auto Local = makeFile("service-pin.bin", 4096, 92);
+  seedRemote(Local, Root + "/pin.bin");
+
+  // 128 descriptors, four sessions reserved: the daemon keeps 64 for itself
+  // and 16 for sessions, leaving 48 for pinned files. A greedy client must be
+  // refused at that budget, with room left for everyone else.
+  ASSERT_NO_FATAL_FAILURE(restartDaemonUnderLimit(128, {"--max-sessions", "4"}));
+
+  auto Greedy = client();
+  ASSERT_TRUE(Greedy) << Greedy.error().message();
+
+  size_t Opened = 0;
+  uint32_t Refusal = 0;
+  for (size_t I = 0; I < 200; I++) {
+    auto Reply = run((*Greedy)->openFile("pin.bin", false));
+    ASSERT_TRUE(Reply) << Reply.error().message();
+    if (!Reply->Ok) {
+      Refusal = Reply->Errno;
+      break;
+    }
+    Opened++;
+  }
+  EXPECT_EQ(Refusal, static_cast<uint32_t>(EMFILE)) << "the greedy client was not refused with EMFILE";
+  EXPECT_LT(Opened, 100u) << "the greedy client reached the raw descriptor limit rather than the daemon's budget";
+
+  // The daemon still has descriptors of its own, so another client can come
+  // in and be served.
+  auto Other = client();
+  ASSERT_TRUE(Other) << "a second client could not connect once one had filled its budget: " << Other.error().message();
+  auto Seen = run((*Other)->stat("pin.bin"));
+  ASSERT_TRUE(Seen) << Seen.error().message();
+  EXPECT_TRUE(Seen->Found);
+
+  run((*Other)->close());
+  run((*Greedy)->close());
 }
 
 TEST_P(Service, MakesAndRemovesDirs) {

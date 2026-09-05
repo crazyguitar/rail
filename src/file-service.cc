@@ -14,6 +14,7 @@
 #include "rail/stream/sink.h"
 #include "rail/transport/data-channel.h"
 
+#include <atomic>
 #include <cerrno>
 #include <climits>
 #include <cstring>
@@ -186,6 +187,51 @@ std::filesystem::path pathOfOpenFile(int Fd) { return std::filesystem::path("/pr
 // past a bound turns that into one client's open failing.
 constexpr size_t kMaxPinned = 4096;
 
+// Pinned handles across every session. The per-connection cap above keeps one
+// client from hogging, but on its own it let a few clients take the daemon to
+// EMFILE for everyone; this is what the descriptor limit leaves once the
+// sessions and the daemon's own descriptors are reserved.
+std::atomic<size_t> &pinnedNow() {
+  static std::atomic<size_t> Now{0};
+  return Now;
+}
+
+std::atomic<size_t> &pinnedBudget() {
+  static std::atomic<size_t> Budget{std::numeric_limits<size_t>::max()};
+  return Budget;
+}
+
+// Owns one slot of the budget for as long as the handle is pinned. The slot is
+// taken by the opener before the open, so the wrapper only gives it back.
+class PinnedFile {
+public:
+  PinnedFile() = default;
+  explicit PinnedFile(FdCache::Held F) : File(std::move(F)), Counted(true) {}
+  PinnedFile(const PinnedFile &) = delete;
+  PinnedFile &operator=(const PinnedFile &) = delete;
+  PinnedFile(PinnedFile &&O) noexcept : File(std::move(O.File)), Counted(std::exchange(O.Counted, false)) {}
+  PinnedFile &operator=(PinnedFile &&O) noexcept {
+    if (this != &O) {
+      release();
+      File = std::move(O.File);
+      Counted = std::exchange(O.Counted, false);
+    }
+    return *this;
+  }
+  ~PinnedFile() { release(); }
+
+  const FdCache::Held &file() const { return File; }
+
+private:
+  void release() {
+    if (Counted) pinnedNow().fetch_sub(1, std::memory_order_relaxed);
+    Counted = false;
+  }
+
+  FdCache::Held File;
+  bool Counted = false;
+};
+
 class Service {
 public:
   Service(std::filesystem::path Root, bool FlipOneBit) : Root(std::move(Root)), FlipOneBit(FlipOneBit) {}
@@ -330,18 +376,27 @@ public:
       co_return co_await Control.send(Reply);
     }
 
+    const size_t Budget = pinnedBudget().load(std::memory_order_relaxed);
+    if (pinnedNow().fetch_add(1, std::memory_order_relaxed) >= Budget) {
+      pinnedNow().fetch_sub(1, std::memory_order_relaxed);
+      Reply.Error = std::format("too many open files across the daemon, {} allowed", Budget);
+      Reply.Errno = EMFILE;
+      co_return co_await Control.send(Reply);
+    }
+
     const int Fd = ::open(Path->c_str(), (O.Writable ? O_RDWR : O_RDONLY) | O_CLOEXEC);
     if (Fd < 0) {
       // Read before anything else can overwrite it, formatting included.
       Reply.Errno = static_cast<uint32_t>(errno);
       Reply.Error = failErrno(std::format("open {}", Path->string())).error().message();
+      pinnedNow().fetch_sub(1, std::memory_order_relaxed);
       co_return co_await Control.send(Reply);
     }
     ::posix_fadvise(Fd, 0, 0, POSIX_FADV_SEQUENTIAL);
 
     Reply.Handle = NextHandle++;
     Reply.Ok = true;
-    Pinned.emplace(Reply.Handle, std::make_shared<FdCache::Handle>(Fd));
+    Pinned.emplace(Reply.Handle, PinnedFile(std::make_shared<FdCache::Handle>(Fd)));
     co_return co_await Control.send(Reply);
   }
 
@@ -357,7 +412,7 @@ public:
     if (Handle != 0) {
       auto It = Pinned.find(Handle);
       if (It == Pinned.end()) return failMessage(std::format("no such handle {}", Handle));
-      return It->second;
+      return It->second.file();
     }
 
     auto Path = underRoot(Root, Named);
@@ -856,7 +911,7 @@ public:
   bool FlipOneBit = false;
   bool Verify = true;
   Sum Agreed = Sum::XxH3;
-  std::unordered_map<uint64_t, FdCache::Held> Pinned;
+  std::unordered_map<uint64_t, PinnedFile> Pinned;
   uint64_t NextHandle = 1;
 
   // Requests answered at once on one connection. Serving them one at a time
@@ -893,6 +948,16 @@ constexpr double kMemoryShare = 0.25;
 // Answering is work, and one core cannot answer for an unbounded crowd. Loose
 // enough not to bind on a machine with real memory.
 constexpr size_t kSessionsPerCore = 256;
+
+// What the descriptor limit leaves for pinned files once every session's own
+// descriptors and the daemon's are reserved.
+void sizePinnedBudget(size_t Sessions) {
+  ::rlimit Limit{};
+  if (::getrlimit(RLIMIT_NOFILE, &Limit) != 0) return;
+  const size_t Have = static_cast<size_t>(Limit.rlim_cur);
+  const size_t Reserved = kDescriptorsKeptBack + Sessions * kDescriptorsPerSession;
+  pinnedBudget().store(Have > Reserved ? Have - Reserved : 0, std::memory_order_relaxed);
+}
 
 size_t descriptorCeiling() {
   ::rlimit Limit{};
@@ -987,7 +1052,9 @@ Coro<Result<void>> serveFiles(const std::filesystem::path &Root, const ServiceOp
   // times over as it has threads - which is the memory bound this exists to
   // enforce. Only the first thread explains it; the rest would print the same
   // three lines again.
-  const size_t Allowed = std::max<size_t>(1, sessionsAffordable(Opts, !Sharing) / Threads);
+  const size_t Total = sessionsAffordable(Opts, !Sharing);
+  const size_t Allowed = std::max<size_t>(1, Total / Threads);
+  sizePinnedBudget(Total);
 
   // A session that ends rings this, so the accept loop reaps it at once instead
   // of holding its registered pages, queue pairs and descriptors until the next
