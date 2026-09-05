@@ -66,6 +66,16 @@ of that column on its own reads higher than a pass inside the whole table.
 column 5 to 20%, because the daemon's io_uring workers inherit the mask, so it
 is off unless asked for.
 
+RDMA metadata throughput, median operations per second:
+
+| operation (batch) | ops/s |
+| --- | ---: |
+| stat (100) | 29,121 |
+| stat (1000) | 28,701 |
+| open + close (100 pairs) | 16,107 |
+| chmod 0644 (100) | 30,625 |
+| statfs (100) | 29,222 |
+
 ## Served from memory
 
 `--backing tmpfs` puts the peer's export on a tmpfs instead of its nvme. The

@@ -347,61 +347,30 @@ public:
     co_return co_await Channel->acceptPeer();
   }
 
-  // The descriptor is owned from the moment it opens, so a result nobody
-  // collects still closes it.
-  struct Opening {
+  Coro<Result<void>> onOpen(const proto::OpenRequest &O) {
     proto::OpenReply Reply;
-    FdCache::Held File;
-  };
-
-  // Gives the budget slot back unless the open committed it to a pinned file.
-  struct BudgetSlot {
-    bool Held = true;
-    ~BudgetSlot() {
-      if (Held) pinnedNow().fetch_sub(1, std::memory_order_relaxed);
-    }
-    void keep() { Held = false; }
-  };
-
-  static Opening openOffLoop(const std::filesystem::path &Root, const proto::OpenRequest &O) {
-    Opening Out;
-    Out.Reply.Id = O.Id;
+    Reply.Id = O.Id;
 
     auto Path = underRoot(Root, O.Path);
     if (!Path) {
-      Out.Reply.Error = Path.error().message();
-      Out.Reply.Errno = EACCES;
-      return Out;
+      Reply.Error = Path.error().message();
+      Reply.Errno = EACCES;
+      co_return co_await Control.send(Reply);
     }
 
-    Out.Reply.Attrs = attrsOf(*Path, Out.Reply.Found);
-    if (!Out.Reply.Found) {
-      Out.Reply.Error = std::format("no such file: {}", O.Path);
-      Out.Reply.Errno = ENOENT;
-      return Out;
+    Reply.Attrs = attrsOf(*Path, Reply.Found);
+    if (!Reply.Found) {
+      Reply.Error = std::format("no such file: {}", O.Path);
+      Reply.Errno = ENOENT;
+      co_return co_await Control.send(Reply);
     }
-    if (Out.Reply.Attrs.Directory) {
-      Out.Reply.Error = std::format("not a file: {}", O.Path);
-      Out.Reply.Errno = EISDIR;
-      return Out;
+    if (Reply.Attrs.Directory) {
+      Reply.Error = std::format("not a file: {}", O.Path);
+      Reply.Errno = EISDIR;
+      co_return co_await Control.send(Reply);
     }
 
-    const int Fd = ::open(Path->c_str(), (O.Writable ? O_RDWR : O_RDONLY) | O_CLOEXEC);
-    if (Fd < 0) {
-      // Read before anything else can overwrite it, formatting included.
-      Out.Reply.Errno = static_cast<uint32_t>(errno);
-      Out.Reply.Error = failErrno(std::format("open {}", Path->string())).error().message();
-      return Out;
-    }
-    ::posix_fadvise(Fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-    Out.File = std::make_shared<FdCache::Handle>(Fd);
-    return Out;
-  }
-
-  Coro<Result<void>> onOpen(const proto::OpenRequest &O) {
     if (Pinned.size() >= kMaxPinned) {
-      proto::OpenReply Reply;
-      Reply.Id = O.Id;
       Reply.Error = std::format("too many open files on this connection, {} already", Pinned.size());
       Reply.Errno = EMFILE;
       co_return co_await Control.send(Reply);
@@ -410,22 +379,37 @@ public:
     const size_t Budget = pinnedBudget().load(std::memory_order_relaxed);
     if (pinnedNow().fetch_add(1, std::memory_order_relaxed) >= Budget) {
       pinnedNow().fetch_sub(1, std::memory_order_relaxed);
-      proto::OpenReply Reply;
-      Reply.Id = O.Id;
       Reply.Error = std::format("too many open files across the daemon, {} allowed", Budget);
       Reply.Errno = EMFILE;
       co_return co_await Control.send(Reply);
     }
-    BudgetSlot Slot;
 
-    auto Opened = co_await offLoop([Root = Root, O = O] { return openOffLoop(Root, O); });
-    if (!Opened.File) co_return co_await Control.send(Opened.Reply);
+    // Prevent a FIFO open from waiting for a writer on this serving thread.
+    // This does not prevent storage latency during path lookup or regular-file
+    // open. Clear the flag afterward to preserve blocking descriptor semantics.
+    const int Fd = ::open(Path->c_str(), (O.Writable ? O_RDWR : O_RDONLY) | O_CLOEXEC | O_NONBLOCK);
+    if (Fd < 0) {
+      // Read before anything else can overwrite it, formatting included.
+      Reply.Errno = static_cast<uint32_t>(errno);
+      Reply.Error = failErrno(std::format("open {}", Path->string())).error().message();
+      pinnedNow().fetch_sub(1, std::memory_order_relaxed);
+      co_return co_await Control.send(Reply);
+    }
+    // We just opened it without append/direct/async flags, so no F_GETFL is
+    // needed to preserve them. Access mode and CLOEXEC are not changed here.
+    if (::fcntl(Fd, F_SETFL, 0) < 0) {
+      Reply.Errno = static_cast<uint32_t>(errno);
+      Reply.Error = failErrno("clear O_NONBLOCK").error().message();
+      ::close(Fd);
+      pinnedNow().fetch_sub(1, std::memory_order_relaxed);
+      co_return co_await Control.send(Reply);
+    }
+    ::posix_fadvise(Fd, 0, 0, POSIX_FADV_SEQUENTIAL);
 
-    Slot.keep();
-    Opened.Reply.Handle = NextHandle++;
-    Opened.Reply.Ok = true;
-    Pinned.emplace(Opened.Reply.Handle, PinnedFile(std::move(Opened.File)));
-    co_return co_await Control.send(Opened.Reply);
+    Reply.Handle = NextHandle++;
+    Reply.Ok = true;
+    Pinned.emplace(Reply.Handle, PinnedFile(std::make_shared<FdCache::Handle>(Fd)));
+    co_return co_await Control.send(Reply);
   }
 
   Coro<Result<void>> onClose(const proto::CloseRequest &C) {
@@ -452,13 +436,13 @@ public:
     return openFiles().get(*Path, Flags);
   }
 
+  // Keep single-path metadata inline: handing each cached lookup to the pool
+  // costs more than the lookup. Slow backing storage can stall this loop;
+  // directory enumeration still runs off-loop because its work is unbounded.
   Coro<Result<void>> onStat(const proto::StatRequest &S) {
-    auto Reply = co_await offLoop([Root = Root, Id = S.Id, Name = S.Path] {
-      proto::StatReply R;
-      R.Id = Id;
-      if (auto Path = underRoot(Root, Name); Path) R.Attrs = attrsOf(*Path, R.Found);
-      return R;
-    });
+    proto::StatReply Reply;
+    Reply.Id = S.Id;
+    if (auto Path = underRoot(Root, S.Path); Path) Reply.Attrs = attrsOf(*Path, Reply.Found);
     co_return co_await Control.send(Reply);
   }
 
@@ -624,51 +608,12 @@ public:
     co_return Result<void>{};
   }
 
-  // Everything but fsync, which io_uring answers on the loop.
-  static proto::MetaReply metaOffLoop(const std::filesystem::path &Root, const proto::MetaRequest &Meta) {
+  Coro<Result<void>> onMeta(const proto::MetaRequest &Meta) {
     proto::MetaReply Reply;
     Reply.Id = Meta.Id;
 
-    auto Path = underRoot(Root, Meta.Path);
-    if (!Path) {
-      refused(Reply, Path.error());
-      return Reply;
-    }
-
-    // Rename and a hard link both name a second path, and neither may leave the
-    // root, so they are checked together and differ only in the call.
-    const bool Linking = Meta.Op == proto::MetaOp::HardLink;
-    if (Linking || Meta.Op == proto::MetaOp::Rename) {
-      auto Target = underRoot(Root, Meta.Target);
-      if (!Target) {
-        refused(Reply, Target.error());
-        return Reply;
-      }
-      if (Linking) landed(Reply, ::link(Path->c_str(), Target->c_str()), "link");
-      else landed(Reply, ::rename(Path->c_str(), Target->c_str()), "rename");
-      return Reply;
-    }
-
-    if (Meta.Op == proto::MetaOp::ReadLink) {
-      std::string Target(PATH_MAX, '\0');
-      const ssize_t Wrote = ::readlink(Path->c_str(), Target.data(), Target.size());
-      landed(Reply, Wrote < 0 ? -1 : 0, "readlink");
-      if (Wrote >= 0) {
-        Target.resize(static_cast<size_t>(Wrote));
-        Reply.Target = std::move(Target);
-      }
-      return Reply;
-    }
-
-    if (auto R = applyMeta(Meta, *Path); !R) refused(Reply, R.error());
-    else Reply.Ok = true;
-    return Reply;
-  }
-
-  Coro<Result<void>> onMeta(const proto::MetaRequest &Meta) {
+    // A pinned descriptor remains valid after its pathname is replaced.
     if (Meta.Op == proto::MetaOp::Fsync) {
-      proto::MetaReply Reply;
-      Reply.Id = Meta.Id;
       auto File = heldFor(Meta.Handle, Meta.Path, O_WRONLY);
       if (!File) {
         refused(Reply, File.error());
@@ -679,35 +624,64 @@ public:
       co_return co_await Control.send(Reply);
     }
 
-    auto Reply = co_await offLoop([Root = Root, Meta = Meta] { return metaOffLoop(Root, Meta); });
+    auto Path = underRoot(Root, Meta.Path);
+    if (!Path) {
+      refused(Reply, Path.error());
+      co_return co_await Control.send(Reply);
+    }
+
+    // Rename and a hard link both name a second path, and neither may leave the
+    // root, so they are checked together and differ only in the call.
+    const bool Linking = Meta.Op == proto::MetaOp::HardLink;
+    if (Linking || Meta.Op == proto::MetaOp::Rename) {
+      auto Target = underRoot(Root, Meta.Target);
+      if (!Target) {
+        refused(Reply, Target.error());
+        co_return co_await Control.send(Reply);
+      }
+      if (Linking) landed(Reply, ::link(Path->c_str(), Target->c_str()), "link");
+      else landed(Reply, ::rename(Path->c_str(), Target->c_str()), "rename");
+      co_return co_await Control.send(Reply);
+    }
+
+    if (Meta.Op == proto::MetaOp::ReadLink) {
+      std::string Target(PATH_MAX, '\0');
+      const ssize_t Wrote = ::readlink(Path->c_str(), Target.data(), Target.size());
+      landed(Reply, Wrote < 0 ? -1 : 0, "readlink");
+      if (Wrote >= 0) {
+        Target.resize(static_cast<size_t>(Wrote));
+        Reply.Target = std::move(Target);
+      }
+      co_return co_await Control.send(Reply);
+    }
+
+    if (auto R = applyMeta(Meta, *Path); !R) refused(Reply, R.error());
+    else Reply.Ok = true;
     co_return co_await Control.send(Reply);
   }
 
   Coro<Result<void>> onStatFs(const proto::StatFsRequest &Fs) {
-    auto Reply = co_await offLoop([Root = Root, Id = Fs.Id, Name = Fs.Path] {
-      proto::StatFsReply R;
-      R.Id = Id;
+    proto::StatFsReply Reply;
+    Reply.Id = Fs.Id;
 
-      auto Path = underRoot(Root, Name);
-      if (!Path) {
-        R.Error = Path.error().message();
-        return R;
-      }
+    auto Path = underRoot(Root, Fs.Path);
+    if (!Path) {
+      Reply.Error = Path.error().message();
+      co_return co_await Control.send(Reply);
+    }
 
-      struct ::statvfs Info{};
-      if (::statvfs(Path->c_str(), &Info) != 0) {
-        R.Error = failErrno("statvfs").error().message();
-        return R;
-      }
+    struct ::statvfs Info{};
+    if (::statvfs(Path->c_str(), &Info) != 0) {
+      Reply.Error = failErrno("statvfs").error().message();
+      co_return co_await Control.send(Reply);
+    }
 
-      R.Ok = true;
-      R.BlockSize = Info.f_bsize;
-      R.Blocks = Info.f_blocks;
-      R.BlocksFree = Info.f_bavail;
-      R.Files = Info.f_files;
-      R.FilesFree = Info.f_ffree;
-      return R;
-    });
+    Reply.Ok = true;
+    Reply.BlockSize = Info.f_bsize;
+    Reply.Blocks = Info.f_blocks;
+    Reply.BlocksFree = Info.f_bavail;
+    Reply.Files = Info.f_files;
+    Reply.FilesFree = Info.f_ffree;
     co_return co_await Control.send(Reply);
   }
 

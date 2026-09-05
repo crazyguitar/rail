@@ -581,6 +581,23 @@ TEST_P(Service, FsyncOnAMissingPathFails) {
   run((*C)->close());
 }
 
+TEST_P(Service, FsyncUsesPinnedFileAfterPathIsReplaced) {
+  const auto Local = makeFile("service-fsync-pinned.bin", 4096, 72);
+  seedRemote(Local, Root + "/pinned.bin");
+  auto C = client();
+  ASSERT_TRUE(C) << C.error().message();
+  auto Opened = run((*C)->openFile("pinned.bin", true));
+  ASSERT_TRUE(Opened);
+  ASSERT_TRUE(Opened->Ok) << Opened->Error;
+  ASSERT_TRUE(run((*C)->removeFile("pinned.bin")));
+  ASSERT_TRUE(run((*C)->makeLink("pinned.bin", "/etc/passwd")));
+  auto Synced = run((*C)->fsync("pinned.bin", Opened->Handle));
+  EXPECT_TRUE(Synced) << Synced.error().message();
+  EXPECT_FALSE(run((*C)->fsync("pinned.bin")));
+  EXPECT_TRUE(run((*C)->closeFile(Opened->Handle)));
+  run((*C)->close());
+}
+
 TEST_P(Service, FsyncStaysInRoot) {
   auto C = client();
   ASSERT_TRUE(C) << C.error().message();
@@ -768,30 +785,29 @@ TEST_P(Service, OneClientCannotExhaustTheDaemonsDescriptors) {
   run((*Greedy)->close());
 }
 
-TEST_P(Service, ABlockedOpenDoesNotStallOtherSessions) {
+TEST_P(Service, OpeningAFifoDoesNotStallTheDaemon) {
   const auto Local = makeFile("service-beside.bin", 4096, 93);
   seedRemote(Local, Root + "/beside.bin");
 
-  // open() on a fifo with no writer blocks until one appears.
+  // open() on a fifo waits for a writer unless it is opened non-blocking, and
+  // that wait would hold the thread every session on it shares.
   auto Made = peer().run({"mkfifo", Root + "/pipe"});
   ASSERT_TRUE(Made) << Made.error().message();
   for (int I = 0; I < 40 && !peer().exists(Root + "/pipe").value_or(false); I++) std::this_thread::sleep_for(std::chrono::milliseconds(50));
   ASSERT_TRUE(peer().exists(Root + "/pipe").value_or(false)) << "the fifo was not created";
 
-  auto Stuck = client();
-  ASSERT_TRUE(Stuck) << Stuck.error().message();
-  auto Other = client();
-  ASSERT_TRUE(Other) << Other.error().message();
+  auto C = client();
+  ASSERT_TRUE(C) << C.error().message();
 
-  // Never awaited: it cannot come back until the daemon dies.
-  auto Blocking = (*Stuck)->openFile("pipe", false);
-  Blocking.start();
+  auto Opened = run((*C)->openFile("pipe", false));
+  ASSERT_TRUE(Opened) << "opening a fifo never came back: " << Opened.error().message();
+  EXPECT_TRUE(Opened->Ok) << Opened->Error;
 
-  auto Seen = run((*Other)->stat("beside.bin"));
-  ASSERT_TRUE(Seen) << "a stat on another session did not come back while an open was blocked: " << Seen.error().message();
-  EXPECT_TRUE(Seen->Found);
+  auto Seen = run((*C)->stat("beside.bin"));
+  ASSERT_TRUE(Seen) << Seen.error().message();
+  EXPECT_TRUE(Seen->Found) << "the session stopped answering after the fifo open";
 
-  run((*Other)->close());
+  run((*C)->close());
 }
 
 TEST_P(Service, MakesAndRemovesDirs) {
