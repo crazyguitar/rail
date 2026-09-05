@@ -11,9 +11,11 @@
 
 #include <gtest/gtest.h>
 
+#include <barrier>
 #include <cstdlib>
 #include <memory>
 #include <span>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -156,6 +158,28 @@ TEST(Pages, PoolPagesAreDistinct) {
 
   EXPECT_EQ(First.capacity(), 1u << 20);
   EXPECT_NE(First.bytes(), Second.bytes());
+}
+
+// A grower that waited its turn must take from the region the last one added,
+// not add another. The barrier lands the race nearly every round; the rounds
+// make it certain.
+TEST(Pages, ConcurrentGrowthAddsOnlyWhatIsNeeded) {
+  constexpr size_t kThreads = 4;
+  for (int Round = 0; Round < 20; Round++) {
+    Memory M(4, 2 * kFrame, kFrame);
+    std::barrier Go(static_cast<std::ptrdiff_t>(kThreads));
+    std::vector<rail::Run> Held(kThreads);
+    std::vector<std::thread> Threads;
+    for (size_t I = 0; I < kThreads; I++)
+      Threads.emplace_back([&, I] {
+        Go.arrive_and_wait();
+        Held[I] = M.alloc(kFrame);
+      });
+    for (auto &T : Threads) T.join();
+
+    for (const auto &R : Held) ASSERT_TRUE(R.valid());
+    EXPECT_EQ(M.stats().RegionsGrown, 2u) << "round " << Round << " grew a region nobody needed";
+  }
 }
 
 TEST(Pages, GrowthStopsAtCeiling) {

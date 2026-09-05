@@ -131,6 +131,7 @@ private:
   void release(MemoryRegion *R, size_t First, size_t Frames);
   std::unique_ptr<MemoryRegion> build();
   bool grow();
+  bool growLocked();
 #ifdef RAIL_HAVE_RDMA
   Result<void> registerWith(MemoryRegion &R, const std::vector<std::shared_ptr<RdmaDevice>> &With);
 #endif

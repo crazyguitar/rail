@@ -170,6 +170,10 @@ std::unique_ptr<MemoryRegion> Memory::build() {
 
 bool Memory::grow() {
   const std::lock_guard<std::mutex> Alone(Growing);
+  return growLocked();
+}
+
+bool Memory::growLocked() {
   {
     const std::lock_guard<std::mutex> Held(Lock);
     if (Regions.size() >= RegionCeiling) return false;
@@ -217,7 +221,15 @@ Run Memory::alloc(size_t Bytes) {
     if (Run Mine = takeLocked(Frames); Mine.valid()) return Mine;
   }
 
-  if (!grow()) {
+  // A second look once we are the one grower: whoever held this before us may
+  // have added the region we need, and another on top of it would be wasted.
+  const std::lock_guard<std::mutex> Alone(Growing);
+  {
+    const std::lock_guard<std::mutex> Held(Lock);
+    if (Run Mine = takeLocked(Frames); Mine.valid()) return Mine;
+  }
+
+  if (!growLocked()) {
     const std::lock_guard<std::mutex> Held(Lock);
     Stats.Exhausted++;
     return Run{};
