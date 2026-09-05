@@ -49,6 +49,7 @@ void Loop::schedule(std::coroutine_handle<> H) {
 }
 
 void Loop::wait(int Fd, uint32_t Events, std::coroutine_handle<> H) {
+  Dormant.erase(Fd);
   auto &OnFd = Waiters[Fd];
   OnFd.push_back({H, Events});
   if (Shared.contains(Fd)) return;
@@ -121,11 +122,17 @@ void Loop::forget(int Fd) {
   // them instead and let the closed descriptor become an error they can report.
   wake(Fd);
   Shared.erase(Fd);
+  Dormant.erase(Fd);
   std::erase_if(Timed, [Fd](const Timer &T) { return T.Fd == Fd; });
   if (::epoll_ctl(EpollFd, EPOLL_CTL_DEL, Fd, nullptr) == 0) Registered--;
 }
 
-bool Loop::hasWork() const { return !Ready.empty() || !Timed.empty() || Registered > 0; }
+void Loop::idle(int Fd) {
+  if (Shared.contains(Fd)) Dormant.insert(Fd);
+  else forget(Fd);
+}
+
+bool Loop::hasWork() const { return !Ready.empty() || !Timed.empty() || Registered > static_cast<int>(Dormant.size()); }
 
 Loop::Driver::Driver(Driver &&Other) noexcept : Id(std::exchange(Other.Id, 0)) {}
 

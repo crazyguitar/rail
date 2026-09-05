@@ -3,6 +3,7 @@
 #include "rail/io/coro.h"
 #include "rail/io/loop.h"
 #include "rail/io/stream.h"
+#include "rail/result.h"
 
 #include <algorithm>
 #include <atomic>
@@ -64,6 +65,49 @@ private:
   std::vector<std::thread> Threads;
 };
 
+// Reuse completion descriptors on their owning loop. Workers only hold a
+// reference to the descriptor; registration and recycling stay on the loop.
+class OffLoopSignals {
+public:
+  struct Signal {
+    int Fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    ~Signal() {
+      if (Fd >= 0) ::close(Fd);
+    }
+  };
+
+  static OffLoopSignals &get() {
+    (void)Loop::get(); // Destroy registered signals before their loop.
+    thread_local OffLoopSignals Cache;
+    return Cache;
+  }
+
+  ~OffLoopSignals() {
+    for (const auto &S : Free) Loop::get().forget(S->Fd);
+  }
+
+  std::shared_ptr<Signal> take() {
+    if (!Free.empty()) {
+      auto S = std::move(Free.back());
+      Free.pop_back();
+      return S;
+    }
+    auto S = std::make_shared<Signal>();
+    if (S->Fd >= 0) Loop::get().share(S->Fd, EPOLLIN);
+    return S;
+  }
+
+  void put(std::shared_ptr<Signal> S) {
+    if (Free.size() < 16) {
+      Loop::get().idle(S->Fd);
+      Free.push_back(std::move(S));
+    } else Loop::get().forget(S->Fd);
+  }
+
+private:
+  std::vector<std::shared_ptr<Signal>> Free;
+};
+
 template <class Fn> Coro<std::invoke_result_t<Fn>> offLoop(Fn Work) {
   using R = std::invoke_result_t<Fn>;
 
@@ -72,28 +116,45 @@ template <class Fn> Coro<std::invoke_result_t<Fn>> offLoop(Fn Work) {
   struct Slot {
     std::optional<R> Out;
     std::atomic<bool> Landed{false};
-    int Done = -1;
-    ~Slot() {
-      if (Done >= 0) ::close(Done);
-    }
+    std::shared_ptr<OffLoopSignals::Signal> Signal;
   };
   auto State = std::make_shared<Slot>();
-  State->Done = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-  if (State->Done < 0) co_return Work();
+  State->Signal = OffLoopSignals::get().take();
+  if (State->Signal->Fd < 0) {
+    // Fallible jobs must not turn descriptor exhaustion into a blocking call
+    // on the serving loop (for example, truncate waiting for a file lease).
+    if constexpr (std::is_constructible_v<R, std::unexpected<Error>>) co_return failErrno("eventfd");
+    else co_return Work();
+  }
 
   struct Unwatch {
-    int Fd;
-    ~Unwatch() { Loop::get().forget(Fd); }
-  } Guard{State->Done};
+    std::shared_ptr<OffLoopSignals::Signal> Signal;
+    bool Reuse = false;
+    ~Unwatch() {
+      if (Reuse) OffLoopSignals::get().put(std::move(Signal));
+      else Loop::get().forget(Signal->Fd);
+    }
+  } Guard{State->Signal};
 
   OffLoopPool::get().post([State, Work = std::move(Work)]() mutable {
     State->Out.emplace(Work());
     State->Landed.store(true, std::memory_order_release);
     const uint64_t One = 1;
-    [[maybe_unused]] auto Wrote = ::write(State->Done, &One, sizeof(One));
+    ssize_t Wrote;
+    do {
+      Wrote = ::write(State->Signal->Fd, &One, sizeof(One));
+    } while (Wrote < 0 && errno == EINTR);
   });
 
-  while (!State->Landed.load(std::memory_order_acquire)) co_await WaitFor{State->Done, EPOLLIN};
+  while (!State->Landed.load(std::memory_order_acquire)) co_await WaitFor{State->Signal->Fd, EPOLLIN};
+  uint64_t Count;
+  ssize_t Read;
+  do {
+    Read = ::read(State->Signal->Fd, &Count, sizeof(Count));
+  } while (Read < 0 && errno == EINTR);
+  // A consumed notification proves the worker has written it. If completion
+  // was observed before that write, leave this descriptor with the worker.
+  Guard.Reuse = Read == sizeof(Count);
   co_return std::move(*State->Out);
 }
 

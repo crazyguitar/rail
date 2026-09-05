@@ -644,6 +644,32 @@ public:
       co_return co_await Control.send(Reply);
     }
 
+    if (Meta.Op == proto::MetaOp::Truncate) {
+      // Inline unless a lease is in the way: opening for write with O_NONBLOCK
+      // fails at once with EWOULDBLOCK instead of waiting out the lease break,
+      // and only that case is worth a worker thread.
+      const int Fd = ::open(Path->c_str(), O_WRONLY | O_CLOEXEC | O_NONBLOCK);
+      if (Fd >= 0) {
+        const bool Cut = ::ftruncate(Fd, static_cast<off_t>(Meta.Size)) == 0;
+        const int Why = errno;
+        ::close(Fd);
+        if (!Cut) refused(Reply, fail(std::error_code(Why, std::generic_category()), "truncate").error());
+        else Reply.Ok = true;
+        co_return co_await Control.send(Reply);
+      }
+      if (errno != EWOULDBLOCK) {
+        refused(Reply, failErrno("truncate").error());
+        co_return co_await Control.send(Reply);
+      }
+      auto Done = co_await offLoop([Path = *Path, Size = Meta.Size]() -> Result<void> {
+        if (::truncate(Path.c_str(), static_cast<off_t>(Size)) != 0) return failErrno("truncate");
+        return {};
+      });
+      if (!Done) refused(Reply, Done.error());
+      else Reply.Ok = true;
+      co_return co_await Control.send(Reply);
+    }
+
     if (Meta.Op == proto::MetaOp::ReadLink) {
       std::string Target(PATH_MAX, '\0');
       const ssize_t Wrote = ::readlink(Path->c_str(), Target.data(), Target.size());

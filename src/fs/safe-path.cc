@@ -15,6 +15,13 @@ Result<std::filesystem::path> underRoot(const std::filesystem::path &Root, const
   const std::filesystem::path Candidate = Root / Relative;
 
   std::error_code EC;
+  // A direct child cannot escape through an intermediate component. Only a
+  // symlink needs canonical resolution; recheck its type on every request.
+  if (!Relative.has_parent_path()) {
+    const auto Status = std::filesystem::symlink_status(Candidate, EC);
+    if (!EC && std::filesystem::exists(Status) && !std::filesystem::is_symlink(Status)) return Candidate;
+  }
+
   auto RealRoot = std::filesystem::weakly_canonical(Root, EC);
   if (EC) RealRoot = Root;
   auto Real = std::filesystem::weakly_canonical(Candidate, EC);

@@ -7,7 +7,9 @@
 
 #include <chrono>
 #include <csignal>
+#include <future>
 #include <stdexcept>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
@@ -61,6 +63,7 @@ TEST(Loop, RunRefusesToReturnAnUnfinishedResult) {
   bool Threw = false;
   bool Returned = false;
   std::thread([&] {
+    EXPECT_EQ(run(offLoop([] { return 7; })), 7);
     try {
       run(parkedForever());
       Returned = true;
@@ -106,6 +109,55 @@ TEST(Loop, OffLoopWorkComesBackToTheLoop) {
   }));
   EXPECT_EQ(Got, 42);
   EXPECT_NE(Ran, Loop) << "the work ran on the loop thread";
+}
+
+TEST(Loop, OffLoopResourceFailureDoesNotRunFallibleWorkInline) {
+  std::thread([] {
+    // Initialize the loop before limiting descriptors; restore the limit before
+    // making assertions so the rest of the suite can still open files.
+    (void)Loop::get();
+    struct rlimit Before{};
+    ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &Before), 0);
+    auto Limited = Before;
+    Limited.rlim_cur = 0;
+    ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &Limited), 0);
+    bool Ran = false;
+    auto Got = run(offLoop([&]() -> Result<int> {
+      Ran = true;
+      return 42;
+    }));
+    const int Restored = ::setrlimit(RLIMIT_NOFILE, &Before);
+    ASSERT_EQ(Restored, 0);
+    EXPECT_FALSE(Ran);
+    ASSERT_FALSE(Got);
+    EXPECT_EQ(Got.error().Code.value(), EMFILE);
+  }).join();
+}
+
+TEST(Loop, OffLoopCompletionsRemainDistinctAfterCancellation) {
+  std::promise<void> Started, Release;
+  auto Released = Release.get_future().share();
+  {
+    auto Abandoned = offLoop([&Started, Released]() -> Result<std::string> {
+      Started.set_value();
+      Released.wait();
+      return "abandoned";
+    });
+    Abandoned.start();
+    Started.get_future().wait();
+  }
+  // The cancelled worker still owns its notification descriptor while other
+  // jobs complete. Its eventual wake must not complete a different request.
+  auto First = run(offLoop([]() -> Result<std::string> { return "first"; }));
+  Release.set_value();
+  ASSERT_TRUE(First);
+  EXPECT_EQ(*First, "first");
+  for (int I = 0; I < 100; ++I) {
+    const auto Expected = std::to_string(I);
+    auto Got = run(offLoop([Expected]() -> Result<std::string> { return Expected; }));
+    ASSERT_TRUE(Got);
+    EXPECT_EQ(*Got, Expected);
+  }
 }
 
 // A connection is read by one coroutine and written by another. Registering the

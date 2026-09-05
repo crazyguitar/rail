@@ -810,6 +810,45 @@ TEST_P(Service, OpeningAFifoDoesNotStallTheDaemon) {
   run((*C)->close());
 }
 
+TEST_P(Service, ALeasedTruncateDoesNotStallOtherSessions) {
+  const auto Local = makeFile("service-leased.bin", 4096, 94);
+  seedRemote(Local, Root + "/leased.bin");
+  seedRemote(Local, Root + "/beside.bin");
+  auto Mutating = client();
+  ASSERT_TRUE(Mutating);
+  auto Other = client();
+  ASSERT_TRUE(Other);
+
+  const auto Helper = serviceBinary().parent_path().parent_path().parent_path() / "tests/e2e/rail-lease-holder";
+  const std::string Release = Root + "/release-lease";
+  auto Holder = peer().run({Helper.string(), Root + "/leased.bin", Release});
+  ASSERT_TRUE(Holder) << Holder.error().message();
+  auto Ready = Holder->readLine();
+  ASSERT_TRUE(Ready);
+  ASSERT_EQ(*Ready, "ready");
+
+  auto Pending = (*Mutating)->truncate("leased.bin", 0);
+  Pending.start();
+  auto Blocked = Holder->readLine();
+  ASSERT_TRUE(Blocked);
+  ASSERT_EQ(*Blocked, "blocked");
+
+  // Only a reply on the unrelated session can release the lease. An inline
+  // truncate deadlocks this handshake until the helper's failure timeout.
+  auto Seen = run((*Other)->stat("beside.bin"));
+  EXPECT_TRUE(Seen);
+  if (Seen) EXPECT_TRUE(Seen->Found);
+  EXPECT_TRUE(peer().makeDirectory(Release));
+  auto Released = Holder->readLine();
+  EXPECT_TRUE(Released);
+  if (Released) EXPECT_EQ(*Released, "released") << "truncate stalled the serving loop";
+
+  auto Collect = [](Coro<Result<void>> &Task) -> Coro<Result<void>> { co_return co_await Task.join(); };
+  EXPECT_TRUE(run(Collect(Pending)));
+  run((*Mutating)->close());
+  run((*Other)->close());
+}
+
 TEST_P(Service, MakesAndRemovesDirs) {
   auto C = client();
   ASSERT_TRUE(C) << C.error().message();

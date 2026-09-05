@@ -37,6 +37,10 @@ public:
 
   void share(int Fd, uint32_t Events);
 
+  // Keep a shared descriptor registered for reuse, without counting it as
+  // pending work. The next wait() makes it active again.
+  void idle(int Fd);
+
   void cancel(std::coroutine_handle<> H);
 
   void wake(int Fd);
@@ -100,6 +104,7 @@ private:
   };
   std::unordered_map<int, std::vector<Parked>> Waiters;
   std::unordered_set<int> Shared;
+  std::unordered_set<int> Dormant;
   int Registered = 0;
   struct Timer {
     std::chrono::steady_clock::time_point When;

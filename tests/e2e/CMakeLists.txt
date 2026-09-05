@@ -1,3 +1,5 @@
+add_executable(rail-lease-holder lease-holder.cc)
+
 add_executable(rail-e2e
   harness.cc
   privileged.cc
@@ -26,5 +28,5 @@ add_executable(rail-e2e
   test-stream.cc
 )
 target_link_libraries(rail-e2e PRIVATE rail-testing GTest::gtest_main)
-add_dependencies(rail-e2e rail-cli raild-cli mount-railnfs mount-railfuse)
+add_dependencies(rail-e2e rail-cli raild-cli mount-railnfs mount-railfuse rail-lease-holder)
 add_test(NAME e2e COMMAND rail-e2e)

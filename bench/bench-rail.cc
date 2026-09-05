@@ -28,9 +28,9 @@ void BM_RailRead(benchmark::State &State) {
   State.counters["depth"] = static_cast<double>(Depth);
 }
 
-enum class MetadataOp { Stat, OpenClose, SetMode, StatFs };
+enum class MetadataOp { Stat, OpenClose, SetMode, StatFs, Truncate };
 
-Coro<Result<void>> metadataRound(FileClient &Client, const std::string &Name, size_t Times, MetadataOp Op) {
+Coro<Result<void>> metadataRound(FileClient &Client, const std::string &Name, size_t Times, MetadataOp Op, uint64_t Size) {
   for (size_t I = 0; I < Times; I++) {
     switch (Op) {
     case MetadataOp::Stat: {
@@ -48,6 +48,10 @@ Coro<Result<void>> metadataRound(FileClient &Client, const std::string &Name, si
     }
     case MetadataOp::SetMode:
       if (auto Changed = co_await Client.setMode(Name, 0644); !Changed) co_return Changed;
+      break;
+    case MetadataOp::Truncate:
+      // Keep the shared data fixture's size and contents intact.
+      if (auto Changed = co_await Client.truncate(Name, Size); !Changed) co_return Changed;
       break;
     case MetadataOp::StatFs: {
       auto Seen = co_await Client.statFs(Name);
@@ -69,13 +73,23 @@ void metadata(benchmark::State &State, MetadataOp Op) {
   if (!orSkip(State, Opened)) return;
   auto &Client = **Opened;
   const std::string Target = targetFor(targetSize());
+  uint64_t Size = 0;
+  if (Op == MetadataOp::Truncate) {
+    auto Seen = run(Client.stat(Target));
+    if (!Seen || !Seen->Found) {
+      State.SkipWithError("truncate benchmark target was not found");
+      run(Client.close());
+      return;
+    }
+    Size = Seen->Attrs.Size;
+  }
 
   // Check success before timing as well as within every measured batch.
-  auto Warm = run(metadataRound(Client, Target, Batch, Op));
+  auto Warm = run(metadataRound(Client, Target, Batch, Op, Size));
   if (!Warm) State.SkipWithError(Warm.error().message().c_str());
   else {
     for (auto _ : State) {
-      auto Done = run(metadataRound(Client, Target, Batch, Op));
+      auto Done = run(metadataRound(Client, Target, Batch, Op, Size));
       if (Done) continue;
       State.SkipWithError(Done.error().message().c_str());
       break;
@@ -89,6 +103,7 @@ void BM_RailStat(benchmark::State &State) { metadata(State, MetadataOp::Stat); }
 void BM_RailOpenClose(benchmark::State &State) { metadata(State, MetadataOp::OpenClose); }
 void BM_RailSetMode(benchmark::State &State) { metadata(State, MetadataOp::SetMode); }
 void BM_RailStatFs(benchmark::State &State) { metadata(State, MetadataOp::StatFs); }
+void BM_RailTruncate(benchmark::State &State) { metadata(State, MetadataOp::Truncate); }
 
 } // namespace
 
@@ -96,6 +111,7 @@ BENCHMARK(BM_RailStat)->Arg(100)->Arg(1000)->UseRealTime();
 BENCHMARK(BM_RailOpenClose)->Arg(100)->UseRealTime();
 BENCHMARK(BM_RailSetMode)->Arg(100)->UseRealTime();
 BENCHMARK(BM_RailStatFs)->Arg(100)->UseRealTime();
+BENCHMARK(BM_RailTruncate)->Arg(100)->UseRealTime();
 
 BENCHMARK(BM_RailRead)
     ->Args({128 << 10, 1})
