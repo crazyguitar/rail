@@ -2,6 +2,7 @@
 
 #define _GNU_SOURCE
 
+#include <atomic>
 #include <fcntl.h>
 #include <format>
 #include <sys/stat.h>
@@ -15,6 +16,14 @@ namespace {
 // only the final short page needs rounding up; commit() truncates the padding
 // away.
 uint64_t roundUp(uint64_t N) { return (N + kDirectAlignment - 1) & ~(kDirectAlignment - 1); }
+
+// Unique within this process, so two sessions or two threads staging the same
+// destination never share one temp - which let one truncate the other's bytes
+// and rename a spliced file into place.
+uint64_t nextTempId() {
+  static std::atomic<uint64_t> Counter{0};
+  return Counter.fetch_add(1, std::memory_order_relaxed);
+}
 
 // The page cache costs a copy at about 2.7 GB/s on this hardware where the
 // same device takes direct writes at 6.4. Falls back when the filesystem
@@ -30,7 +39,7 @@ int openDestination(const std::filesystem::path &Temp, bool Direct) {
 
 Result<FileWriter> FileWriter::create(const std::filesystem::path &Dst, const FileMeta &Meta, Durability D, bool Direct) {
   const std::filesystem::path Dir = Dst.parent_path().empty() ? std::filesystem::path(".") : Dst.parent_path();
-  const std::filesystem::path Temp = Dir / std::format(".rail.tmp.{}.{}", ::getpid(), Dst.filename().string());
+  const std::filesystem::path Temp = Dir / std::format(".rail.tmp.{}.{}.{}", ::getpid(), nextTempId(), Dst.filename().string());
 
   const int Fd = openDestination(Temp, Direct);
   if (Fd < 0) return failErrno("open " + Temp.string());

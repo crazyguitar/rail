@@ -347,6 +347,33 @@ TEST_P(Service, AnAbortedStoreFailsInsteadOfHanging) {
   run((*C)->close());
 }
 
+TEST_P(Service, ConcurrentStoresToOnePathDoNotSplice) {
+  const auto A = makeFile("service-clash-a.bin", 6u << 20, 71);
+  const auto B = makeFile("service-clash-b.bin", 6u << 20, 72);
+
+  auto C1 = client();
+  ASSERT_TRUE(C1) << C1.error().message();
+  auto C2 = client();
+  ASSERT_TRUE(C2) << C2.error().message();
+
+  auto Both = [&]() -> Coro<Result<void>> {
+    auto SA = (*C1)->store(A, "clash.bin");
+    auto SB = (*C2)->store(B, "clash.bin");
+    SA.start();
+    SB.start();
+    [[maybe_unused]] auto RA = co_await SA.join();
+    [[maybe_unused]] auto RB = co_await SB.join();
+    co_return Result<void>{};
+  };
+  run(Both());
+
+  const auto Landed = peer().digest(Root + "/clash.bin").value_or("");
+  EXPECT_TRUE(Landed == localDigest(A) || Landed == localDigest(B)) << "two stores of the same path spliced into a file matching neither input";
+
+  run((*C1)->close());
+  run((*C2)->close());
+}
+
 TEST_P(Service, FetchIntoMemoryMatchesSource) {
   const uint64_t Size = 6u << 20;
   const auto Local = makeFile("service-fetch-into.bin", Size, 61);
