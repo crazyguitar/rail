@@ -11,6 +11,8 @@
 
 #include <gtest/gtest.h>
 
+#include <sys/resource.h>
+
 #include <algorithm>
 #include <barrier>
 #include <chrono>
@@ -325,11 +327,20 @@ TEST(Pages, ARegionBuiltDuringAttachGetsItsKeys) {
   ASSERT_NE((*First)->slot(), (*Second)->slot());
   const size_t Slot = (*Second)->slot();
 
-  constexpr size_t kRegion = 32 * kFrame;
+  // Each round pins two regions with two devices, four registrations; keep
+  // them under the locked-memory limit, which a CI runner sets low.
+  size_t Region = 32 * kFrame;
+  ::rlimit Locked{};
+  if (::getrlimit(RLIMIT_MEMLOCK, &Locked) == 0 && Locked.rlim_cur != RLIM_INFINITY) {
+    const size_t Fits = static_cast<size_t>(Locked.rlim_cur) / 5 / kFrame * kFrame;
+    if (Fits < kFrame) GTEST_SKIP() << "locked-memory limit " << Locked.rlim_cur << " cannot hold the regions";
+    Region = std::min(Region, Fits);
+  }
+
   for (int Round = 0; Round < 10; Round++) {
-    Memory M(4, kRegion, kFrame);
-    ASSERT_TRUE(M.attach(*First));
-    rail::Run Filled = M.alloc(kRegion);
+    Memory M(4, Region, kFrame);
+    if (auto R = M.attach(*First); !R) GTEST_SKIP() << "cannot register " << Region << " bytes here: " << R.error().message();
+    rail::Run Filled = M.alloc(Region);
     ASSERT_TRUE(Filled.valid()) << "the constructor's region should hold a whole run";
 
     std::barrier Go(2);
