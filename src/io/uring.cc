@@ -9,6 +9,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
+#include <utility>
 
 namespace rail {
 
@@ -48,6 +49,7 @@ Uring::Uring() {
 }
 
 Uring::~Uring() {
+  Reaper = {};
   if (EventFd >= 0) ::close(EventFd);
   if (Ring) {
     io_uring_queue_exit(Ring);
@@ -101,10 +103,30 @@ Result<void> Uring::submit(Fsync &F) {
   return {};
 }
 
-Coro<Result<void>> Uring::await(Fsync &F) {
-  while (!F.Done) {
+// The one coroutine parked on the eventfd. It drains the ring and resumes the
+// owners of what landed; the owners themselves park on their operation. With
+// nothing parked there is nothing to resume, so it stops rather than waking on
+// its tick forever; a completion left behind is drained when the next await
+// starts it again.
+Coro<void> Uring::reaper() {
+  for (;;) {
     co_await WaitFor{EventFd, EPOLLIN, kCompletionTick};
+    if (Outstanding == 0) co_return;
     reap();
+  }
+}
+
+void Uring::ensureReaper() {
+  if (!usable() || (Reaper.valid() && !Reaper.done())) return;
+  Reaper = reaper();
+  Reaper.start();
+}
+
+Coro<Result<void>> Uring::await(Fsync &F) {
+  if (!usable()) co_return failMessage("io_uring is unavailable");
+  while (!F.Done) {
+    ensureReaper();
+    co_await Landed{this, F};
   }
   if (F.Result < 0) co_return fail(std::error_code(-F.Result, std::generic_category()), "io_uring fsync");
   co_return Result<void>{};
@@ -118,11 +140,12 @@ Result<void> Uring::submit(Read &R) {
 
 // A short read means end of file, so it stops rather than asking again.
 Coro<Result<size_t>> Uring::await(Read &R) {
+  if (!usable()) co_return failMessage("io_uring is unavailable");
   size_t Total = 0;
   for (;;) {
     while (!R.Done) {
-      co_await WaitFor{EventFd, EPOLLIN, kCompletionTick};
-      reap();
+      ensureReaper();
+      co_await Landed{this, R};
     }
 
     if (R.Result < 0) co_return fail(std::error_code(-R.Result, std::generic_category()), "io_uring read");
@@ -136,16 +159,13 @@ Coro<Result<size_t>> Uring::await(Read &R) {
   }
 }
 
-// One ring serves every read on the thread, so this drains completions that
-// belong to other coroutines and takes the descriptor's count with them. They
-// have to be woken here: a coroutine whose read finished in someone else's
-// drain was left parked on an event already spent, and slept out its timeout
-// with the bytes it asked for sitting ready.
+// Drains every completion the ring holds and resumes each op's own waiter, so
+// a drain wakes only what it finished, not every op parked on the thread.
 void Uring::reap() {
   uint64_t Ticks = 0;
   [[maybe_unused]] auto Ignored = ::read(EventFd, &Ticks, sizeof(Ticks));
 
-  bool Any = false;
+  Reaps++;
   for (;;) {
     io_uring_cqe *Cqe = nullptr;
     if (io_uring_peek_cqe(Ring, &Cqe) != 0 || !Cqe) break;
@@ -153,19 +173,18 @@ void Uring::reap() {
     if (auto *Finished = static_cast<Completion *>(io_uring_cqe_get_data(Cqe))) {
       Finished->Result = Cqe->res;
       Finished->Done = true;
-      Any = true;
+      if (auto Owner = std::exchange(Finished->Waiter, {})) Loop::get().schedule(Owner);
     }
     io_uring_cqe_seen(Ring, Cqe);
   }
-
-  if (Any) Loop::get().wake(EventFd);
 }
 
 Coro<Result<void>> Uring::await(Write &W) {
+  if (!usable()) co_return failMessage("io_uring is unavailable");
   for (;;) {
     while (!W.Done) {
-      co_await WaitFor{EventFd, EPOLLIN, kCompletionTick};
-      reap();
+      ensureReaper();
+      co_await Landed{this, W};
     }
 
     if (W.Result < 0) co_return fail(std::error_code(-W.Result, std::generic_category()), "io_uring write");
