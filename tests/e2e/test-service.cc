@@ -768,6 +768,32 @@ TEST_P(Service, OneClientCannotExhaustTheDaemonsDescriptors) {
   run((*Greedy)->close());
 }
 
+TEST_P(Service, ABlockedOpenDoesNotStallOtherSessions) {
+  const auto Local = makeFile("service-beside.bin", 4096, 93);
+  seedRemote(Local, Root + "/beside.bin");
+
+  // open() on a fifo with no writer blocks until one appears.
+  auto Made = peer().run({"mkfifo", Root + "/pipe"});
+  ASSERT_TRUE(Made) << Made.error().message();
+  for (int I = 0; I < 40 && !peer().exists(Root + "/pipe").value_or(false); I++) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  ASSERT_TRUE(peer().exists(Root + "/pipe").value_or(false)) << "the fifo was not created";
+
+  auto Stuck = client();
+  ASSERT_TRUE(Stuck) << Stuck.error().message();
+  auto Other = client();
+  ASSERT_TRUE(Other) << Other.error().message();
+
+  // Never awaited: it cannot come back until the daemon dies.
+  auto Blocking = (*Stuck)->openFile("pipe", false);
+  Blocking.start();
+
+  auto Seen = run((*Other)->stat("beside.bin"));
+  ASSERT_TRUE(Seen) << "a stat on another session did not come back while an open was blocked: " << Seen.error().message();
+  EXPECT_TRUE(Seen->Found);
+
+  run((*Other)->close());
+}
+
 TEST_P(Service, MakesAndRemovesDirs) {
   auto C = client();
   ASSERT_TRUE(C) << C.error().message();

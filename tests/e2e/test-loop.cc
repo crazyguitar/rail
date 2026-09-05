@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <csignal>
 #include <stdexcept>
 #include <sys/socket.h>
@@ -70,6 +71,30 @@ TEST(Loop, RunRefusesToReturnAnUnfinishedResult) {
 
   EXPECT_TRUE(Threw);
   EXPECT_FALSE(Returned) << "run() returned a value the coroutine never produced";
+}
+
+// A blocked job must not hold up the next: a quick one runs beside a sleeping
+// one. The sleeper is joined, since run() would resume it as if its wait fired.
+TEST(Loop, ABlockedOffLoopJobDoesNotHoldUpAnother) {
+  ASSERT_GE(OffLoopPool::get().workers(), 2u);
+
+  const auto Took = run([]() -> Coro<std::chrono::steady_clock::duration> {
+    auto Slow = offLoop([] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      return 1;
+    });
+    Slow.start();
+
+    const auto Started = std::chrono::steady_clock::now();
+    const int Quick = co_await offLoop([] { return 2; });
+    const auto Elapsed = std::chrono::steady_clock::now() - Started;
+    EXPECT_EQ(Quick, 2);
+
+    [[maybe_unused]] const int Late = co_await Slow.join();
+    co_return Elapsed;
+  }());
+
+  EXPECT_LT(Took, std::chrono::milliseconds(200)) << "the quick job waited behind the blocked one";
 }
 
 TEST(Loop, OffLoopWorkComesBackToTheLoop) {
