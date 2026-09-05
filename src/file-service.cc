@@ -24,6 +24,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <sys/eventfd.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -952,6 +953,29 @@ size_t sessionsAffordable(const ServiceOptions &Opts, bool Explain) {
   return Held;
 }
 
+namespace {
+
+// Sleeps until either a client is waiting to be accepted or a session has ended
+// and rung the doorbell. Both are registered for one handle and cancelled on
+// resume; the loop is single threaded, so nothing fires in between.
+struct ReapWait {
+  int Listener;
+  int Doorbell;
+  std::coroutine_handle<> H{};
+
+  bool await_ready() const noexcept { return false; }
+  void await_suspend(std::coroutine_handle<> Handle) {
+    H = Handle;
+    Loop::get().wait(Listener, EPOLLIN, H);
+    Loop::get().wait(Doorbell, EPOLLIN, H);
+  }
+  void await_resume() {
+    if (H) Loop::get().cancel(H);
+  }
+};
+
+} // namespace
+
 Coro<Result<void>> serveFiles(const std::filesystem::path &Root, const ServiceOptions &Opts) {
   const size_t Threads = std::max<size_t>(1, Opts.Threads);
   const bool Sharing = Threads > 1;
@@ -965,36 +989,60 @@ Coro<Result<void>> serveFiles(const std::filesystem::path &Root, const ServiceOp
   // three lines again.
   const size_t Allowed = std::max<size_t>(1, sessionsAffordable(Opts, !Sharing) / Threads);
 
-  struct Session {
-    std::unique_ptr<Service> Owner;
-    Coro<Result<void>> Task;
-  };
-  std::vector<Session> Running;
+  // A session that ends rings this, so the accept loop reaps it at once instead
+  // of holding its registered pages, queue pairs and descriptors until the next
+  // client happens to connect.
+  const int Doorbell = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  if (Doorbell < 0) co_return failErrno("eventfd for session reaping");
 
-  auto reap = [&Running](Session &S) {
-    if (auto R = S.Task.result(); !R) std::fprintf(stderr, "raild: %s\n", R.error().message().c_str());
+  std::vector<Coro<Result<void>>> Running;
+
+  auto reap = [&Running] {
+    for (size_t I = Running.size(); I-- > 0;)
+      if (Running[I].done()) {
+        if (auto R = Running[I].result(); !R) std::fprintf(stderr, "raild: %s\n", R.error().message().c_str());
+        Running.erase(Running.begin() + static_cast<long>(I));
+      }
+  };
+
+  // Bell is a parameter, not a capture: a coroutine lambda keeps its captures
+  // in the closure object, not in the frame, so a capture would dangle if the
+  // closure died before the session did.
+  auto serve = [](std::unique_ptr<Service> Owner, Stream Client, int Bell) -> Coro<Result<void>> {
+    auto Outcome = co_await Owner->serveAndClose(std::move(Client));
+    const uint64_t One = 1;
+    [[maybe_unused]] auto Wrote = ::write(Bell, &One, sizeof(One));
+    co_return Outcome;
+  };
+
+  const auto stop = [Doorbell](Error Why) {
+    Loop::get().forget(Doorbell);
+    ::close(Doorbell);
+    return std::unexpected(std::move(Why));
   };
 
   for (;;) {
-    for (size_t I = Running.size(); I-- > 0;)
-      if (Running[I].Task.done()) {
-        reap(Running[I]);
-        Running.erase(Running.begin() + static_cast<long>(I));
+    reap();
+
+    auto Client = Listener->tryAccept();
+    if (!Client) co_return stop(Client.error());
+
+    if (Client->valid()) {
+      if (Running.size() >= Allowed) {
+        std::fprintf(stderr, "raild: refusing a client, %zu sessions already open\n", Running.size());
+        continue;
       }
-
-    auto Client = co_await Listener->accept();
-    if (!Client) co_return std::unexpected(Client.error());
-
-    if (Running.size() >= Allowed) {
-      std::fprintf(stderr, "raild: refusing a client, %zu sessions already open\n", Running.size());
+      auto Owner = std::make_unique<Service>(Root, Opts.FlipOneBit);
+      Running.push_back(serve(std::move(Owner), std::move(*Client), Doorbell));
+      Running.back().start();
       continue;
     }
 
-    Session Slot;
-    Slot.Owner = std::make_unique<Service>(Root, Opts.FlipOneBit);
-    Slot.Task = Slot.Owner->serveAndClose(std::move(*Client));
-    Slot.Task.start();
-    Running.push_back(std::move(Slot));
+    // Nothing waiting; sleep until a client arrives or a session ends, then
+    // drain the doorbell so a stale ring cannot spin the loop.
+    co_await ReapWait{Listener->fd(), Doorbell};
+    uint64_t Ticks = 0;
+    while (::read(Doorbell, &Ticks, sizeof(Ticks)) == static_cast<ssize_t>(sizeof(Ticks))) {}
   }
 }
 

@@ -4,8 +4,11 @@
 #include "rail/io/runner.h"
 #include "rail/proto/message.h"
 
+#include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <gtest/gtest.h>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -649,6 +652,70 @@ TEST_P(Service, MoreReadsThanReceiveSlots) {
   }
 
   run((*C)->close());
+}
+
+TEST_P(Service, ClosedSessionsFreeTheirDescriptorsWhileIdle) {
+  const auto Local = makeFile("service-hold.bin", 4096, 91);
+  seedRemote(Local, Root + "/hold.bin");
+
+  auto fdCount = [&]() -> int {
+    auto Proc = peer().run({"bash", "-c", "ls /proc/$(pgrep -x raild | head -1)/fd 2>/dev/null | wc -l"});
+    if (!Proc) return -1;
+    auto Line = Proc->readLine();
+    return Line ? std::atoi(Line->c_str()) : -1;
+  };
+
+  using namespace std::chrono_literals;
+
+  // Settles once the count has held still for two reads, so a session still
+  // being reaped is not taken as the baseline.
+  auto settled = [&]() -> int {
+    int Last = fdCount();
+    for (int I = 0; I < 40; I++) {
+      std::this_thread::sleep_for(50ms);
+      const int Now = fdCount();
+      if (Now == Last && Now > 0) return Now;
+      Last = Now;
+    }
+    return Last;
+  };
+
+  // A warmup so any one-time descriptors are already in the baseline.
+  {
+    auto C = client();
+    ASSERT_TRUE(C) << C.error().message();
+    ASSERT_TRUE(run((*C)->stat(".")));
+    run((*C)->close());
+  }
+  const int Base = settled();
+  ASSERT_GT(Base, 0) << "could not read the daemon's descriptor count";
+
+  // Each session opens a file and drops the connection without closing it, so
+  // the daemon holds that descriptor in the session's pinned handles until the
+  // session is reaped - on either backend.
+  constexpr int kSessions = 6;
+  std::vector<std::unique_ptr<FileClient>> Clients;
+  for (int I = 0; I < kSessions; I++) {
+    auto C = client();
+    ASSERT_TRUE(C) << C.error().message();
+    auto Opened = run((*C)->openFile("hold.bin", false));
+    ASSERT_TRUE(Opened) << Opened.error().message();
+    ASSERT_TRUE(Opened->Ok) << Opened->Error;
+    Clients.push_back(std::move(*C));
+  }
+  const int Peak = fdCount();
+  EXPECT_GE(Peak, Base + kSessions) << "open sessions did not raise the descriptor count";
+
+  for (auto &C : Clients) run(C->close());
+  Clients.clear();
+
+  // No new client connects, so only reaping on completion frees these.
+  int After = fdCount();
+  for (int I = 0; I < 60 && After > Base + 2; I++) {
+    std::this_thread::sleep_for(50ms);
+    After = fdCount();
+  }
+  EXPECT_LE(After, Base + 2) << "closed sessions kept their descriptors through an idle daemon";
 }
 
 TEST_P(Service, MakesAndRemovesDirs) {
