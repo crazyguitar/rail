@@ -11,10 +11,13 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <barrier>
+#include <chrono>
 #include <cstdlib>
 #include <memory>
 #include <span>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -303,6 +306,52 @@ TEST(Pages, AttachRegistersEveryRegion) {
   ASSERT_TRUE(Grown.valid()) << "this run comes from a region grown after attach";
   const Page Later = Grown.borrow(0, kFrame);
   EXPECT_NE(M.rkeyOf(Later, Slot), 0u) << "a region grown after attach must be registered too";
+}
+
+// A region built while a second device attaches must still get its key. The
+// 32 MiB registration is a milliseconds-wide window; the attacher starts
+// 0.2 ms in, so it lands inside. A miss would read as a pass, never a failure.
+TEST(Pages, ARegionBuiltDuringAttachGetsItsKeys) {
+  const auto Ports = activeRdmaPorts();
+  std::vector<std::string> Names;
+  for (const auto &P : Ports)
+    if (std::find(Names.begin(), Names.end(), P.Device) == Names.end()) Names.push_back(P.Device);
+  if (Names.size() < 2) GTEST_SKIP() << "needs two rdma devices";
+
+  auto First = RdmaDevice::open(Names[0]);
+  ASSERT_TRUE(First) << First.error().message();
+  auto Second = RdmaDevice::open(Names[1]);
+  ASSERT_TRUE(Second) << Second.error().message();
+  ASSERT_NE((*First)->slot(), (*Second)->slot());
+  const size_t Slot = (*Second)->slot();
+
+  constexpr size_t kRegion = 32 * kFrame;
+  for (int Round = 0; Round < 10; Round++) {
+    Memory M(4, kRegion, kFrame);
+    ASSERT_TRUE(M.attach(*First));
+    rail::Run Filled = M.alloc(kRegion);
+    ASSERT_TRUE(Filled.valid()) << "the constructor's region should hold a whole run";
+
+    std::barrier Go(2);
+    rail::Run Grown;
+    Result<void> Attached;
+    std::thread Grower([&] {
+      Go.arrive_and_wait();
+      Grown = M.alloc(kFrame);
+    });
+    std::thread Attacher([&] {
+      Go.arrive_and_wait();
+      std::this_thread::sleep_for(std::chrono::microseconds(200));
+      Attached = M.attach(*Second);
+    });
+    Grower.join();
+    Attacher.join();
+
+    ASSERT_TRUE(Attached) << Attached.error().message();
+    ASSERT_TRUE(Grown.valid()) << "the frame must come from a grown region";
+    const Page Later = Grown.borrow(0, kFrame);
+    EXPECT_NE(M.rkeyOf(Later, Slot), 0u) << "round " << Round << ": a region built while the device attached has no key for it";
+  }
 }
 
 TEST(Pages, UnregisteredMemoryHasNoKeys) {

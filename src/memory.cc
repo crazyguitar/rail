@@ -315,7 +315,10 @@ Result<void> Memory::registerWith(MemoryRegion &R, const std::vector<std::shared
   return {};
 }
 
+// Under the grow lock too, so a device cannot arrive between a build's device
+// snapshot and its push and be missed by both.
 Result<void> Memory::attach(const std::shared_ptr<RdmaDevice> &Device) {
+  const std::lock_guard<std::mutex> Alone(Growing);
   const std::lock_guard<std::mutex> Held(Lock);
   for (const auto &Known : Devices)
     if (Known->slot() == Device->slot()) return Result<void>{};
