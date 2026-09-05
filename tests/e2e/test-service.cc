@@ -585,6 +585,30 @@ TEST_P(Service, PipelinedReadsMatch) {
   run((*C)->close());
 }
 
+TEST_P(Service, MoreReadsThanReceiveSlots) {
+  constexpr size_t kBlock = 4096;
+  constexpr size_t kBlocks = 64;
+  constexpr size_t kReads = 1100;
+
+  const auto Local = makeFile("service-slots.bin", kBlock * kBlocks, 53);
+  seedRemote(Local, Root + "/slots.bin");
+  const auto Expected = localBytes(Local);
+
+  auto C = client();
+  ASSERT_TRUE(C) << C.error().message();
+
+  std::vector<std::byte> Block(kBlock);
+  for (size_t I = 0; I < kReads; I++) {
+    const size_t At = (I % kBlocks) * kBlock;
+    auto Got = run((*C)->read("slots.bin", At, Block));
+    ASSERT_TRUE(Got) << "read " << I << ": " << Got.error().message();
+    ASSERT_EQ(Got->Bytes, kBlock);
+    EXPECT_TRUE(std::equal(Block.begin(), Block.end(), Expected.begin() + static_cast<long>(At))) << "read " << I << " returned the wrong bytes";
+  }
+
+  run((*C)->close());
+}
+
 TEST_P(Service, MakesAndRemovesDirs) {
   auto C = client();
   ASSERT_TRUE(C) << C.error().message();

@@ -79,8 +79,8 @@ struct Cts {
   // One per rail: the same memory registered on two devices has a different
   // key on each, so the sender needs the one belonging to the rail it picks.
   uint32_t Rkey[kMaxRails];
-  // Written last on purpose. Seeing a fresh value is what says the rest of the
-  // record has landed, so it is read first and with acquire ordering.
+  // Kept for the wire layout. A record is taken on its completion, not by
+  // watching this change.
   uint32_t Seq;
 };
 static_assert(sizeof(Cts) == 48, "the ring is written by rdma, so its layout is wire format");
@@ -152,6 +152,8 @@ public:
     Pair = ibv_create_qp(Domain, &Init);
     if (!Pair) return failErrno("ibv_create_qp");
 
+    Inline = Init.cap.max_inline_data >= sizeof(Cts);
+
     return toInit();
   }
 
@@ -184,6 +186,7 @@ public:
   ibv_qp *pair() const { return Pair; }
   size_t slot() const { return Owner->slot(); }
   uint32_t ringKey() const { return RingRegion->lkey; }
+  bool inlineCts() const { return Inline; }
 
   // An arrival consumes one whether or not it carried a buffer.
   void spent() {
@@ -249,13 +252,14 @@ private:
   ibv_port_attr Attr{};
   ibv_gid Gid{};
   uint8_t Number = 1;
+  bool Inline = false;
   RailWire Remote{};
   uint32_t Path = static_cast<uint32_t>(IBV_MTU_1024);
 };
 
 class RdmaDataChannel final : public DataChannel {
 public:
-  RdmaDataChannel(size_t PageCount, size_t PageSize) : Pool(PageCount, PageSize), Ring(kSlots) {}
+  RdmaDataChannel(size_t PageCount, size_t PageSize) : Pool(PageCount, PageSize), Ring(kSlots * 2) {}
 
   DataChannelTraits traits() const override { return {true, 1u << 22, kSlots / 2, "rdma"}; }
   PagePool &pool() override { return Pool; }
@@ -395,7 +399,6 @@ private:
     Free.clear();
     for (uint32_t I = kSlots; I-- > 0;) Free.push_back(I);
     Landing.assign(kSlots, {});
-    Seen.assign(kSlots, 0);
 
     Pump = Loop::get().drive([this] { return pump(); });
     Started = true;
@@ -489,13 +492,14 @@ private:
       if (Record.Rkey[I] == 0) return failMessage("a page was never registered with this rail");
     }
     Record.Seq = ++Stamp;
-    Offer[Slot] = Record;
+    Cts &Staged = Ring[kSlots + Slot];
+    Staged = Record;
 
     const size_t Which = offerRail();
     Rail &Post = *Lines[Which];
 
     ibv_sge Piece{};
-    Piece.addr = reinterpret_cast<uint64_t>(&Offer[Slot]);
+    Piece.addr = reinterpret_cast<uint64_t>(&Staged);
     Piece.length = sizeof(Cts);
     Piece.lkey = Post.ringKey();
 
@@ -505,7 +509,7 @@ private:
     Work.num_sge = 1;
     Work.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
     Work.imm_data = htonl(kIsCts | Slot);
-    Work.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
+    Work.send_flags = IBV_SEND_SIGNALED | (Post.inlineCts() ? IBV_SEND_INLINE : 0);
     Work.wr.rdma.remote_addr = PeerRing + Slot * sizeof(Cts);
     Work.wr.rdma.rkey = PeerRingKey[Which];
 
@@ -514,24 +518,14 @@ private:
     return {};
   }
 
-  // The ring is written by the peer's adapter, so the sequence is read first
-  // and with acquire ordering: it is the marker that the rest of the record has
-  // arrived.
+  void offered(uint32_t Slot) {
+    if (Slot >= kSlots) return;
+    Cts Record{};
+    std::memcpy(&Record, &Ring[Slot], sizeof(Record));
+    Held[Record.Key].push_back(Record);
+  }
+
   bool harvest(uint64_t Key, Cts &Out) {
-    for (uint32_t Slot = 0; Slot < kSlots; Slot++) {
-      const uint32_t Stamped = __atomic_load_n(&Ring[Slot].Seq, __ATOMIC_ACQUIRE);
-      if (Stamped == 0 || Stamped == Seen[Slot]) continue;
-
-      Cts Record = Ring[Slot];
-      Record.Seq = Stamped;
-      Seen[Slot] = Stamped;
-
-      // A key may be in flight more than once - nothing says a caller has to
-      // pick a fresh one, and the tagged transport this replaces matched
-      // repeats in order. So they queue rather than overwrite.
-      Held[Record.Key].push_back(Record);
-    }
-
     auto It = Held.find(Key);
     if (It == Held.end() || It->second.empty()) return false;
 
@@ -632,7 +626,8 @@ private:
 
           On.spent();
 
-          if (!(Immediate & kIsCts) && Slot < kSlots) Landing[Slot].Done = true;
+          if (Immediate & kIsCts) offered(Slot);
+          else if (Slot < kSlots) Landing[Slot].Done = true;
           continue;
         }
         auto It = Sent.find(Done[I].wr_id);
@@ -690,8 +685,6 @@ private:
 
   PagePool Pool;
   std::vector<Cts> Ring;
-  std::vector<Cts> Offer = std::vector<Cts>(kSlots);
-  std::vector<uint32_t> Seen;
   std::vector<Waiting> Landing;
   std::vector<uint32_t> Free;
   std::unordered_map<uint64_t, std::deque<Cts>> Held;
@@ -703,7 +696,7 @@ private:
   size_t Turn = 0;
   std::string Failure;
   uint64_t Posted = 0;
-  uint32_t Stamp = 0;
+  uint32_t Stamp = 0xFFFFFFF0;
   int Alive = -1;
   size_t Pending = 0;
   std::chrono::steady_clock::time_point Woke{};

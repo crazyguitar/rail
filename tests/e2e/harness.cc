@@ -157,6 +157,19 @@ void prependByteLocal(const std::filesystem::path &P, std::byte B) {
   Out.write(Content.data(), static_cast<std::streamsize>(Content.size()));
 }
 
+std::vector<std::byte> localBytes(const std::filesystem::path &P) {
+  std::ifstream In(P, std::ios::binary);
+  std::vector<std::byte> Out;
+  char Chunk[64 << 10];
+  while (In.read(Chunk, sizeof(Chunk)) || In.gcount() > 0) {
+    const size_t N = static_cast<size_t>(In.gcount());
+    const auto *Start = reinterpret_cast<const std::byte *>(Chunk);
+    Out.insert(Out.end(), Start, Start + N);
+    if (!In) break;
+  }
+  return Out;
+}
+
 std::string localDigest(const std::filesystem::path &P) {
   std::ifstream In(P, std::ios::binary);
   if (!In) return {};

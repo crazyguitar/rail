@@ -46,6 +46,7 @@ void setLocalMode(const std::filesystem::path &P, uint32_t Mode);
 void overwriteLocal(const std::filesystem::path &P, uint64_t Offset, size_t Length);
 void prependByteLocal(const std::filesystem::path &P, std::byte B);
 std::string localDigest(const std::filesystem::path &P);
+std::vector<std::byte> localBytes(const std::filesystem::path &P);
 
 // Places a fixture on the peer and verifies it arrived intact, so a failed
 // copy surfaces here rather than later as "the delta matched nothing".
