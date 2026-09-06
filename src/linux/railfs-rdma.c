@@ -346,10 +346,14 @@ static int railfs_region(struct railfs_line *line, size_t bytes, void **cpu, dma
 	return 0;
 }
 
+// Drained before it goes: a completion still in flight would otherwise reach
+// railfs_on_landed after the queue pair is gone and repost a receive on it.
 static void railfs_line_close(struct railfs_line *line)
 {
 	if (line->qp) {
+		ib_drain_qp(line->qp);
 		ib_destroy_qp(line->qp);
+		line->qp = NULL;
 	}
 
 	if (line->landing_mr) {
@@ -891,7 +895,9 @@ int railfs_rdma_offer(struct railfs_rdma *rail, u32 slot, u64 key, u32 len)
 // Waits for the page offered into this slot and copies it out of whichever
 // rail's landing the peer chose. The slot is free to be offered again once this
 // returns.
-int railfs_rdma_collect(struct railfs_rdma *rail, u32 slot, void *buf, u32 len)
+// After a collect the landing holds the page until the next offer on that
+// slot, so a reader can take it from there instead of into a buffer of its own.
+static int railfs_rdma_collect_at(struct railfs_rdma *rail, u32 slot, u32 len, const void **at)
 {
 	u32 line;
 
@@ -917,8 +923,32 @@ int railfs_rdma_collect(struct railfs_rdma *rail, u32 slot, void *buf, u32 len)
 		return -EPROTO;
 	}
 
-	memcpy(buf, railfs_landing_at(&rail->line[line], slot), len);
+	*at = railfs_landing_at(&rail->line[line], slot);
 	return len;
+}
+
+int railfs_rdma_collect(struct railfs_rdma *rail, u32 slot, void *buf, u32 len)
+{
+	const void *at;
+	int got = railfs_rdma_collect_at(rail, slot, len, &at);
+
+	if (got < 0) {
+		return got;
+	}
+
+	memcpy(buf, at, len);
+	return len;
+}
+
+int railfs_rdma_fetch_landed(struct railfs_rdma *rail, u64 key, u32 len, const void **landed)
+{
+	int err = railfs_rdma_offer(rail, 0, key, len);
+
+	if (err) {
+		return err;
+	}
+
+	return railfs_rdma_collect_at(rail, 0, len, landed);
 }
 
 // One page, offered and collected without letting go in between. What a ranged

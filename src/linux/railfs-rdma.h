@@ -59,6 +59,7 @@ int railfs_rdma_meet(struct railfs_rdma *rdma, const struct railfs_wire *wire);
  * copies it out. Returns the byte count or a negative errno.
  */
 int railfs_rdma_fetch(struct railfs_rdma *rdma, u64 key, void *buf, u32 len);
+int railfs_rdma_fetch_landed(struct railfs_rdma *rdma, u64 key, u32 len, const void **landed);
 
 /* The same exchange split in two, so a caller can have RAILFS_STREAM_SLOTS of
  * them outstanding. Offer says where the page for key should land and returns

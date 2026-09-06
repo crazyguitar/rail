@@ -646,7 +646,7 @@ static int railfs_read_reply(struct railfs_conn *conn, struct railfs_cursor *c, 
 // The bytes themselves, off whichever channel this connection has. Returns how
 // many arrived, which the tcp path learns from a header and the fabric knows in
 // advance because the peer sends everything that was asked for.
-static int railfs_take_payload(struct railfs_conn *conn, u64 id, void *buf, u32 len, u32 *got)
+static int railfs_take_payload(struct railfs_conn *conn, u64 id, void **buf, u32 len, u32 *got)
 {
 	u8 header[RAILFS_DATA_HEADER_SIZE];
 	u32 frame_len = 0;
@@ -654,7 +654,7 @@ static int railfs_take_payload(struct railfs_conn *conn, u64 id, void *buf, u32 
 	int err;
 
 	if (conn->rail) {
-		err = railfs_rdma_fetch(conn->rail, id, buf, len);
+		err = *buf ? railfs_rdma_fetch(conn->rail, id, *buf, len) : railfs_rdma_fetch_landed(conn->rail, id, len, (const void **)buf);
 		if (err < 0) {
 			return err;
 		}
@@ -680,7 +680,11 @@ static int railfs_take_payload(struct railfs_conn *conn, u64 id, void *buf, u32 
 		return -EMSGSIZE;
 	}
 
-	err = recv_all(conn->data, buf, frame_len);
+	if (!*buf) {
+		*buf = conn->landing;
+	}
+
+	err = recv_all(conn->data, *buf, frame_len);
 	if (err) {
 		return err;
 	}
@@ -689,7 +693,7 @@ static int railfs_take_payload(struct railfs_conn *conn, u64 id, void *buf, u32 
 	return 0;
 }
 
-int railfs_read(struct railfs_conn *conn, const char *path, u64 offset, void *buf, u32 len)
+static int railfs_read_core(struct railfs_conn *conn, const char *path, u64 offset, void **buf, u32 len)
 {
 	struct railfs_cursor c;
 	u8 *payload = NULL;
@@ -714,6 +718,15 @@ int railfs_read(struct railfs_conn *conn, const char *path, u64 offset, void *bu
 	// One of the two carries the payload. A connection has exactly one.
 	if (!conn->data && !conn->rail) {
 		return -EOPNOTSUPP;
+	}
+
+	// Taken before the request goes out: failing after it would leave the
+	// payload unread on the socket.
+	if (!*buf && conn->data && !conn->landing) {
+		conn->landing = kvmalloc(RAILFS_PAGE_SIZE, GFP_NOFS);
+		if (!conn->landing) {
+			return -ENOMEM;
+		}
 	}
 
 	cap = RAILFS_HEADER_SIZE + 8 + 4 + strlen(path) + 8 + 4 + 8;
@@ -784,7 +797,7 @@ int railfs_read(struct railfs_conn *conn, const char *path, u64 offset, void *bu
 	// digest field, not with a shorter frame, so checking it here would fail
 	// every read rather than skip the check.
 	digest = railfs_now();
-	if (conn->verify && railfs_matches_digest(&c, payload, buf, frame_len, path, offset)) {
+	if (conn->verify && railfs_matches_digest(&c, payload, *buf, frame_len, path, offset)) {
 		err = -EBADMSG;
 	}
 	railfs_trace_add(RAILFS_PHASE_READ_DIGEST, digest, frame_len);
@@ -794,6 +807,24 @@ out:
 	kfree(payload);
 	kfree(frame);
 	return err;
+}
+
+int railfs_read(struct railfs_conn *conn, const char *path, u64 offset, void *buf, u32 len)
+{
+	void *into = buf;
+
+	return railfs_read_core(conn, path, offset, &into, len);
+}
+
+// The bytes stay where the transport put them, the fabric's landing page or
+// this connection's own buffer, until the next read on this connection.
+int railfs_read_landed(struct railfs_conn *conn, const char *path, u64 offset, u32 len, const void **landed)
+{
+	void *into = NULL;
+	int got = railfs_read_core(conn, path, offset, &into, len);
+
+	*landed = into;
+	return got;
 }
 
 // The mirror of railfs_take_payload: the bytes out, on whichever channel this
@@ -1638,6 +1669,7 @@ void railfs_disconnect(struct railfs_conn *conn)
 		return;
 	}
 	railfs_rdma_close(conn->rail);
+	kvfree(conn->landing);
 
 	if (conn->data) {
 		sock_release(conn->data);

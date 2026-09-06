@@ -13,25 +13,24 @@
 #include "railfs-tcp.h"
 #include "railfs-trace.h"
 
-struct railfs_read_req {
+struct railfs_folio_read {
 	const char *path;
-	loff_t offset;
-	void *buf;
-	u32 len;
+	struct folio *folio;
 };
 
-static int railfs_read_op(struct railfs_conn *conn, void *arg)
+// Copied into the folio while the connection is still held: the bytes sit in
+// that connection's landing and its next read overwrites them.
+static int railfs_folio_op(struct railfs_conn *conn, void *arg)
 {
-	struct railfs_read_req *req = arg;
+	struct railfs_folio_read *req = arg;
+	const void *landed = NULL;
+	u32 len = (u32)folio_size(req->folio);
+	int got = railfs_read_landed(conn, req->path, folio_pos(req->folio), len, &landed);
 
-	return railfs_read(conn, req->path, req->offset, req->buf, req->len);
-}
-
-static int railfs_read_retrying(struct railfs_pool *pool, const char *path, loff_t offset, void *buf, u32 len)
-{
-	struct railfs_read_req req = { .path = path, .offset = offset, .buf = buf, .len = len };
-
-	return railfs_pool_call(pool, railfs_read_op, &req);
+	if (got > 0) {
+		memcpy_to_folio(req->folio, 0, landed, got);
+	}
+	return got;
 }
 
 int railfs_fill_folio(struct folio *folio)
@@ -40,8 +39,7 @@ int railfs_fill_folio(struct folio *folio)
 	struct railfs_options *opts = inode->i_sb->s_fs_info;
 	struct railfs_path *name = railfs_path_hold(inode);
 	size_t size = folio_size(folio);
-	loff_t pos = folio_pos(folio);
-	void *buf = NULL;
+	struct railfs_folio_read req;
 	int got;
 	int err;
 
@@ -50,28 +48,21 @@ int railfs_fill_folio(struct folio *folio)
 		goto out;
 	}
 
-	buf = kvmalloc(size, GFP_NOFS);
-	if (!buf) {
-		err = -ENOMEM;
-		goto out;
-	}
-
-	got = railfs_read_retrying(opts->pool, name->name, pos, buf, (u32)size);
+	req.path = name->name;
+	req.folio = folio;
+	got = railfs_pool_call(opts->pool, railfs_folio_op, &req);
 	if (got < 0) {
 		err = got;
 		goto out;
 	}
 
-	folio_zero_range(folio, 0, size);
-
-	if (got > 0) {
-		memcpy_to_folio(folio, 0, buf, got);
+	if ((size_t)got < size) {
+		folio_zero_range(folio, got, size - got);
 	}
 
 	folio_mark_uptodate(folio);
 	err = 0;
 out:
-	kvfree(buf);
 	railfs_path_put(name);
 	return err;
 }
@@ -94,6 +85,7 @@ struct railfs_fetch {
 	loff_t isize;
 	u32 len;
 	struct folio **folios;
+	bool landed;
 	unsigned int nr;
 	bool widened;
 };
@@ -179,35 +171,45 @@ static void railfs_fetch_free(struct railfs_fetch *fetch)
 	kfree(fetch);
 }
 
+// Lands only on success, so a retry on another connection starts clean and
+// the folios are unlocked exactly once, here or by the caller.
+static int railfs_fetch_op(struct railfs_conn *conn, void *arg)
+{
+	struct railfs_fetch *fetch = arg;
+	const void *landed = NULL;
+	u64 mark;
+	int got = railfs_read_landed(conn, fetch->path, fetch->offset, fetch->len, &landed);
+
+	if (got <= 0) {
+		return got;
+	}
+
+	mark = railfs_now();
+	railfs_fetch_land(fetch, landed, (size_t)got);
+	railfs_trace_add(RAILFS_PHASE_READ_LAND, mark, (u64)got);
+
+	if (fetch->widened) {
+		mark = railfs_now();
+		railfs_fill_around(fetch, landed, (size_t)got);
+		railfs_trace_add(RAILFS_PHASE_READ_AROUND, mark, (u64)got);
+	}
+
+	fetch->landed = true;
+	return got;
+}
+
 static void railfs_fetch_one(struct work_struct *work)
 {
 	struct railfs_fetch *fetch = container_of(work, struct railfs_fetch, work);
 	u64 whole = railfs_now();
-	u64 mark;
-	void *buf;
-	int got = 0;
+	int got = railfs_pool_call(fetch->pool, railfs_fetch_op, fetch);
 
-	mark = railfs_now();
-	buf = kvmalloc(fetch->len, GFP_NOFS);
-	railfs_trace_add(RAILFS_PHASE_READ_ALLOC, mark, fetch->len);
-
-	if (buf) {
-		got = railfs_read_retrying(fetch->pool, fetch->path, fetch->offset, buf, fetch->len);
-	}
-
-	mark = railfs_now();
-	railfs_fetch_land(fetch, got > 0 ? buf : NULL, got > 0 ? (size_t)got : 0);
-	railfs_trace_add(RAILFS_PHASE_READ_LAND, mark, got > 0 ? (u64)got : 0);
-
-	if (got > 0 && fetch->widened) {
-		mark = railfs_now();
-		railfs_fill_around(fetch, buf, (size_t)got);
-		railfs_trace_add(RAILFS_PHASE_READ_AROUND, mark, (u64)got);
+	if (!fetch->landed) {
+		railfs_fetch_land(fetch, NULL, 0);
 	}
 
 	railfs_trace_add(RAILFS_PHASE_READ_TOTAL, whole, got > 0 ? (u64)got : 0);
 	railfs_trace_inflight(-1);
-	kvfree(buf);
 	railfs_fetch_free(fetch);
 }
 

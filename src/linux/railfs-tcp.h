@@ -17,6 +17,7 @@ struct railfs_conn {
 	struct socket *sock;
 	struct socket *data;
 	struct railfs_rdma *rail;
+	void *landing;
 	struct mutex lock;
 	u64 next_id;
 	/* Whether the session agreed to hash what it carries. Kept here because a
@@ -89,6 +90,7 @@ void railfs_free_dirents(struct railfs_dirent *entries, u32 count);
  * success, which may be short at end of file, or a negative errno.
  */
 int railfs_read(struct railfs_conn *conn, const char *path, u64 offset, void *buf, u32 len);
+int railfs_read_landed(struct railfs_conn *conn, const char *path, u64 offset, u32 len, const void **landed);
 
 /* Writes len bytes of buf to path at offset. Returns the byte count the peer
  * accepted, or a negative errno.
