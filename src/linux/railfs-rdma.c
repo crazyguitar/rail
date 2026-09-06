@@ -748,7 +748,7 @@ static void railfs_on_landed(struct ib_cq *cq, struct ib_wc *wc)
 	u32 imm;
 
 	if (wc->status != IB_WC_SUCCESS) {
-		pr_err("railfs: rdma payload failed on rail %u: %s\n", line->index, ib_wc_status_msg(wc->status));
+		pr_err_ratelimited("railfs: rdma payload failed on rail %u: %s\n", line->index, ib_wc_status_msg(wc->status));
 		railfs_strand_all(rail, -EIO);
 		return;
 	}
@@ -805,7 +805,7 @@ static void railfs_rail_break(struct railfs_rdma *rail)
 static void railfs_on_cts_sent(struct ib_cq *cq, struct ib_wc *wc)
 {
 	if (wc->status != IB_WC_SUCCESS) {
-		pr_err("railfs: rdma clear to send failed: %s\n", ib_wc_status_msg(wc->status));
+		pr_err_ratelimited("railfs: rdma clear to send failed: %s\n", ib_wc_status_msg(wc->status));
 	}
 }
 
@@ -815,7 +815,7 @@ static void railfs_on_sent(struct ib_cq *cq, struct ib_wc *wc)
 
 	line->rail->sent_err = wc->status == IB_WC_SUCCESS ? 0 : -EIO;
 	if (wc->status != IB_WC_SUCCESS) {
-		pr_err("railfs: rdma send failed: %s\n", ib_wc_status_msg(wc->status));
+		pr_err_ratelimited("railfs: rdma send failed: %s\n", ib_wc_status_msg(wc->status));
 	}
 	complete(&line->rail->sent);
 }

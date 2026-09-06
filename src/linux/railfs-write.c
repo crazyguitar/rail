@@ -99,14 +99,41 @@ static void railfs_flush_one(struct work_struct *work)
 	wake_up(&railfs_flush_room);
 }
 
-static void railfs_flush_queue(struct railfs_flush *flush)
+// A folio whose write is not going to happen goes back to dirty before its
+// writeback bit clears, or the page is clean and the data is gone.
+static void railfs_folio_defer(struct writeback_control *wbc, struct folio *folio)
 {
-	wait_event(railfs_flush_room, atomic_read(&railfs_flushes) < flush->limit);
-	atomic_inc(&railfs_flushes);
-	queue_work(railfs_page_wq, &flush->work);
+	folio_redirty_for_writepage(wbc, folio);
+	folio_end_writeback(folio);
 }
 
-static int railfs_flush_big(struct address_space *mapping, struct railfs_options *opts, const char *path, struct folio *folio, size_t bytes)
+static void railfs_flush_abandon(struct railfs_flush *flush, struct writeback_control *wbc)
+{
+	unsigned int i;
+
+	for (i = 0; i < flush->nr; i++) {
+		railfs_folio_defer(wbc, flush->folios[i]);
+	}
+	railfs_flush_free(flush);
+}
+
+// An exiting task cannot be woken and its dirty pages go with the inode on
+// close, so it queues past the limit and waits for its own flush only.
+static int railfs_flush_queue(struct railfs_flush *flush, struct writeback_control *wbc)
+{
+	if (!(current->flags & PF_EXITING) && wait_event_killable(railfs_flush_room, atomic_read(&railfs_flushes) < flush->limit)) {
+		railfs_flush_abandon(flush, wbc);
+		return -ERESTARTSYS;
+	}
+	atomic_inc(&railfs_flushes);
+	queue_work(railfs_page_wq, &flush->work);
+	return 0;
+}
+
+// Runs in the caller's context, so a fatal signal reaches the pool wait: that,
+// like a failed allocation, redirties the folio rather than dropping it.
+static int railfs_flush_big(struct address_space *mapping, struct writeback_control *wbc, struct railfs_options *opts, const char *path,
+			    struct folio *folio, size_t bytes)
 {
 	loff_t pos = folio_pos(folio);
 	size_t at = 0;
@@ -115,8 +142,8 @@ static int railfs_flush_big(struct address_space *mapping, struct railfs_options
 
 	buf = kvmalloc(RAILFS_PAGE_SIZE, GFP_NOFS);
 	if (!buf) {
-		err = -ENOMEM;
-		goto out;
+		railfs_folio_defer(wbc, folio);
+		return -ENOMEM;
 	}
 
 	while (at < bytes) {
@@ -127,6 +154,12 @@ static int railfs_flush_big(struct address_space *mapping, struct railfs_options
 		memcpy_from_folio(buf, folio, at, piece);
 		put = railfs_pool_call(opts->pool, railfs_write_op, &req);
 
+		if (put == -ERESTARTSYS || put == -EINTR) {
+			kvfree(buf);
+			railfs_folio_defer(wbc, folio);
+			return put;
+		}
+
 		if (put < 0) {
 			err = put;
 			break;
@@ -136,7 +169,6 @@ static int railfs_flush_big(struct address_space *mapping, struct railfs_options
 	}
 
 	kvfree(buf);
-out:
 	if (err) {
 		mapping_set_error(mapping, err);
 	}
@@ -209,6 +241,7 @@ int railfs_writepages(struct address_space *mapping, struct writeback_control *w
 	unsigned int room = RAILFS_PAGE_SIZE / PAGE_SIZE;
 	struct railfs_flush *flush = NULL;
 	struct folio *folio = NULL;
+	bool refused = false;
 	int error = 0;
 	u64 gather;
 
@@ -237,14 +270,26 @@ int railfs_writepages(struct address_space *mapping, struct writeback_control *w
 			continue;
 		}
 
+		// The iterator holds a batch of references that only its own end
+		// releases, so after a refusal the rest are deferred, not the loop left.
+		if (refused) {
+			railfs_folio_defer(wbc, folio);
+			continue;
+		}
+
 		if (bytes > RAILFS_PAGE_SIZE) {
-			error = railfs_flush_big(mapping, opts, path->name, folio, bytes);
+			error = railfs_flush_big(mapping, wbc, opts, path->name, folio, bytes);
 			continue;
 		}
 
 		if (flush && (pos != flush->offset + (loff_t)flush->len || flush->len + bytes > RAILFS_PAGE_SIZE || flush->nr == flush->room)) {
-			railfs_flush_queue(flush);
+			error = railfs_flush_queue(flush, wbc);
 			flush = NULL;
+			if (error) {
+				refused = true;
+				railfs_folio_defer(wbc, folio);
+				continue;
+			}
 		}
 
 		if (!flush) {
@@ -252,7 +297,7 @@ int railfs_writepages(struct address_space *mapping, struct writeback_control *w
 		}
 
 		if (!flush) {
-			folio_end_writeback(folio);
+			railfs_folio_defer(wbc, folio);
 			error = -ENOMEM;
 			continue;
 		}
@@ -266,7 +311,7 @@ int railfs_writepages(struct address_space *mapping, struct writeback_control *w
 		if (flush->nr >= RAILFS_MAX_SEND_FOLIOS && !flush->buf) {
 			flush->buf = kvmalloc(RAILFS_PAGE_SIZE, GFP_NOFS);
 			if (!flush->buf) {
-				folio_end_writeback(folio);
+				railfs_folio_defer(wbc, folio);
 				error = -ENOMEM;
 				continue;
 			}
@@ -298,7 +343,11 @@ int railfs_writepages(struct address_space *mapping, struct writeback_control *w
 	}
 
 	if (flush) {
-		railfs_flush_queue(flush);
+		int queued = railfs_flush_queue(flush, wbc);
+
+		if (queued && !error) {
+			error = queued;
+		}
 	}
 
 out:

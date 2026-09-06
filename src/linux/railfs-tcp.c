@@ -1490,10 +1490,14 @@ struct railfs_conn *railfs_pool_take_near(struct railfs_pool *pool, unsigned int
 		// was measured worse everywhere - a lone writer went 2.22 to 1.82 GiB/s -
 		// because it puts the whole pool on one file and the peer then contends
 		// on that inode.
-		wait_event(pool->waiters, (pool->busy & window) != window);
+		if (wait_event_killable(pool->waiters, (pool->busy & window) != window)) {
+			return NULL;
+		}
 	}
 }
 
+// NULL only on a fatal signal. The wait is bounded by the holders' socket
+// deadlines and need not be unkillable meanwhile; an exiting task waits it out.
 struct railfs_conn *railfs_pool_take(struct railfs_pool *pool)
 {
 	int at;
@@ -1506,7 +1510,9 @@ struct railfs_conn *railfs_pool_take(struct railfs_pool *pool)
 
 		// Not (1UL << count) - 1: at count == BITS_PER_LONG that shift is
 		// undefined, and here yields a mask of zero, which spins.
-		wait_event(pool->waiters, pool->busy != railfs_pool_all(pool));
+		if (wait_event_killable(pool->waiters, pool->busy != railfs_pool_all(pool))) {
+			return NULL;
+		}
 	}
 }
 
@@ -1525,6 +1531,10 @@ static int railfs_pool_run(struct railfs_pool *pool, unsigned int hint, unsigned
 		u64 mark = railfs_now();
 		struct railfs_conn *conn = railfs_pool_take_near(pool, hint, span);
 		bool lost;
+
+		if (!conn) {
+			return -ERESTARTSYS;
+		}
 
 		railfs_trace_add(RAILFS_PHASE_POOL_WAIT, mark, 0);
 		err = op(conn, arg);
