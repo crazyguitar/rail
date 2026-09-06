@@ -977,6 +977,45 @@ TEST_P(Nfs, ARenamedDirectoryStalesTheHandlesBeneathIt) {
   EXPECT_EQ(statusOfGetAttr(Probe, File), kNfs3ErrStale) << "a handle beneath the moved directory should be stale too";
 }
 
+// Renaming a name onto itself is a no-op that succeeds, so nothing it names
+// may become stale.
+TEST_P(Nfs, RenamingANameOntoItselfKeepsItsHandles) {
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
+  const std::string Long(70, 's');
+
+  nfs::XdrWriter Made;
+  Made.opaque(RootHandle);
+  Made.text(Long);
+  putNoAttrs(Made);
+  ASSERT_TRUE(Probe.call(nfs::kNfsProgram, kNfsMakeDirectory, Made.bytes()));
+
+  uint32_t Status = 1;
+  const auto Directory = lookup(Probe, RootHandle, Long, Status);
+  ASSERT_EQ(Status, 0u);
+
+  nfs::XdrWriter Created;
+  Created.opaque(Directory);
+  Created.text("f.bin");
+  Created.u32(0);
+  putNoAttrs(Created);
+  ASSERT_TRUE(Probe.call(nfs::kNfsProgram, kNfsCreate, Created.bytes()));
+  const auto File = lookup(Probe, Directory, "f.bin", Status);
+  ASSERT_EQ(Status, 0u);
+
+  nfs::XdrWriter Args;
+  Args.opaque(RootHandle);
+  Args.text(Long);
+  Args.opaque(RootHandle);
+  Args.text(Long);
+  auto R = Probe.call(nfs::kNfsProgram, kNfsRename, Args.bytes());
+  ASSERT_TRUE(R) << R.error().message();
+  nfs::XdrReader Body(R->Body);
+  ASSERT_EQ(Body.u32(), 0u) << "renaming a name onto itself should succeed";
+
+  EXPECT_EQ(statusOfGetAttr(Probe, Directory), 0u) << "the directory did not move, so its handle must still resolve";
+  EXPECT_EQ(statusOfGetAttr(Probe, File), 0u) << "nothing beneath it moved either";
+}
+
 TEST_P(Nfs, ParentOfTheExportRootIsTheExportRoot) {
   restartExportAs(Host + ":sub");
 

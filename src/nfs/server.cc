@@ -764,10 +764,14 @@ private:
     auto Moved = co_await Held->client().rename(From, To);
     if (!Moved) co_return co_await replyBroken(Conn, C, failureFields(Proc::Rename), Moved.error(), *Held);
 
-    Known.forget(From);
-    Known.forget(To);
-    forget(From);
-    forget(To);
+    // Renaming a name onto itself moves nothing, and dropping what is
+    // remembered for it would stale handles that are still good.
+    if (From != To) {
+      Known.forget(From);
+      Known.forget(To);
+      forget(From);
+      forget(To);
+    }
 
     XdrWriter W;
     W.u32(kOk);
