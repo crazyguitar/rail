@@ -197,6 +197,26 @@ bool peerGone(int Fd) {
   return ::recv(Fd, &Peek, 1, MSG_PEEK | MSG_DONTWAIT) == 0;
 }
 
+namespace {
+
+// A peer that vanishes without closing would hold its session until the daemon
+// restarts. Probes notice it within a minute; so does an unanswered send.
+void setKeepalive(int Fd) {
+  const int One = 1;
+  const int IdleSeconds = 30;
+  const int ProbeSeconds = 10;
+  const int Probes = 3;
+  const unsigned int UnackedMs = 60000;
+  ::setsockopt(Fd, IPPROTO_TCP, TCP_NODELAY, &One, sizeof(One));
+  ::setsockopt(Fd, SOL_SOCKET, SO_KEEPALIVE, &One, sizeof(One));
+  ::setsockopt(Fd, IPPROTO_TCP, TCP_KEEPIDLE, &IdleSeconds, sizeof(IdleSeconds));
+  ::setsockopt(Fd, IPPROTO_TCP, TCP_KEEPINTVL, &ProbeSeconds, sizeof(ProbeSeconds));
+  ::setsockopt(Fd, IPPROTO_TCP, TCP_KEEPCNT, &Probes, sizeof(Probes));
+  ::setsockopt(Fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &UnackedMs, sizeof(UnackedMs));
+}
+
+} // namespace
+
 Result<Stream> Stream::tryAccept() {
   for (;;) {
     sockaddr_storage Addr{};
@@ -207,8 +227,7 @@ Result<Stream> Stream::tryAccept() {
     if (Client < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return Stream();
     if (Client < 0) return failErrno("accept");
 
-    const int One = 1;
-    ::setsockopt(Client, IPPROTO_TCP, TCP_NODELAY, &One, sizeof(One));
+    setKeepalive(Client);
     if (auto R = setNonBlocking(Client); !R) {
       ::close(Client);
       return std::unexpected(R.error());
@@ -223,8 +242,7 @@ Coro<Result<Stream>> Stream::accept() {
     socklen_t Len = sizeof(Addr);
     const int Client = ::accept(Fd, reinterpret_cast<sockaddr *>(&Addr), &Len);
     if (Client >= 0) {
-      const int One = 1;
-      ::setsockopt(Client, IPPROTO_TCP, TCP_NODELAY, &One, sizeof(One));
+      setKeepalive(Client);
       if (auto R = setNonBlocking(Client); !R) {
         ::close(Client);
         co_return std::unexpected(R.error());

@@ -845,6 +845,22 @@ TEST_P(Service, OneClientCannotExhaustTheDaemonsDescriptors) {
   run((*Greedy)->close());
 }
 
+// A client that vanishes without closing would hold its session until the
+// daemon restarts; the socket's keepalive timer is what notices it.
+TEST_P(Service, AnAcceptedSessionHasKeepaliveArmed) {
+  auto C = client();
+  ASSERT_TRUE(C) << C.error().message();
+  ASSERT_TRUE(run((*C)->stat(".")));
+
+  auto Proc = peer().run({"bash", "-c", "ss -tno state established '( sport = :" + std::to_string(Opts.Port) + " )'"});
+  ASSERT_TRUE(Proc) << "could not run ss on the peer";
+  std::string Seen;
+  while (auto Line = Proc->readLine()) Seen += *Line + "\n";
+  run((*C)->close());
+
+  EXPECT_NE(Seen.find("keepalive"), std::string::npos) << "no keepalive timer on the accepted session:\n" << Seen;
+}
+
 // A client that lies: Hello names one page size, then a write asks for more.
 // No receive can be posted for it, so the session must end rather than sit
 // for good holding its slot, pool and descriptors.
