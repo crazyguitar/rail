@@ -1,8 +1,12 @@
 #include "harness.h"
 
+#include "rail/app/checksum.h"
 #include "rail/file-service.h"
 #include "rail/io/runner.h"
+#include "rail/io/stream.h"
+#include "rail/proto/control-channel.h"
 #include "rail/proto/message.h"
+#include "rail/transport/data-channel.h"
 
 #include <cerrno>
 #include <chrono>
@@ -783,6 +787,60 @@ TEST_P(Service, OneClientCannotExhaustTheDaemonsDescriptors) {
 
   run((*Other)->close());
   run((*Greedy)->close());
+}
+
+// A client that lies: Hello names one page size, then a write asks for more.
+// No receive can be posted for it, so the session must end rather than sit
+// for good holding its slot, pool and descriptors.
+TEST_P(Service, AnOversizeWriteEndsTheSession) {
+  // A normal client first: it waits for the daemon to bind, a raw socket would not.
+  auto Up = client();
+  ASSERT_TRUE(Up) << Up.error().message();
+  run((*Up)->close());
+
+  constexpr uint64_t kPage = 1u << 20;
+  auto Sock = Stream::connect(Host, Opts.Port);
+  ASSERT_TRUE(Sock) << Sock.error().message();
+  proto::ControlChannel Control(std::move(*Sock));
+  auto Channel = makeDataChannel(Opts.Backend, 2, kPage, Host);
+  ASSERT_TRUE(Channel);
+  ASSERT_TRUE(Channel->prepare());
+
+  proto::Hello H;
+  H.Backend = Opts.Backend;
+  H.PageCount = 2;
+  H.PageSize = kPage;
+  H.WindowPages = 1;
+  H.Sum = static_cast<uint8_t>(Sum::XxH3);
+  ASSERT_TRUE(run(Control.send(H)));
+  auto Ack = run(Control.expect<proto::HelloAck>());
+  ASSERT_TRUE(Ack) << Ack.error().message();
+  Channel->watch(Control.readFd());
+  ASSERT_TRUE(run(Channel->connect(Ack->ChannelEndpoint)));
+  auto Local = run(Channel->localEndpoint());
+  ASSERT_TRUE(Local) << Local.error().message();
+  proto::PeerEndpoint Mine;
+  Mine.Blob = *Local;
+  ASSERT_TRUE(run(Control.send(Mine)));
+
+  proto::WriteRequest Wr;
+  Wr.Id = 1;
+  Wr.Path = "lie.bin";
+  Wr.Length = kPage + 1;
+  ASSERT_TRUE(run(Control.send(Wr)));
+  auto Refused = run(Control.expect<proto::TransferReply>());
+  ASSERT_TRUE(Refused) << Refused.error().message();
+  EXPECT_FALSE(Refused->Ok);
+  EXPECT_NE(Refused->Error.find("exceeds"), std::string::npos) << Refused->Error;
+
+  // The page was never sent. A live session would still answer this.
+  proto::StatRequest St;
+  St.Id = 2;
+  St.Path = "lie.bin";
+  const bool Sent = run(Control.send(St)).has_value();
+  const bool Answered = Sent && run(Control.expect<proto::StatReply>()).has_value();
+  EXPECT_FALSE(Answered) << "the session stayed open after a write it could never receive";
+  Channel->close();
 }
 
 TEST_P(Service, OpeningAFifoDoesNotStallTheDaemon) {

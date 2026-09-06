@@ -302,6 +302,14 @@ public:
     co_return Outcome;
   }
 
+  // No payload will follow this reply and the peer is already waiting for
+  // one. Answer, then drop the session, so that wait fails instead of lasting.
+  Coro<Result<void>> refuseTransfer(const proto::TransferReply &Reply) {
+    [[maybe_unused]] auto Sent = co_await Control.send(Reply);
+    Control.close();
+    co_return failMessage(Reply.Error);
+  }
+
   Coro<Result<void>> dispatch(proto::Message M) {
     if (auto *S = std::get_if<proto::StatRequest>(&M)) co_return co_await onStat(*S);
     if (auto *L = std::get_if<proto::ListRequest>(&M)) co_return co_await onList(*L);
@@ -470,7 +478,7 @@ public:
     }
     if (!Buf.valid()) {
       Reply.Error = "out of registered memory for a transfer page";
-      co_return co_await Control.send(Reply);
+      co_return co_await refuseTransfer(Reply);
     }
 
     // Only the page bounds it. The client posts a receive for exactly what it
@@ -886,11 +894,11 @@ public:
     }
     if (!Buf.valid()) {
       Reply.Error = "out of registered memory for a transfer page";
-      co_return co_await Control.send(Reply);
+      co_return co_await refuseTransfer(Reply);
     }
     if (Wr.Length > Buf.capacity()) {
       Reply.Error = std::format("write of {} bytes exceeds the page size", Wr.Length);
-      co_return co_await Control.send(Reply);
+      co_return co_await refuseTransfer(Reply);
     }
     Buf.resize(Wr.Length);
 
