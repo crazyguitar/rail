@@ -143,6 +143,8 @@ struct End {};
 struct FileAttrs {
   uint64_t Size = 0;
   uint32_t Mode = 0;
+  uint32_t Uid = 0;
+  uint32_t Gid = 0;
   int64_t Mtime = 0;
   bool Directory = false;
   // Told apart from what it points at. The daemon stats without following, so

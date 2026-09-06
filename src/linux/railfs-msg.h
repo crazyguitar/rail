@@ -69,6 +69,8 @@ enum railfs_msg_type {
 struct railfs_attrs {
 	u64 size;
 	u32 mode;
+	u32 uid;
+	u32 gid;
 	s64 mtime;
 	u8 directory;
 	u8 link;

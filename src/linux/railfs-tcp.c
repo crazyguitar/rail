@@ -557,7 +557,7 @@ int railfs_list(struct railfs_conn *conn, const char *path, struct railfs_dirent
 
 	// Smallest an entry can be: a four byte name length and the attributes.
 	// Without this a count off the wire asks for an allocation of any size.
-	if ((u64)n * 30 > payload_len) {
+	if ((u64)n * 38 > payload_len) {
 		err = -EBADMSG;
 		goto out;
 	}

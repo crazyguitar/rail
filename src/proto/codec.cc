@@ -115,19 +115,23 @@ const char *typeName(Type T) {
 void writeAttrs(Writer &W, const FileAttrs &A) {
   W.u64(A.Size);
   W.u32(A.Mode);
+  W.u32(A.Uid);
+  W.u32(A.Gid);
   W.i64(A.Mtime);
   W.u8(A.Directory ? 1 : 0);
   W.u8(A.Link ? 1 : 0);
   W.u32(A.Links);
 }
 
-constexpr size_t kAttrsBytes = 26;
+constexpr size_t kAttrsBytes = 34;
 constexpr size_t kListEntryFloor = 4 + kAttrsBytes;
 
 FileAttrs readAttrs(Reader &R) {
   FileAttrs A;
   A.Size = R.u64();
   A.Mode = R.u32();
+  A.Uid = R.u32();
+  A.Gid = R.u32();
   A.Mtime = R.i64();
   A.Directory = R.u8() != 0;
   A.Link = R.u8() != 0;

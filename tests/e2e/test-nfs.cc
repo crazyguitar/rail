@@ -1,4 +1,5 @@
 #include "harness.h"
+#include "privileged.h"
 
 #include "local-process.h"
 #include "rail/nfs/rpc.h"
@@ -208,6 +209,7 @@ protected:
         peer().run({serviceBinary().string(), "--serve", Root, "--port", std::to_string(servicePortFor(GetParam())), "--backend", GetParam()});
     ASSERT_TRUE(Served) << "could not start raild on the peer: " << Served.error().message();
     Daemon.emplace(std::move(*Served));
+    ASSERT_TRUE(waitForListener(Host, servicePortFor(GetParam()))) << "raild never started listening on the peer";
   }
 
   void stopDaemon() {
@@ -932,6 +934,47 @@ TEST_P(Nfs, ForgedHandleStaysInTheExport) {
   EXPECT_EQ(statusOfGetAttr(Probe, forged("sub/nested.bin")), 0u) << "a handle inside the export should still work, or this proves nothing";
   EXPECT_EQ(statusOfGetAttr(Probe, forged("alpha.bin")), kNfs3ErrStale) << "a handle above the exported directory must not resolve";
   EXPECT_EQ(statusOfGetAttr(Probe, forged("../alpha.bin")), kNfs3ErrStale) << "a parent reference must not resolve";
+}
+
+// The table keeps a directory by its path, so a directory that moves would
+// leave an entry naming nothing, and every handle beneath it would resolve to
+// a path that is gone. Both are dropped with the rename instead.
+TEST_P(Nfs, ARenamedDirectoryStalesTheHandlesBeneathIt) {
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
+  const std::string Long(70, 'd');
+
+  nfs::XdrWriter Made;
+  Made.opaque(RootHandle);
+  Made.text(Long);
+  putNoAttrs(Made);
+  ASSERT_TRUE(Probe.call(nfs::kNfsProgram, kNfsMakeDirectory, Made.bytes()));
+
+  uint32_t Status = 1;
+  const auto Directory = lookup(Probe, RootHandle, Long, Status);
+  ASSERT_EQ(Status, 0u);
+
+  nfs::XdrWriter Created;
+  Created.opaque(Directory);
+  Created.text("f.bin");
+  Created.u32(0);
+  putNoAttrs(Created);
+  ASSERT_TRUE(Probe.call(nfs::kNfsProgram, kNfsCreate, Created.bytes()));
+  const auto File = lookup(Probe, Directory, "f.bin", Status);
+  ASSERT_EQ(Status, 0u);
+  ASSERT_EQ(statusOfGetAttr(Probe, File), 0u);
+
+  nfs::XdrWriter Args;
+  Args.opaque(RootHandle);
+  Args.text(Long);
+  Args.opaque(RootHandle);
+  Args.text("moved");
+  auto R = Probe.call(nfs::kNfsProgram, kNfsRename, Args.bytes());
+  ASSERT_TRUE(R) << R.error().message();
+  nfs::XdrReader Body(R->Body);
+  ASSERT_EQ(Body.u32(), 0u);
+
+  EXPECT_EQ(statusOfGetAttr(Probe, Directory), kNfs3ErrStale) << "the moved directory's old handle should be stale, not a name that is missing";
+  EXPECT_EQ(statusOfGetAttr(Probe, File), kNfs3ErrStale) << "a handle beneath the moved directory should be stale too";
 }
 
 TEST_P(Nfs, ParentOfTheExportRootIsTheExportRoot) {

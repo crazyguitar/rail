@@ -17,6 +17,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -135,11 +136,28 @@ std::string parentPath(const std::string &Path, const std::string &Root) {
 
 bool namedSafely(const std::string &Name) { return !Name.empty() && Name != "." && Name != ".." && Name.find('/') == std::string::npos; }
 
+// A handle is the path when it fits, else the directory's digest and the name,
+// so the table holds one entry per directory, never evicted: a handle is good
+// while the file exists, and memory follows the export's shape, not traffic.
+constexpr size_t kDigestAt = 2;
+constexpr size_t kNameAt = kDigestAt + 16;
+constexpr size_t kNameRoom = kHandleSize - kNameAt;
+
 class Handles {
 public:
+  void pin(const std::string &Path) {
+    const std::lock_guard<std::mutex> Held(Lock);
+    Anchor = Path;
+  }
+
   std::vector<std::byte> encode(const std::string &Path) {
     const std::lock_guard<std::mutex> Held(Lock);
     std::vector<std::byte> H(kHandleSize, std::byte{0});
+    if (!Anchor.empty() && Path == Anchor) {
+      H[0] = std::byte{4};
+      return H;
+    }
+
     if (Path.size() <= kInlineLimit) {
       H[0] = std::byte{1};
       H[1] = static_cast<std::byte>(Path.size());
@@ -147,16 +165,43 @@ public:
       return H;
     }
 
+    const size_t Cut = Path.rfind('/');
+    const size_t NameLength = Cut == std::string::npos ? 0 : Path.size() - Cut - 1;
+    if (NameLength > 0 && NameLength <= kNameRoom) {
+      const std::string Parent = Path.substr(0, Cut);
+      const Digest D = digestOf(Parent);
+      H[0] = std::byte{3};
+      H[1] = static_cast<std::byte>(NameLength);
+      std::memcpy(H.data() + kDigestAt, D.data(), D.size());
+      std::memcpy(H.data() + kNameAt, Path.data() + Cut + 1, NameLength);
+      remember(D, Parent);
+      return H;
+    }
+
     const Digest D = digestOf(Path);
     H[0] = std::byte{2};
     std::memcpy(H.data() + 8, D.data(), D.size());
-    Long.insert_or_assign(std::string(reinterpret_cast<const char *>(D.data()), D.size()), Path);
+    remember(D, Path);
     return H;
+  }
+
+  // For a name that stopped meaning what it did: the entry for it and for
+  // everything beneath it go, so a handle that carried them is stale.
+  void forget(const std::string &Path) {
+    const std::lock_guard<std::mutex> Held(Lock);
+    drop(ByPath.find(Path));
+    const std::string Below = Path + "/";
+    for (auto It = ByPath.lower_bound(Below); It != ByPath.end() && It->first.starts_with(Below);) It = drop(It);
   }
 
   std::optional<std::string> decode(std::span<const std::byte> H) const {
     const std::lock_guard<std::mutex> Held(Lock);
     if (H.size() != kHandleSize) return std::nullopt;
+
+    if (H[0] == std::byte{4}) {
+      if (Anchor.empty()) return std::nullopt;
+      return Anchor;
+    }
 
     if (H[0] == std::byte{1}) {
       const size_t Length = static_cast<size_t>(H[1]);
@@ -164,15 +209,35 @@ public:
       return std::string(reinterpret_cast<const char *>(H.data() + 8), Length);
     }
 
-    if (H[0] != std::byte{2}) return std::nullopt;
-    auto It = Long.find(std::string(reinterpret_cast<const char *>(H.data() + 8), sizeof(Digest)));
+    if (H[0] != std::byte{2} && H[0] != std::byte{3}) return std::nullopt;
+    const size_t KeyAt = H[0] == std::byte{3} ? kDigestAt : 8;
+    auto It = Long.find(std::string(reinterpret_cast<const char *>(H.data() + KeyAt), sizeof(Digest)));
     if (It == Long.end()) return std::nullopt;
-    return It->second;
+    if (H[0] == std::byte{2}) return It->second;
+
+    const size_t Length = static_cast<size_t>(H[1]);
+    if (Length == 0 || Length > kNameRoom) return std::nullopt;
+    return It->second + "/" + std::string(reinterpret_cast<const char *>(H.data() + kNameAt), Length);
   }
 
 private:
+  static std::string keyOf(const Digest &D) { return std::string(reinterpret_cast<const char *>(D.data()), D.size()); }
+
+  void remember(const Digest &D, const std::string &Path) {
+    Long.insert_or_assign(keyOf(D), Path);
+    ByPath.insert_or_assign(Path, keyOf(D));
+  }
+
+  std::map<std::string, std::string>::iterator drop(std::map<std::string, std::string>::iterator It) {
+    if (It == ByPath.end()) return It;
+    Long.erase(It->second);
+    return ByPath.erase(It);
+  }
+
   mutable std::mutex Lock;
+  std::string Anchor;
   std::unordered_map<std::string, std::string> Long;
+  std::map<std::string, std::string> ByPath;
 };
 
 Handles &sharedHandles() {
@@ -184,8 +249,8 @@ void writeAttrs(XdrWriter &W, const proto::FileAttrs &A, const std::string &Path
   W.u32(A.Directory ? kTypeDirectory : kTypeRegular);
   W.u32(A.Mode);
   W.u32(A.Directory ? 2 : 1);
-  W.u32(::getuid());
-  W.u32(::getgid());
+  W.u32(A.Uid);
+  W.u32(A.Gid);
   W.u64(A.Size);
   W.u64((A.Size + 4095) & ~uint64_t{4095});
   W.u32(0);
@@ -448,6 +513,7 @@ private:
 
       std::fprintf(stderr, "railnfs: mounted %s as %s\n", Opts.Remote.Root.c_str(), Wanted.c_str());
       W.u32(kMountOk);
+      Known.pin(Opts.Remote.Root);
       W.opaque(Known.encode(Opts.Remote.Root));
       W.u32(1);
       W.u32(1);
@@ -670,6 +736,7 @@ private:
     auto Gone = co_await Held->client().removeDirectory(Target);
     if (!Gone) co_return co_await replyBroken(Conn, C, failureFields(Proc::RemoveDirectory), Gone.error(), *Held);
 
+    Known.forget(Target);
     forget(Target);
 
     XdrWriter W;
@@ -697,6 +764,8 @@ private:
     auto Moved = co_await Held->client().rename(From, To);
     if (!Moved) co_return co_await replyBroken(Conn, C, failureFields(Proc::Rename), Moved.error(), *Held);
 
+    Known.forget(From);
+    Known.forget(To);
     forget(From);
     forget(To);
 
@@ -933,6 +1002,7 @@ private:
     auto Gone = co_await Held->client().removeFile(Target);
     if (!Gone) co_return co_await replyBroken(Conn, C, failureFields(Proc::Remove), Gone.error(), *Held);
 
+    Known.forget(Target);
     forget(Target);
 
     XdrWriter W;

@@ -89,6 +89,12 @@ int railfs_get_attrs(struct railfs_cursor *c, struct railfs_attrs *a)
 		err = railfs_get_u32(c, &a->mode);
 	}
 	if (!err) {
+		err = railfs_get_u32(c, &a->uid);
+	}
+	if (!err) {
+		err = railfs_get_u32(c, &a->gid);
+	}
+	if (!err) {
 		err = get_raw(c, &a->mtime, sizeof(a->mtime));
 	}
 	if (!err) {

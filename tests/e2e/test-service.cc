@@ -845,6 +845,26 @@ TEST_P(Service, OneClientCannotExhaustTheDaemonsDescriptors) {
   run((*Greedy)->close());
 }
 
+// The daemon knows who owns a file and the client cannot; reporting the
+// daemon's own uid instead made every listing lie about ownership.
+TEST_P(Service, AttributesCarryTheOwnerTheDaemonSaw) {
+  const auto Local = makeFile("service-owner.bin", 4096, 73);
+  seedRemote(Local, Root + "/owner.bin");
+
+  auto C = client();
+  ASSERT_TRUE(C) << C.error().message();
+  auto Seen = run((*C)->stat("owner.bin"));
+  ASSERT_TRUE(Seen) << Seen.error().message();
+  ASSERT_TRUE(Seen->Found);
+
+  auto Expected = peer().run({"stat", "-c", "%u %g", Root + "/owner.bin"});
+  ASSERT_TRUE(Expected) << "could not stat the file on the peer";
+  auto Line = Expected->readLine();
+  ASSERT_TRUE(Line) << "no answer from stat on the peer";
+  EXPECT_EQ(std::to_string(Seen->Attrs.Uid) + " " + std::to_string(Seen->Attrs.Gid), *Line) << "the owner reported is not the owner on disk";
+  run((*C)->close());
+}
+
 // A client that vanishes without closing would hold its session until the
 // daemon restarts; the socket's keepalive timer is what notices it.
 TEST_P(Service, AnAcceptedSessionHasKeepaliveArmed) {
