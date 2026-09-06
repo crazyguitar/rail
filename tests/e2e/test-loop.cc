@@ -2,13 +2,16 @@
 #include "rail/io/offload.h"
 #include "rail/io/runner.h"
 #include "rail/io/stream.h"
+#include "rail/io/turn.h"
 
 #include <gtest/gtest.h>
 
 #include <chrono>
 #include <csignal>
+#include <fcntl.h>
 #include <future>
 #include <stdexcept>
+#include <string>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <thread>
@@ -194,4 +197,41 @@ TEST(Loop, ABlockedWriteWakesWhileAReadIsWaiting) {
 
   ::close(Silent[0]);
   ::close(Silent[1]);
+}
+
+// give() takes the next waiter off the queue and schedules it. If that
+// coroutine is destroyed before it resumes, the turn it was handed must go to
+// whoever is next, or it is lost and every later take() waits forever.
+TEST(Loop, ATurnHandedToADeadWaiterIsPassedOn) {
+  Turn T;
+  std::vector<std::string> Ran;
+  auto Taker = [&](std::string Name) -> Coro<void> {
+    co_await T.take();
+    Ran.push_back(std::move(Name));
+  };
+
+  // Takes the turn at once and keeps it: nothing here gives it back.
+  auto Holder = Taker("holder");
+  Holder.start();
+  ASSERT_TRUE(Holder.done());
+
+  auto Doomed = Taker("doomed");
+  Doomed.start();
+  auto Next = Taker("next");
+  Next.start();
+  ASSERT_FALSE(Doomed.done());
+  ASSERT_FALSE(Next.done());
+
+  // Hands the turn to Doomed, which is destroyed before it can resume.
+  T.give();
+  Doomed = {};
+
+  Loop::get().runUntil(Next.handle());
+  ASSERT_TRUE(Next.done()) << "the turn died with the waiter it was handed to";
+
+  T.give();
+  auto Later = Taker("later");
+  Later.start();
+  EXPECT_TRUE(Later.done());
+  EXPECT_EQ(Ran, (std::vector<std::string>{"holder", "next", "later"}));
 }

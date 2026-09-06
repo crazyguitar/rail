@@ -13,7 +13,7 @@ constexpr size_t kHeaderSize = 10; // magic(4) + type(2) + length(4)
 
 Coro<Result<void>> ControlChannel::send(const Message &M) {
   co_await Order.take();
-  const Turn Mine(Order);
+  const Holding Mine(Order);
   co_return co_await sendClaimed(M);
 }
 

@@ -2,6 +2,7 @@
 
 #include "rail/io/coro.h"
 #include "rail/io/stream.h"
+#include "rail/io/turn.h"
 #include "rail/proto/message.h"
 #include "rail/result.h"
 
@@ -76,63 +77,11 @@ private:
   // their frames together and the peer would read neither. Ownership passes
   // straight to the next waiter: clearing the flag first lets a sender that
   // arrives in between take it as well.
-  class Sending {
-  public:
-    auto take() {
-      struct Awaiter {
-        Sending *G;
-        std::coroutine_handle<> Queued{};
-
-        bool await_ready() const noexcept { return !G->Held; }
-        void await_suspend(std::coroutine_handle<> H) {
-          Queued = H;
-          G->Waiting.push_back(H);
-        }
-        void await_resume() noexcept {
-          Queued = {};
-          G->Held = true;
-        }
-
-        // A coroutine destroyed while it waits takes its handle with it. The
-        // awaiter lives in that coroutine's frame, so this runs then, and what
-        // is left behind is a queue give() can resume into safely.
-        ~Awaiter() {
-          if (Queued) std::erase(G->Waiting, Queued);
-        }
-      };
-      return Awaiter{this};
-    }
-
-    void give() {
-      if (Waiting.empty()) {
-        Held = false;
-        return;
-      }
-      auto H = Waiting.front();
-      Waiting.pop_front();
-      Loop::get().schedule(H);
-    }
-
-  private:
-    bool Held = false;
-    std::deque<std::coroutine_handle<>> Waiting;
-  };
-
-  // Gives the frame back on every exit, including a coroutine destroyed while
-  // its write is suspended.
-  struct Turn {
-    Sending &G;
-
-    explicit Turn(Sending &G) : G(G) {}
-    Turn(const Turn &) = delete;
-    Turn &operator=(const Turn &) = delete;
-    ~Turn() { G.give(); }
-  };
 
   Stream S;
   Stream W;
   bool Split = false;
-  Sending Order;
+  Turn Order;
   std::vector<std::byte> OutBuf;
   std::vector<std::byte> InBuf;
 };

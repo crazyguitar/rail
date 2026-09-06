@@ -1,5 +1,6 @@
 #include "rail/io/loop.h"
 #include "rail/io/stream.h"
+#include "rail/io/turn.h"
 #include "rail/transport/data-channel.h"
 
 #include <charconv>
@@ -16,52 +17,6 @@ namespace {
 
 // One frame reaches the wire whole. A second sender waits its turn rather
 // than interleaving with the first.
-class Order {
-public:
-  auto take() {
-    struct Awaiter {
-      Order *G;
-      std::coroutine_handle<> Queued{};
-
-      bool await_ready() const noexcept { return !G->Held; }
-      void await_suspend(std::coroutine_handle<> H) {
-        Queued = H;
-        G->Waiting.push_back(H);
-      }
-      void await_resume() noexcept {
-        Queued = {};
-        G->Held = true;
-      }
-      ~Awaiter() {
-        if (Queued) std::erase(G->Waiting, Queued);
-      }
-    };
-    return Awaiter{this};
-  }
-
-  void give() {
-    if (Waiting.empty()) {
-      Held = false;
-      return;
-    }
-    auto H = Waiting.front();
-    Waiting.pop_front();
-    Loop::get().schedule(H);
-  }
-
-private:
-  bool Held = false;
-  std::deque<std::coroutine_handle<>> Waiting;
-};
-
-struct Turn {
-  Order &G;
-
-  explicit Turn(Order &G) : G(G) {}
-  Turn(const Turn &) = delete;
-  Turn &operator=(const Turn &) = delete;
-  ~Turn() { G.give(); }
-};
 
 constexpr int kAcceptTickMs = 250;
 
@@ -139,7 +94,7 @@ public:
   // whoever asked for it, in whatever order the frames turn up.
   Coro<Result<void>> send(Page &Buf, uint64_t Key) override {
     co_await Sending.take();
-    const Turn Mine(Sending);
+    const Holding Mine(Sending);
 
     std::byte Header[kHeaderSize];
     const uint32_t Length = static_cast<uint32_t>(Buf.size());
@@ -288,7 +243,7 @@ private:
   int Alive = -1;
   Stream Listener;
   Stream Peer;
-  Order Sending;
+  Turn Sending;
   std::unordered_map<uint64_t, Posted *> Waiting;
   std::deque<std::coroutine_handle<>> Idlers;
   std::string Failure;

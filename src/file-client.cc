@@ -6,6 +6,7 @@
 #include "rail/fs/writer.h"
 #include "rail/io/stream.h"
 #include "rail/io/trace.h"
+#include "rail/io/turn.h"
 #include "rail/proto/control-channel.h"
 #include "rail/stream/page-stream.h"
 #include "rail/stream/sink.h"
@@ -107,58 +108,8 @@ struct FileClient::Impl {
 
   // One streamed transfer at a time on a client. Ownership passes straight to
   // the next waiter, so a transfer that arrives in between cannot take it.
-  class OneStream {
-  public:
-    auto take() {
-      struct Awaiter {
-        OneStream *G;
-        std::coroutine_handle<> Queued{};
 
-        bool await_ready() const noexcept { return !G->Held; }
-        void await_suspend(std::coroutine_handle<> H) {
-          Queued = H;
-          G->Waiting.push_back(H);
-        }
-        void await_resume() noexcept {
-          Queued = {};
-          G->Held = true;
-        }
-
-        // A coroutine destroyed while it waits takes its handle with it.
-        ~Awaiter() {
-          if (Queued) std::erase(G->Waiting, Queued);
-        }
-      };
-      return Awaiter{this};
-    }
-
-    void give() {
-      if (Waiting.empty()) {
-        Held = false;
-        return;
-      }
-      auto H = Waiting.front();
-      Waiting.pop_front();
-      Loop::get().schedule(H);
-    }
-
-  private:
-    bool Held = false;
-    std::deque<std::coroutine_handle<>> Waiting;
-  };
-
-  OneStream Streaming;
-
-  // Gives the turn back however the transfer ends, including a coroutine
-  // destroyed part way through one.
-  struct Streamer {
-    OneStream &G;
-
-    explicit Streamer(OneStream &G) : G(G) {}
-    Streamer(const Streamer &) = delete;
-    Streamer &operator=(const Streamer &) = delete;
-    ~Streamer() { G.give(); }
-  };
+  Turn Streaming;
 
   bool FlipOneBit = false;
   size_t AbortAfterPages = 0;
@@ -556,7 +507,7 @@ Coro<Result<proto::StatFsReply>> FileClient::statFs(const std::string &Path) {
 
 Coro<Result<uint64_t>> FileClient::fetch(const std::string &Path, const std::filesystem::path &Local) {
   co_await P->Streaming.take();
-  const Impl::Streamer Alone(P->Streaming);
+  const Holding Alone(P->Streaming);
 
   const uint64_t PageBytes = P->Channel->pool().pageSize();
 
@@ -601,7 +552,7 @@ Coro<Result<uint64_t>> FileClient::fetch(const std::string &Path, const std::fil
 
 Coro<Result<uint64_t>> FileClient::store(const std::filesystem::path &Local, const std::string &Path) {
   co_await P->Streaming.take();
-  const Impl::Streamer Alone(P->Streaming);
+  const Holding Alone(P->Streaming);
 
   const uint64_t PageBytes = P->Channel->pool().pageSize();
 
@@ -672,7 +623,7 @@ Coro<Result<uint64_t>> FileClient::fetchInto(const std::string &Path, uint64_t O
 
 Coro<Result<uint64_t>> FileClient::fetchThrough(const std::string &Path, uint64_t Offset, uint64_t Want, PageSink &Landing, uint64_t Handle) {
   co_await P->Streaming.take();
-  const Impl::Streamer Alone(P->Streaming);
+  const Holding Alone(P->Streaming);
 
   const uint64_t PageBytes = P->Channel->pool().pageSize();
   if (Offset % kDirectAlignment != 0)
@@ -726,7 +677,7 @@ FileClient::storeFrom(AddressSpace &From, size_t Length, const std::string &Path
 Coro<Result<uint64_t>>
 FileClient::storeThrough(const std::string &Path, uint64_t Offset, uint64_t Length, bool Truncate, PageSource &Outgoing, uint64_t Handle) {
   co_await P->Streaming.take();
-  const Impl::Streamer Alone(P->Streaming);
+  const Holding Alone(P->Streaming);
 
   const uint64_t PageBytes = P->Channel->pool().pageSize();
 
