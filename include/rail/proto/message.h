@@ -142,6 +142,11 @@ struct End {};
 
 struct FileAttrs {
   uint64_t Size = 0;
+  // Which filesystem on the peer, and which file on it. Together they name a
+  // file whatever it is called, and inode numbers repeat across a mount point,
+  // so the device comes too.
+  uint64_t Dev = 0;
+  uint64_t Ino = 0;
   uint32_t Mode = 0;
   uint32_t Uid = 0;
   uint32_t Gid = 0;

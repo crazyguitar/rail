@@ -68,6 +68,8 @@ enum railfs_msg_type {
 
 struct railfs_attrs {
 	u64 size;
+	u64 dev;
+	u64 ino;
 	u32 mode;
 	u32 uid;
 	u32 gid;

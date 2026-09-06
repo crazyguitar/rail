@@ -51,6 +51,8 @@ proto::FileAttrs attrsOf(const std::filesystem::path &P, bool &Found) {
   }
   Found = true;
   A.Size = static_cast<uint64_t>(St.st_size);
+  A.Dev = static_cast<uint64_t>(St.st_dev);
+  A.Ino = static_cast<uint64_t>(St.st_ino);
   A.Mode = St.st_mode & 07777;
   A.Uid = St.st_uid;
   A.Gid = St.st_gid;

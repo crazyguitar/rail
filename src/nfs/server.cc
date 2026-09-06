@@ -110,7 +110,18 @@ Digest digestOf(const std::string &Path) {
   return H.digest();
 }
 
-uint64_t fileIdOf(const std::string &Path) {
+// What a client tells files apart by, so it is the peer's own identity rather
+// than a digest of the path, which made a renamed file look like a different
+// one. A peer too old to send one falls back to the name.
+uint64_t fileIdOf(const proto::FileAttrs &A, const std::string &Path) {
+  if (A.Ino != 0) {
+    uint64_t Id = A.Ino ^ (A.Dev * 0x9E3779B97F4A7C15ULL);
+    Id ^= Id >> 33;
+    Id *= 0xFF51AFD7ED558CCDULL;
+    Id ^= Id >> 33;
+    return Id ? Id : 1;
+  }
+
   const Digest D = digestOf(Path);
   uint64_t Id = 0;
   for (size_t I = 0; I < 8; I++) Id = (Id << 8) | static_cast<uint64_t>(D[I]);
@@ -259,7 +270,7 @@ void writeAttrs(XdrWriter &W, const proto::FileAttrs &A, const std::string &Path
   W.u32(0);
   W.u32(0);
   W.u64(kFsId);
-  W.u64(fileIdOf(Path));
+  W.u64(fileIdOf(A, Path));
   for (int I = 0; I < 3; I++) {
     W.u32(static_cast<uint32_t>(A.Mtime));
     W.u32(0);
@@ -1148,8 +1159,21 @@ private:
       if (!Listed) co_return co_await replyBroken(Conn, C, 1, Listed.error(), *Held);
       if (!Listed->Found) co_return co_await replyStatus(Conn, C, kErrNotDir, 1);
 
+      auto Self = co_await Held->client().stat(*Path);
+      if (!Self) co_return co_await replyBroken(Conn, C, 1, Self.error(), *Held);
+
+      const std::string Up = parentPath(*Path, Opts.Remote.Root);
+      proto::FileAttrs Above = Self->Attrs;
+      if (Up != *Path) {
+        auto Parent = co_await Held->client().stat(Up);
+        if (!Parent) co_return co_await replyBroken(Conn, C, 1, Parent.error(), *Held);
+        Above = Parent->Attrs;
+      }
+
       Listing.Path = *Path;
       Listing.Entries = std::move(Listed->Entries);
+      Listing.Self = Self->Attrs;
+      Listing.Parent = Above;
       std::ranges::sort(Listing.Entries, [](const proto::ListEntry &A, const proto::ListEntry &B) { return A.Name < B.Name; });
     }
     const std::vector<proto::ListEntry> &Entries = Listing.Entries;
@@ -1170,9 +1194,11 @@ private:
       const std::string Name = Index == 0 ? "." : Index == 1 ? ".." : Entries[Index - 2].Name;
       const std::string Target = Index == 0 ? *Path : Index == 1 ? parentPath(*Path, Opts.Remote.Root) : joinPath(*Path, Name);
 
+      const proto::FileAttrs &Owner = Index == 0 ? Listing.Self : Index == 1 ? Listing.Parent : Entries[Index - 2].Attrs;
+
       const size_t Mark = W.size();
       W.boolean(true);
-      W.u64(fileIdOf(Target));
+      W.u64(fileIdOf(Owner, Target));
       W.text(Name);
       W.u64(Index + 1);
       if (WithAttrs) {
@@ -1307,6 +1333,9 @@ private:
   struct SortedListing {
     std::string Path;
     std::vector<proto::ListEntry> Entries;
+    // Dot and dot-dot are not entries, so their identity is asked for once.
+    proto::FileAttrs Self;
+    proto::FileAttrs Parent;
   };
   SortedListing Listing;
 

@@ -86,6 +86,12 @@ int railfs_get_attrs(struct railfs_cursor *c, struct railfs_attrs *a)
 
 	err = railfs_get_u64(c, &a->size);
 	if (!err) {
+		err = railfs_get_u64(c, &a->dev);
+	}
+	if (!err) {
+		err = railfs_get_u64(c, &a->ino);
+	}
+	if (!err) {
 		err = railfs_get_u32(c, &a->mode);
 	}
 	if (!err) {

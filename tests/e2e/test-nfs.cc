@@ -248,6 +248,25 @@ protected:
     return H;
   }
 
+  uint64_t fileIdThrough(RpcProbe &Probe, std::span<const std::byte> Handle) {
+    nfs::XdrWriter Args;
+    Args.opaque(Handle);
+    auto R = Probe.call(nfs::kNfsProgram, kNfsGetAttr, Args.bytes());
+    EXPECT_TRUE(R) << (R ? "" : R.error().message());
+    if (!R) return 0;
+    nfs::XdrReader Body(R->Body);
+    EXPECT_EQ(Body.u32(), 0u);
+    for (int I = 0; I < 5; I++) Body.u32();
+    Body.u64();
+    Body.u64();
+    Body.u32();
+    Body.u32();
+    Body.u64();
+    const uint64_t Id = Body.u64();
+    EXPECT_TRUE(Body.ok());
+    return Id;
+  }
+
   uint32_t statusOfGetAttr(RpcProbe &Probe, std::span<const std::byte> Handle) {
     nfs::XdrWriter Args;
     Args.opaque(Handle);
@@ -318,13 +337,16 @@ protected:
 
 struct DirListing {
   std::vector<std::string> Names;
+  std::vector<uint64_t> Ids;
   uint64_t LastCookie = 0;
 };
 
 DirListing readDirEntries(nfs::XdrReader &Body) {
   DirListing Listing;
   while (Body.boolean()) {
-    EXPECT_NE(Body.u64(), 0u) << "every entry needs a fileid";
+    const uint64_t Id = Body.u64();
+    EXPECT_NE(Id, 0u) << "every entry needs a fileid";
+    Listing.Ids.push_back(Id);
     Listing.Names.push_back(Body.text(255));
     Listing.LastCookie = Body.u64();
     if (!Body.ok()) break;
@@ -1039,6 +1061,79 @@ TEST_P(Nfs, OwnershipIsSquashedToWhoeverRunsTheGateway) {
   EXPECT_EQ(Body.u32(), ::getuid()) << "the mount should report the caller's own side, not the daemon's";
   EXPECT_EQ(Body.u32(), ::getgid()) << "the same for the group";
   EXPECT_TRUE(Body.ok());
+}
+
+// Two names for one file share a file id, a renamed file keeps it, and two
+// files never share one. A digest of the path got the first two wrong.
+TEST_P(Nfs, TheFileIdSaysWhichFileItIs) {
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
+
+  uint32_t Status = 1;
+  const auto Alpha = lookup(Probe, RootHandle, "alpha.bin", Status);
+  ASSERT_EQ(Status, 0u);
+  const auto Sub = lookup(Probe, RootHandle, "sub", Status);
+  ASSERT_EQ(Status, 0u);
+  const auto Other = lookup(Probe, Sub, "nested.bin", Status);
+  ASSERT_EQ(Status, 0u);
+
+  const uint64_t Id = fileIdThrough(Probe, Alpha);
+  EXPECT_NE(Id, 0u);
+  EXPECT_NE(Id, fileIdThrough(Probe, Other)) << "two files must not share a file id";
+
+  nfs::XdrWriter Linked;
+  Linked.opaque(Alpha);
+  Linked.opaque(RootHandle);
+  Linked.text("alpha-again.bin");
+  ASSERT_TRUE(Probe.call(nfs::kNfsProgram, kNfsLink, Linked.bytes()));
+  const auto Again = lookup(Probe, RootHandle, "alpha-again.bin", Status);
+  ASSERT_EQ(Status, 0u);
+  EXPECT_EQ(fileIdThrough(Probe, Again), Id) << "a second name for one file must share its file id";
+
+  nfs::XdrWriter Moving;
+  Moving.opaque(RootHandle);
+  Moving.text("alpha-again.bin");
+  Moving.opaque(RootHandle);
+  Moving.text("alpha-moved.bin");
+  auto Renamed = Probe.call(nfs::kNfsProgram, kNfsRename, Moving.bytes());
+  ASSERT_TRUE(Renamed) << Renamed.error().message();
+  nfs::XdrReader Done(Renamed->Body);
+  ASSERT_EQ(Done.u32(), 0u);
+
+  const auto Moved = lookup(Probe, RootHandle, "alpha-moved.bin", Status);
+  ASSERT_EQ(Status, 0u);
+  EXPECT_EQ(fileIdThrough(Probe, Moved), Id) << "a renamed file is still the same file";
+}
+
+// Dot and dot-dot are the same directories a lookup answers for, so a listing
+// gives them the same file ids.
+TEST_P(Nfs, DotAndDotDotCarryTheSameFileIdsAsTheDirectoriesThemselves) {
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
+
+  uint32_t Status = 1;
+  const auto Sub = lookup(Probe, RootHandle, "sub", Status);
+  ASSERT_EQ(Status, 0u);
+
+  nfs::XdrWriter Args;
+  Args.opaque(Sub);
+  Args.u64(0);
+  for (int I = 0; I < 2; I++) Args.u32(0);
+  Args.u32(8192);
+
+  auto R = Probe.call(nfs::kNfsProgram, kNfsReadDir, Args.bytes());
+  ASSERT_TRUE(R) << R.error().message();
+
+  nfs::XdrReader Body(R->Body);
+  ASSERT_EQ(Body.u32(), 0u);
+  ASSERT_FALSE(Body.boolean());
+  for (int I = 0; I < 2; I++) Body.u32();
+
+  const auto Listed = readDirEntries(Body);
+  ASSERT_GE(Listed.Names.size(), 2u);
+  ASSERT_EQ(Listed.Names[0], ".");
+  ASSERT_EQ(Listed.Names[1], "..");
+
+  EXPECT_EQ(Listed.Ids[0], fileIdThrough(Probe, Sub)) << "dot should be the directory it is listing";
+  EXPECT_EQ(Listed.Ids[1], fileIdThrough(Probe, RootHandle)) << "dot-dot should be that directory's parent";
 }
 
 TEST_P(Nfs, ParentOfTheExportRootIsTheExportRoot) {
