@@ -1016,6 +1016,31 @@ TEST_P(Nfs, RenamingANameOntoItselfKeepsItsHandles) {
   EXPECT_EQ(statusOfGetAttr(Probe, File), 0u) << "nothing beneath it moved either";
 }
 
+// Every file on the peer belongs to the daemon, so reporting that owner would
+// have a caller's own kernel refuse it. The mount squashes to whoever runs the
+// gateway, the way the fuse and kernel mounts do.
+TEST_P(Nfs, OwnershipIsSquashedToWhoeverRunsTheGateway) {
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
+
+  uint32_t Status = 1;
+  const auto File = lookup(Probe, RootHandle, "alpha.bin", Status);
+  ASSERT_EQ(Status, 0u);
+
+  nfs::XdrWriter Args;
+  Args.opaque(File);
+  auto R = Probe.call(nfs::kNfsProgram, kNfsGetAttr, Args.bytes());
+  ASSERT_TRUE(R) << R.error().message();
+
+  nfs::XdrReader Body(R->Body);
+  ASSERT_EQ(Body.u32(), 0u);
+  Body.u32();
+  Body.u32();
+  Body.u32();
+  EXPECT_EQ(Body.u32(), ::getuid()) << "the mount should report the caller's own side, not the daemon's";
+  EXPECT_EQ(Body.u32(), ::getgid()) << "the same for the group";
+  EXPECT_TRUE(Body.ok());
+}
+
 TEST_P(Nfs, ParentOfTheExportRootIsTheExportRoot) {
   restartExportAs(Host + ":sub");
 

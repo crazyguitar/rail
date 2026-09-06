@@ -249,8 +249,11 @@ void writeAttrs(XdrWriter &W, const proto::FileAttrs &A, const std::string &Path
   W.u32(A.Directory ? kTypeDirectory : kTypeRegular);
   W.u32(A.Mode);
   W.u32(A.Directory ? 2 : 1);
-  W.u32(A.Uid);
-  W.u32(A.Gid);
+  // Squashed to whoever runs the gateway, as the fuse and kernel mounts do:
+  // every file on the peer belongs to the daemon, and a caller that saw that
+  // uid would be denied by its own kernel before a request was ever made.
+  W.u32(::getuid());
+  W.u32(::getgid());
   W.u64(A.Size);
   W.u64((A.Size + 4095) & ~uint64_t{4095});
   W.u32(0);
