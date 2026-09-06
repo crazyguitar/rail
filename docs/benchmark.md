@@ -103,6 +103,14 @@ Median of seven with the standard deviation beside it, `--cpus 8-15`:
 at a time: a write straight after another's lands on a drive that has not
 recovered.
 
+Set all three or these do not reproduce:
+
+```bash
+ssh <peer> 'echo 8192 | sudo tee /sys/block/nvme0n1/queue/read_ahead_kb'
+sudo mount -t railfs -o host=<peer>,export=/,port=<port>,rdma none /mnt
+sudo bash -c 'exec 3>/dev/cpu_dma_latency; head -c4 /dev/zero >&3; sleep 1h' &
+```
+
 Read, 256 KiB:
 
 | threads | nvme | nfs | fuse | railfs |
@@ -269,3 +277,5 @@ at the stock 128 KiB against 9.9 at 1 MiB.
 echo 1024 | sudo tee /sys/block/nvme0n1/queue/read_ahead_kb   # 1 MiB tables
 echo 8192 | sudo tee /sys/block/nvme0n1/queue/read_ahead_kb   # thread sweep
 ```
+
+On the peer too, for every column but `nvme`.

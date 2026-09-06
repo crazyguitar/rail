@@ -94,6 +94,9 @@ Coro<Result<void>> PageSender::fill(uint64_t &Cursor, uint64_t End) {
 Coro<Result<void>> PageSender::shipReady() {
   Reading &Ready = Prefetch.front();
 
+  if (RefuseSendAfterPages > 0 && Shipped >= RefuseSendAfterPages) co_return failMessage("the fabric refused a send");
+  Shipped++;
+
   if (Ready.Direct) {
     const uint64_t Key = Ready.Key;
     {
@@ -147,6 +150,11 @@ Coro<size_t> PageSender::readOrZero(Reading &Ready) {
   co_return Ready.Length;
 }
 
+std::unexpected<Error> PageSender::giveUp(const Error &Why) {
+  LeftUnsent = true;
+  return std::unexpected(Why);
+}
+
 Coro<Result<void>> PageSender::drain(size_t Keep) {
   while (InFlight.size() > Keep) {
     Scoped T("tx.retire");
@@ -178,14 +186,16 @@ Coro<Result<uint64_t>> PageSender::run(uint64_t Offset, uint64_t Length) {
   const uint64_t End = Offset + Length;
   uint64_t Cursor = Offset;
 
+  // Every early return here leaves pages that were never posted, and the peer
+  // has a receive waiting for each of them.
   while (Cursor < End || !Prefetch.empty()) {
-    if (auto R = co_await fill(Cursor, End); !R) co_return std::unexpected(R.error());
+    if (auto R = co_await fill(Cursor, End); !R) co_return giveUp(R.error());
     if (Prefetch.empty()) break;
-    if (auto R = co_await drain(G.Window - 1); !R) co_return std::unexpected(R.error());
-    if (auto R = co_await shipReady(); !R) co_return std::unexpected(R.error());
+    if (auto R = co_await drain(G.Window - 1); !R) co_return giveUp(R.error());
+    if (auto R = co_await shipReady(); !R) co_return giveUp(R.error());
   }
 
-  if (auto R = co_await drain(0); !R) co_return std::unexpected(R.error());
+  if (auto R = co_await drain(0); !R) co_return giveUp(R.error());
   if (!Failure) co_return std::unexpected(Failure.error());
   co_return Length;
 }

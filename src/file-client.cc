@@ -111,8 +111,24 @@ struct FileClient::Impl {
 
   Turn Streaming;
 
+  // The peer is parked on a receive that will never complete, and no control
+  // frame can reach it there. Only closing frees it.
+  void abandonSend() {
+    Channel->close();
+    Control.close();
+  }
+
+  Coro<Result<uint64_t>> abandon(proto::StreamDigest Digest, const Error &Why) {
+    Digest.Error = Why.message();
+    [[maybe_unused]] auto Told = co_await Control.sendClaimed(Digest);
+    abandonSend();
+    co_return std::unexpected(Why);
+  }
+
   bool FlipOneBit = false;
   size_t AbortAfterPages = 0;
+  size_t RefuseSendAfterPages = 0;
+  size_t PagesSent = 0;
   bool Verify = true;
   Sum Agreed = Sum::XxH3;
 
@@ -177,6 +193,7 @@ Coro<Result<std::unique_ptr<FileClient>>> FileClient::connect(const std::string 
   P->Control = proto::ControlChannel(std::move(*Sock));
   P->FlipOneBit = Opts.FlipOneBit;
   P->AbortAfterPages = Opts.AbortAfterPages;
+  P->RefuseSendAfterPages = Opts.RefuseSendAfterPages;
   P->Verify = Opts.Verify;
   P->Agreed = Opts.Checksum;
   P->Channel = makeDataChannel(Opts.Backend, Opts.PageCount, Opts.PageSize, Host);
@@ -387,12 +404,28 @@ Coro<Result<void>> FileClient::write(const std::string &Path, uint64_t Offset, s
   Impl::Exchange Ex(P.get(), Wr.Id);
   if (auto R = co_await P->Control.send(Wr); !R) co_return std::unexpected(R.error());
 
+  // Past the request, the daemon has a receive posted, so every way out of
+  // here has to close rather than simply return.
   Page Buf;
   Buf = co_await P->Channel->pool().acquire();
-  if (!Buf.valid()) co_return failMessage("out of registered memory for a transfer page");
+  if (!Buf.valid()) {
+    P->abandonSend();
+    co_return failMessage("out of registered memory for a transfer page");
+  }
   Buf.resize(From.size());
   if (!From.empty()) std::memcpy(Buf.bytes(), From.data(), From.size());
-  if (auto R = co_await P->Channel->send(Buf, Wr.Id); !R) co_return std::unexpected(R.error());
+
+  // One write is one page, so the streaming path's injector counts here too.
+  if (P->RefuseSendAfterPages > 0 && P->PagesSent >= P->RefuseSendAfterPages) {
+    P->abandonSend();
+    co_return failMessage("the fabric refused a send");
+  }
+  P->PagesSent++;
+
+  if (auto R = co_await P->Channel->send(Buf, Wr.Id); !R) {
+    P->abandonSend();
+    co_return std::unexpected(R.error());
+  }
 
   auto Reply = asReply<proto::TransferReply>(co_await Ex.wait());
   if (!Reply) co_return std::unexpected(Reply.error());
@@ -586,12 +619,13 @@ Coro<Result<uint64_t>> FileClient::store(const std::filesystem::path &Local, con
 
   FileSource Reading(*Source);
   const StreamGeometry Geometry = StreamGeometry::forChannel(*P->Channel);
-  PageSender Sender(*P->Channel, Reading, St.TagBase, Geometry, P->FlipOneBit, P->Verify, P->Agreed, P->AbortAfterPages);
+  PageSender Sender(*P->Channel, Reading, St.TagBase, Geometry, P->FlipOneBit, P->Verify, P->Agreed, P->AbortAfterPages, P->RefuseSendAfterPages);
 
   proto::StreamDigest Digest;
   Digest.Id = St.Id;
   if (Size > 0) {
     auto Streamed = co_await Sender.stream(0, Size);
+    if (!Streamed && Sender.leftPagesUnsent()) co_return co_await P->abandon(Digest, Streamed.error());
     if (!Streamed) {
       Digest.Error = Streamed.error().message();
     } else {
@@ -707,12 +741,13 @@ FileClient::storeThrough(const std::string &Path, uint64_t Offset, uint64_t Leng
   if (!Accepted->Ok) co_return failMessage(Accepted->Error);
 
   const StreamGeometry Geometry = StreamGeometry::forChannel(*P->Channel);
-  PageSender Sender(*P->Channel, Outgoing, St.TagBase, Geometry, P->FlipOneBit, P->Verify, P->Agreed, P->AbortAfterPages);
+  PageSender Sender(*P->Channel, Outgoing, St.TagBase, Geometry, P->FlipOneBit, P->Verify, P->Agreed, P->AbortAfterPages, P->RefuseSendAfterPages);
 
   proto::StreamDigest Digest;
   Digest.Id = St.Id;
   if (Length > 0) {
     auto Streamed = co_await Sender.stream(Offset, Length);
+    if (!Streamed && Sender.leftPagesUnsent()) co_return co_await P->abandon(Digest, Streamed.error());
     if (!Streamed) {
       Digest.Error = Streamed.error().message();
     } else {

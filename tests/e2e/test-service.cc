@@ -74,6 +74,28 @@ protected:
     Daemon.emplace(std::move(*Started));
   }
 
+  // Descriptors the daemon holds. A session that never finishes keeps its own,
+  // so a leak shows up here.
+  int daemonDescriptors() {
+    auto Proc = peer().run({"bash", "-c", "ls /proc/$(pgrep -x raild | head -1)/fd 2>/dev/null | wc -l"});
+    if (!Proc) return -1;
+    auto Line = Proc->readLine();
+    return Line ? std::atoi(Line->c_str()) : -1;
+  }
+
+  // Settles once the count has held still for two reads, so a session still
+  // being reaped is not taken as the baseline.
+  int settledDescriptors() {
+    int Last = daemonDescriptors();
+    for (int I = 0; I < 40; I++) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      const int Now = daemonDescriptors();
+      if (Now == Last && Now > 0) return Now;
+      Last = Now;
+    }
+    return Last;
+  }
+
   // The daemon needs a moment to bind, and a refused connection says nothing
   // about the protocol, so connecting retries before a test blames the server.
   Result<std::unique_ptr<FileClient>> client() { return clientWith(Opts); }
@@ -349,6 +371,60 @@ TEST_P(Service, StoreCatchesBadData) {
   EXPECT_FALSE(peer().exists(Root + "/badstore.bin").value_or(false)) << "a corrupted store still landed a file";
 
   run((*C)->close());
+}
+
+// The daemon already has a receive posted for the refused page. If its
+// session never finishes, the descriptors it holds never come back.
+TEST_P(Service, ARefusedWriteDoesNotLeakTheSession) {
+  const std::vector<std::byte> Block(64u << 10, std::byte{7});
+
+  // The same work with nothing going wrong. The daemon caches the file it
+  // wrote, so comparing against this leaves only the session in question.
+  {
+    auto Fine = client();
+    ASSERT_TRUE(Fine) << Fine.error().message();
+    ASSERT_TRUE(run((*Fine)->write("refused.bin", 0, Block, true)));
+    ASSERT_TRUE(run((*Fine)->write("refused.bin", Block.size(), Block, false)));
+    run((*Fine)->close());
+  }
+  const int Whole = settledDescriptors();
+  ASSERT_GT(Whole, 0) << "could not read the daemon's descriptor count";
+
+  ServiceOptions Refusing = Opts;
+  Refusing.RefuseSendAfterPages = 1;
+  auto C = clientWith(Refusing);
+  ASSERT_TRUE(C) << C.error().message();
+  ASSERT_TRUE(run((*C)->write("refused.bin", 0, Block, true))) << "the first write should reach the daemon";
+  EXPECT_FALSE(run((*C)->write("refused.bin", Block.size(), Block, false))) << "a refused send reported success";
+  run((*C)->close());
+
+  const int After = settledDescriptors();
+  EXPECT_LE(After, Whole) << "the daemon kept the session left waiting for a page: " << Whole << " -> " << After;
+}
+
+// Neither end can move: the daemon waits for pages, the client for a reply
+// that only follows them.
+TEST_P(Service, AStoreWhoseSendFailsDoesNotStrandTheDaemon) {
+  const auto Local = makeFile("service-send-fail.bin", 6u << 20, 64);
+
+  ServiceOptions Failing = Opts;
+  Failing.PageSize = 1u << 20;
+  Failing.RefuseSendAfterPages = 2;
+  auto C = clientWith(Failing);
+  ASSERT_TRUE(C) << C.error().message();
+
+  auto Put = run((*C)->store(Local, "send-fail.bin"));
+  EXPECT_FALSE(Put) << "a store whose send the fabric refused reported success";
+  EXPECT_FALSE(peer().exists(Root + "/send-fail.bin").value_or(false)) << "a refused send still landed a file";
+
+  run((*C)->close());
+
+  // The daemon let go of it: a new session is served as usual.
+  auto Next = client();
+  ASSERT_TRUE(Next) << Next.error().message();
+  auto Seen = run((*Next)->stat("."));
+  EXPECT_TRUE(Seen) << "the daemon stopped answering after a stranded store";
+  run((*Next)->close());
 }
 
 TEST_P(Service, AnAbortedStoreFailsInsteadOfHanging) {
@@ -691,27 +767,7 @@ TEST_P(Service, ClosedSessionsFreeTheirDescriptorsWhileIdle) {
   const auto Local = makeFile("service-hold.bin", 4096, 91);
   seedRemote(Local, Root + "/hold.bin");
 
-  auto fdCount = [&]() -> int {
-    auto Proc = peer().run({"bash", "-c", "ls /proc/$(pgrep -x raild | head -1)/fd 2>/dev/null | wc -l"});
-    if (!Proc) return -1;
-    auto Line = Proc->readLine();
-    return Line ? std::atoi(Line->c_str()) : -1;
-  };
-
   using namespace std::chrono_literals;
-
-  // Settles once the count has held still for two reads, so a session still
-  // being reaped is not taken as the baseline.
-  auto settled = [&]() -> int {
-    int Last = fdCount();
-    for (int I = 0; I < 40; I++) {
-      std::this_thread::sleep_for(50ms);
-      const int Now = fdCount();
-      if (Now == Last && Now > 0) return Now;
-      Last = Now;
-    }
-    return Last;
-  };
 
   // A warmup so any one-time descriptors are already in the baseline.
   {
@@ -720,7 +776,7 @@ TEST_P(Service, ClosedSessionsFreeTheirDescriptorsWhileIdle) {
     ASSERT_TRUE(run((*C)->stat(".")));
     run((*C)->close());
   }
-  const int Base = settled();
+  const int Base = settledDescriptors();
   ASSERT_GT(Base, 0) << "could not read the daemon's descriptor count";
 
   // Each session opens a file and drops the connection without closing it, so
@@ -736,17 +792,17 @@ TEST_P(Service, ClosedSessionsFreeTheirDescriptorsWhileIdle) {
     ASSERT_TRUE(Opened->Ok) << Opened->Error;
     Clients.push_back(std::move(*C));
   }
-  const int Peak = fdCount();
+  const int Peak = daemonDescriptors();
   EXPECT_GE(Peak, Base + kSessions) << "open sessions did not raise the descriptor count";
 
   for (auto &C : Clients) run(C->close());
   Clients.clear();
 
   // No new client connects, so only reaping on completion frees these.
-  int After = fdCount();
+  int After = daemonDescriptors();
   for (int I = 0; I < 60 && After > Base + 2; I++) {
     std::this_thread::sleep_for(50ms);
-    After = fdCount();
+    After = daemonDescriptors();
   }
   EXPECT_LE(After, Base + 2) << "closed sessions kept their descriptors through an idle daemon";
 }

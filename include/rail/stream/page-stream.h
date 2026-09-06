@@ -31,8 +31,10 @@ public:
              bool FlipOneBit = false,
              bool Verify = true,
              Sum Which = Sum::XxH3,
-             size_t AbortAfterPages = 0)
-      : Channel(Channel), Source(Source), TagBase(TagBase), G(G), FlipOneBit(FlipOneBit), AbortAfterPages(AbortAfterPages), Whole(Verify, Which) {}
+             size_t AbortAfterPages = 0,
+             size_t RefuseSendAfterPages = 0)
+      : Channel(Channel), Source(Source), TagBase(TagBase), G(G), FlipOneBit(FlipOneBit), AbortAfterPages(AbortAfterPages),
+        RefuseSendAfterPages(RefuseSendAfterPages), Whole(Verify, Which) {}
 
   PageSender(const PageSender &) = delete;
   PageSender &operator=(const PageSender &) = delete;
@@ -42,6 +44,10 @@ public:
   Digest digest() const { return Whole.digest(); }
 
   bool matches(const Digest &Theirs) const { return Whole.matches(Theirs); }
+
+  // A page whose read failed still goes out as zeros, completing the peer's
+  // receive. One that was never posted leaves that receive waiting for good.
+  bool leftPagesUnsent() const { return LeftUnsent; }
 
 private:
   struct Reading {
@@ -64,6 +70,7 @@ private:
   Coro<Result<void>> shipReady();
   Coro<size_t> readOrZero(Reading &Ready);
   static void markFailed(Reading &R);
+  std::unexpected<Error> giveUp(const Error &Why);
   Coro<Result<void>> drain(size_t Keep);
 
   Coro<void> quiesce();
@@ -74,6 +81,9 @@ private:
   StreamGeometry G;
   bool FlipOneBit = false;
   size_t AbortAfterPages = 0;
+  size_t RefuseSendAfterPages = 0;
+  size_t Shipped = 0;
+  bool LeftUnsent = false;
   size_t Pooled = 0;
   Verifier Whole;
   Result<void> Failure = Result<void>{};

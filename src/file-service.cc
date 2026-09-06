@@ -302,12 +302,17 @@ public:
     co_return Outcome;
   }
 
-  // No payload will follow this reply and the peer is already waiting for
-  // one. Answer, then drop the session, so that wait fails instead of lasting.
+  // The peer is parked on a reply or a payload that will never come, and sends
+  // nothing more for the receive loop to notice. Closing fails that wait.
+  Result<void> endSession(const std::string &Why) {
+    Control.close();
+    return failMessage(Why);
+  }
+
+  // No payload will follow this reply and the peer is already waiting for one.
   Coro<Result<void>> refuseTransfer(const proto::TransferReply &Reply) {
     [[maybe_unused]] auto Sent = co_await Control.send(Reply);
-    Control.close();
-    co_return failMessage(Reply.Error);
+    co_return endSession(Reply.Error);
   }
 
   Coro<Result<void>> dispatch(proto::Message M) {
@@ -511,8 +516,9 @@ public:
     Buf.resize(Want);
     {
       Scoped T("rd.payload");
-      co_return co_await Channel->send(Buf, Rd.Id);
+      if (auto R = co_await Channel->send(Buf, Rd.Id); !R) co_return endSession(R.error().message());
     }
+    co_return Result<void>{};
   }
 
   Coro<uint32_t> readInto(const proto::ReadRequest &Rd, Page &Buf, uint32_t Want, proto::TransferReply &Reply) {
@@ -759,7 +765,12 @@ public:
     } else {
       Digest.Error = Sent.error().message();
     }
-    co_return co_await Control.send(Digest);
+    if (auto R = co_await Control.send(Digest); !R) co_return std::unexpected(R.error());
+
+    // Pages that were never posted leave the client waiting on the fabric,
+    // where this digest cannot reach it.
+    if (!Sent && Sender.leftPagesUnsent()) co_return endSession(Sent.error().message());
+    co_return Result<void>{};
   }
 
   Coro<Result<void>> storeAtOffset(const proto::StoreRequest &St) {
@@ -904,7 +915,7 @@ public:
 
     {
       Scoped T("wr.payload");
-      if (auto R = co_await Channel->recv(Buf, Wr.Id, Wr.Length); !R) co_return std::unexpected(R.error());
+      if (auto R = co_await Channel->recv(Buf, Wr.Id, Wr.Length); !R) co_return endSession(R.error().message());
     }
 
     Verifier Landed(Verify, Agreed);
