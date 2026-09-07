@@ -94,7 +94,7 @@ public:
 
   // Answers with what the peer then holds, so a caller need not ask.
   // Brings a file into existence, or empties one that is there.
-  Coro<Result<proto::FileAttrs>> createFile(const std::string &Path, uint32_t Mode = 0644);
+  Coro<Result<proto::FileAttrs>> createFile(const std::string &Path, uint32_t Mode = 0644, bool Exclusive = false);
   Coro<Result<proto::FileAttrs>> makeDirectory(const std::string &Path, uint32_t Mode = 0755);
   Coro<Result<void>> removeFile(const std::string &Path);
   Coro<Result<void>> removeDirectory(const std::string &Path);

@@ -48,6 +48,7 @@ constexpr uint32_t kNf3Dir = 2;
 constexpr uint32_t kNfs3ErrNoEnt = 2;
 constexpr uint32_t kNfs3ErrIo = 5;
 constexpr uint32_t kNfs3ErrExist = 17;
+constexpr uint32_t kNfs3ErrNotSupp = 10004;
 constexpr uint32_t kNfs3ErrNameTooLong = 63;
 constexpr uint32_t kNfs3ErrStale = 70;
 constexpr uint32_t kLastFragment = 0x80000000u;
@@ -662,8 +663,7 @@ TEST_P(Nfs, CreateMakesAFileThatLookupFinds) {
 // touching who may read it.
 TEST_P(Nfs, CreateWithoutAttributesLeavesThePermissions) {
   ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
-  ASSERT_TRUE(peer().run({"bash", "-c", "echo guarded > " + Root + "/guarded.bin && chmod 600 " + Root + "/guarded.bin"}));
-  runOnPeerToCompletion({"true"});
+  runOnPeerToCompletion({"bash", "-c", "printf guarded > " + Root + "/guarded.bin && chmod 600 " + Root + "/guarded.bin"});
 
   nfs::XdrWriter Args;
   Args.opaque(RootHandle);
@@ -680,6 +680,54 @@ TEST_P(Nfs, CreateWithoutAttributesLeavesThePermissions) {
   auto Line = Seen->readLine();
   ASSERT_TRUE(Line);
   EXPECT_EQ(*Line, "600") << "a create that named no mode changed the permissions";
+}
+
+// A guarded create refuses a name in use, at the peer's own open.
+TEST_P(Nfs, GuardedCreateRefusesAnExistingName) {
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
+
+  nfs::XdrWriter First;
+  First.opaque(RootHandle);
+  First.text("guarded-once.bin");
+  First.u32(1);
+  putNoAttrs(First);
+  auto Once = Probe.call(nfs::kNfsProgram, kNfsCreate, First.bytes());
+  ASSERT_TRUE(Once) << Once.error().message();
+  nfs::XdrReader Made(Once->Body);
+  ASSERT_EQ(Made.u32(), 0u) << "the first guarded create should succeed";
+
+  nfs::XdrWriter Again;
+  Again.opaque(RootHandle);
+  Again.text("guarded-once.bin");
+  Again.u32(1);
+  putNoAttrs(Again);
+  auto Twice = Probe.call(nfs::kNfsProgram, kNfsCreate, Again.bytes());
+  ASSERT_TRUE(Twice) << Twice.error().message();
+  nfs::XdrReader Refused(Twice->Body);
+  EXPECT_EQ(Refused.u32(), kNfs3ErrExist) << "a guarded create took over a name that was already there";
+}
+
+// The verifier has nowhere to live here, so the answer says so rather than
+// truncating the file it names.
+TEST_P(Nfs, ExclusiveCreateSaysItCannot) {
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
+  runOnPeerToCompletion({"bash", "-c", "echo kept > " + Root + "/exclusive.bin"});
+
+  nfs::XdrWriter Args;
+  Args.opaque(RootHandle);
+  Args.text("exclusive.bin");
+  Args.u32(2);
+  Args.fixed(std::vector<std::byte>(8, std::byte{7}));
+  auto R = Probe.call(nfs::kNfsProgram, kNfsCreate, Args.bytes());
+  ASSERT_TRUE(R) << R.error().message();
+  nfs::XdrReader Body(R->Body);
+  EXPECT_EQ(Body.u32(), kNfs3ErrNotSupp) << "an exclusive create was answered as though the verifier were kept";
+
+  auto Seen = peer().run({"cat", Root + "/exclusive.bin"});
+  ASSERT_TRUE(Seen);
+  auto Line = Seen->readLine();
+  ASSERT_TRUE(Line) << "the file an exclusive create named is gone";
+  EXPECT_EQ(*Line, "kept") << "an exclusive create changed the file it named";
 }
 
 TEST_P(Nfs, CommitOnAFileAnswersOk) {

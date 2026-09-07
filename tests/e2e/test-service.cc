@@ -928,6 +928,28 @@ TEST_P(Service, MakingSomethingAnswersForWhatItMade) {
   run((*C)->close());
 }
 
+// An exclusive create refuses a name in use at the open itself. No sequential
+// test can catch the gap that closes, so this covers the mechanism.
+TEST_P(Service, AnExclusiveCreateRefusesAnExistingName) {
+  auto C = client();
+  ASSERT_TRUE(C) << C.error().message();
+
+  const std::string Once = "exclusive-once.bin";
+  auto Made = run((*C)->createFile(Once, 0644, true));
+  ASSERT_TRUE(Made) << Made.error().message();
+  EXPECT_NE(Made->Ino, 0u);
+
+  auto Again = run((*C)->createFile(Once, 0644, true));
+  ASSERT_FALSE(Again) << "an exclusive create took a name that was already there";
+  EXPECT_EQ(Again.error().Code, std::errc::file_exists) << "the refusal did not come from the open: " << Again.error().message();
+
+  // The same name without it is taken over, as an unchecked create asks.
+  auto Over = run((*C)->createFile(Once, 0644, false));
+  EXPECT_TRUE(Over) << Over.error().message();
+
+  run((*C)->close());
+}
+
 // A listing answers for the directory it lists and the one above it, which are
 // not entries of it. Without these the mounts asked twice more.
 TEST_P(Service, AListingAnswersForItselfAndItsParent) {

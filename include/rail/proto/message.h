@@ -288,6 +288,9 @@ struct MetaRequest {
   uint32_t Mode = 0;
   int64_t Mtime = 0;
   uint64_t Handle = 0;
+  // A create that refuses a name in use, decided by the peer's open rather
+  // than by asking first and racing whoever answers next.
+  bool Exclusive = false;
 };
 
 struct MetaReply {

@@ -439,6 +439,23 @@ TEST_F(Kernel, AMadeFileReportsTheNumberTheDaemonHasForIt) {
   EXPECT_EQ(Fresh.st_ino, AtCreate.st_ino) << "the number a made file reports must be the one a lookup finds";
 }
 
+// The mount root is made before the peer is asked, so its number is corrected
+// when the answer arrives. One directory reached two ways is one directory.
+TEST_F(Kernel, TheMountRootCarriesThePeersNumber) {
+  ASSERT_TRUE(peer().makeDirectory(Export + "/inner"));
+
+  ASSERT_TRUE(mountIt(defaultOptions()));
+  struct ::stat AsChild{};
+  ASSERT_EQ(::stat((Mountpoint + "/inner").c_str(), &AsChild), 0) << std::strerror(errno);
+  ASSERT_TRUE(unmountFilesystem(Mountpoint).has_value());
+
+  ASSERT_TRUE(mountIt("host=" + Host + ",export=inner,port=" + std::to_string(kPort)));
+  struct ::stat AsRoot{};
+  ASSERT_EQ(::stat(Mountpoint.c_str(), &AsRoot), 0) << std::strerror(errno);
+
+  EXPECT_EQ(AsRoot.st_ino, AsChild.st_ino) << "the mount root kept a number made from its path";
+}
+
 TEST_F(Kernel, ReportsTheSizeTheDaemonGave) {
   ASSERT_TRUE(mountIt(defaultOptions()));
 

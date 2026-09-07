@@ -909,7 +909,7 @@ int railfs_meta_send(struct railfs_conn *conn, const struct railfs_meta_req *req
 	u8 ok = 0;
 	int err;
 
-	cap = RAILFS_HEADER_SIZE + 8 + 2 + 4 + strlen(req->path) + 4 + strlen(target) + 8 + 4 + 8 + 8;
+	cap = RAILFS_HEADER_SIZE + 8 + 2 + 4 + strlen(req->path) + 4 + strlen(target) + 8 + 4 + 8 + 8 + 1;
 
 	frame = railfs_request(conn, cap, &c, &id);
 	if (!frame) {
@@ -923,6 +923,8 @@ int railfs_meta_send(struct railfs_conn *conn, const struct railfs_meta_req *req
 	railfs_put_u32(&c, req->mode);
 	railfs_put_u64(&c, (u64)req->mtime);
 	railfs_put_u64(&c, 0);
+	/* This mount never asks for an exclusive create. */
+	railfs_put_u8(&c, 0);
 
 	if (!railfs_cursor_ok(&c)) {
 		err = -EOVERFLOW;

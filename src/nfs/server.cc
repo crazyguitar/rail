@@ -64,6 +64,9 @@ constexpr size_t kPathLimit = 4096;
 constexpr size_t kReadLimit = 1u << 20;
 constexpr size_t kWriteLimit = 1u << 20;
 constexpr uint32_t kErrExist = 17;
+// The verifier an exclusive create carries has nowhere to live here. Saying so
+// is allowed, and a client answers by asking for a guarded one.
+constexpr uint32_t kErrNotSupp = 10004;
 // What a write promises. UNSTABLE means it is in the export's memory and the
 // client must send a commit before it counts; FILE_SYNC would say it is already
 // on the peer's disk, which a plain write does not make true.
@@ -945,7 +948,10 @@ private:
     Wanted Ask;
     if (How == 2) R.fixed(8);
     else Ask = readWanted(R);
-    if (!R.ok()) co_return co_await sendGated(Conn, C.Xid, AcceptStatus::GarbageArguments, {});
+
+    // Read before answered: a truncated one is garbage, and there are three.
+    if (!R.ok() || How > 2) co_return co_await sendGated(Conn, C.Xid, AcceptStatus::GarbageArguments, {});
+    if (How == 2) co_return co_await replyStatus(Conn, C, kErrNotSupp, failureFields(Proc::Create));
     if (!Directory) co_return co_await replyStatus(Conn, C, kErrStale, failureFields(Proc::Create));
     if (Name.size() > kNameLimit) co_return co_await replyStatus(Conn, C, kErrNameTooLong, failureFields(Proc::Create));
     if (!namedSafely(Name)) co_return co_await replyStatus(Conn, C, kErrInval, failureFields(Proc::Create));
@@ -955,15 +961,13 @@ private:
     auto Held = co_await Pool.take();
     if (!Held) co_return co_await replyBroken(Conn, C, failureFields(Proc::Create), Held.error());
 
-    // GUARDED refuses a name that is already there; the other two modes take
-    // it over, which is what O_CREAT without O_EXCL asks for.
-    auto Seen = co_await Held->client().stat(Target);
-    if (!Seen) co_return co_await replyBroken(Conn, C, failureFields(Proc::Create), Seen.error(), *Held);
-    if (Seen->Found && How == 1) co_return co_await replyStatus(Conn, C, kErrExist, failureFields(Proc::Create));
-
-    // A create that named no mode leaves an existing file's permissions alone.
-    auto Made = co_await Held->client().createFile(Target, Ask.HasMode ? Ask.Mode : proto::kKeepMode);
-    if (!Made) co_return co_await replyBroken(Conn, C, failureFields(Proc::Create), Made.error(), *Held);
+    // Naming no mode leaves an existing file's permissions alone, and a
+    // guarded one is refused at the peer's open rather than by asking first.
+    auto Made = co_await Held->client().createFile(Target, Ask.HasMode ? Ask.Mode : proto::kKeepMode, How == 1);
+    if (!Made) {
+      if (Made.error().Code == std::errc::file_exists) co_return co_await replyStatus(Conn, C, kErrExist, failureFields(Proc::Create));
+      co_return co_await replyBroken(Conn, C, failureFields(Proc::Create), Made.error(), *Held);
+    }
 
     forget(Target);
 

@@ -266,6 +266,7 @@ void encode(const Message &M, std::vector<std::byte> &Payload) {
           W.u32(V.Mode);
           W.i64(V.Mtime);
           W.u64(V.Handle);
+          W.u8(V.Exclusive ? 1 : 0);
         } else if constexpr (std::is_same_v<T, OpenRequest>) {
           W.u64(V.Id);
           W.str(V.Path);
@@ -524,6 +525,7 @@ Result<Message> decode(Type T, std::span<const std::byte> Payload) {
     V.Mode = R.u32();
     V.Mtime = R.i64();
     V.Handle = R.u64();
+    V.Exclusive = R.u8() != 0;
     M = V;
     break;
   }

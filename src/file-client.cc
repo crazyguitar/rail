@@ -466,9 +466,10 @@ Coro<Result<proto::FileAttrs>> FileClient::sendMeta(const proto::MetaRequest &Gi
   co_return Reply->Attrs;
 }
 
-Coro<Result<proto::FileAttrs>> FileClient::createFile(const std::string &Path, uint32_t Mode) {
+Coro<Result<proto::FileAttrs>> FileClient::createFile(const std::string &Path, uint32_t Mode, bool Exclusive) {
   auto Meta = metaOf(proto::MetaOp::Create, Path);
   Meta.Mode = Mode;
+  Meta.Exclusive = Exclusive;
   co_return co_await sendMeta(Meta);
 }
 

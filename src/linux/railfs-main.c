@@ -268,6 +268,8 @@ static int railfs_adopt_root_mode(struct super_block *sb, struct railfs_options 
 		goto out;
 	}
 
+	// Built before the peer was asked, so its number came from the path.
+	root->i_ino = railfs_file_id(&attrs, served);
 	root->i_mode = S_IFDIR | (attrs.mode & RAILFS_MODE_BITS);
 
 	if (attrs.mtime) {

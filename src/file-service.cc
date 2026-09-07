@@ -729,7 +729,9 @@ public:
       const bool Keep = Meta.Mode == proto::kKeepMode;
       const uint32_t Wanted = Keep ? 0644 : Meta.Mode & 07777;
 
-      const int Fd = ::open(Path->c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NONBLOCK, Wanted);
+      // Left to the open: asking first and creating after is a gap.
+      const int Only = Meta.Exclusive ? O_EXCL : O_TRUNC;
+      const int Fd = ::open(Path->c_str(), O_WRONLY | O_CREAT | Only | O_CLOEXEC | O_NONBLOCK, Wanted);
       if (Fd >= 0) {
         auto R = Keep ? Result<void>{} : setModeOf(Fd, Wanted);
         if (!R) refused(Reply, R.error());
@@ -743,8 +745,8 @@ public:
         co_return co_await Control.send(Reply);
       }
 
-      auto Done = co_await offLoop([Path = *Path, Wanted, Keep]() -> Result<void> {
-        const int Fd = ::open(Path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, Wanted);
+      auto Done = co_await offLoop([Path = *Path, Wanted, Keep, Only]() -> Result<void> {
+        const int Fd = ::open(Path.c_str(), O_WRONLY | O_CREAT | Only | O_CLOEXEC, Wanted);
         if (Fd < 0) return failErrno("create");
         auto R = Keep ? Result<void>{} : setModeOf(Fd, Wanted);
         ::close(Fd);
