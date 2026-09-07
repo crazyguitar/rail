@@ -24,3 +24,5 @@ debian/debhelper-build-stamp
 debian/railfs-dkms.postinst
 debian/railfs-dkms.prerm
 obj-*/
+
+.DS_Store
