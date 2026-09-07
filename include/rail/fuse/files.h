@@ -26,6 +26,8 @@ struct File {
   uint64_t StreamStart = 0;
   size_t StreamLen = 0;
   uint64_t StreamStamp = 0;
+  // Reads inside a fetch. The pages belong to the fabric until all are done.
+  size_t Reading = 0;
   AddressSpace Stream;
   vfs::Window Have;
   vfs::Gate Filling;

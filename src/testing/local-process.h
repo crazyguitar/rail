@@ -34,6 +34,7 @@ public:
 
   void kill();
   Result<ProcessResult> wait();
+  int pid() const { return Pid; }
 
 private:
   BackgroundProcess(int Pid, int ReadFd) : Pid(Pid), ReadFd(ReadFd) {}

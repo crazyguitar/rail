@@ -22,6 +22,7 @@
 #include <map>
 #include <netinet/in.h>
 #include <optional>
+#include <random>
 #include <ranges>
 #include <set>
 #include <sstream>
@@ -38,6 +39,15 @@
 namespace rail::e2e {
 
 namespace {
+
+uint64_t residentKib(int Pid) {
+  std::ifstream In("/proc/" + std::to_string(Pid) + "/status");
+  for (std::string Line; std::getline(In, Line);) {
+    if (Line.rfind("VmRSS:", 0) != 0) continue;
+    return std::strtoull(Line.c_str() + 6, nullptr, 10);
+  }
+  return 0;
+}
 
 std::vector<std::string> mountPointsUnder(const std::string &Prefix) {
   std::vector<std::string> Found;
@@ -131,6 +141,7 @@ public:
 
   bool ready() const { return Ready; }
   const std::filesystem::path &at() const { return At; }
+  int pid() const { return Child ? Child->pid() : -1; }
 
 private:
   std::filesystem::path At;
@@ -494,6 +505,110 @@ TEST_P(Mount, MadeFilesAndDotEntriesReportTheSameNumberAsAStat) {
   EXPECT_EQ(Dot, Sub.st_ino) << "dot should be the directory it lists";
   EXPECT_EQ(DotDot, Root.st_ino) << "dot-dot should be that directory's parent";
   EXPECT_NE(AtCreate.st_ino, Dir.st_ino) << "a made file and a made directory are not the same";
+}
+
+// Given back at the end of a file, eight cost what one does. The arena is
+// capped into small regions so holding them has to map more: inside one big
+// region they would hide and this would pass either way.
+TEST_P(Mount, StreamMemoryComesBackWhenAFileIsReadToItsEnd) {
+  remountWith(streamArgs(), {"RAIL_MEMORY_REGIONS=16", "RAIL_MEMORY_REGION_BYTES=16777216"});
+  const int Pid = Live->pid();
+  ASSERT_GT(Pid, 0);
+
+  std::vector<int> Held;
+  const auto readToEnd = [&](const char *Why) {
+    const int Fd = ::open((At / "alpha.bin").c_str(), O_RDONLY);
+    ASSERT_GE(Fd, 0) << Why << ": " << std::strerror(errno);
+    Held.push_back(Fd);
+
+    std::vector<char> Buf(1u << 20);
+    uint64_t Read = 0;
+    for (;;) {
+      const ssize_t Got = ::read(Fd, Buf.data(), Buf.size());
+      ASSERT_GE(Got, 0) << Why << ": " << std::strerror(errno);
+      if (Got == 0) break;
+      Read += static_cast<uint64_t>(Got);
+    }
+    ASSERT_EQ(Read, std::filesystem::file_size(Alpha)) << Why << ": short read";
+  };
+
+  ASSERT_NO_FATAL_FAILURE(readToEnd("the first file"));
+  const uint64_t AfterOne = residentKib(Pid);
+  ASSERT_GT(AfterOne, 0u);
+
+  for (int I = 0; I < 7; I++) ASSERT_NO_FATAL_FAILURE(readToEnd("a later file"));
+  const uint64_t AfterEight = residentKib(Pid);
+
+  for (int Fd : Held) ::close(Fd);
+
+  EXPECT_LT(AfterEight, AfterOne + (8u << 10)) << "seven more files read to their end should not each keep a stream chunk: " << AfterOne
+                                               << " KiB became " << AfterEight << " KiB";
+}
+
+// The end of a file inside a chunk gives its memory back, and reading again
+// has to take it once more rather than serve nothing.
+TEST_P(Mount, AFileReadToItsEndReadsTheSameAgain) {
+  remountWith({"--stream-after", "1"});
+
+  const int Fd = ::open((At / "alpha.bin").c_str(), O_RDONLY);
+  ASSERT_GE(Fd, 0) << std::strerror(errno);
+
+  const auto Expected = localBytes(Alpha);
+  const auto readAll = [&] {
+    std::vector<std::byte> Got;
+    std::vector<char> Buf(1u << 20);
+    for (;;) {
+      const ssize_t N = ::read(Fd, Buf.data(), Buf.size());
+      if (N <= 0) return std::make_pair(Got, N);
+      Got.insert(Got.end(), reinterpret_cast<std::byte *>(Buf.data()), reinterpret_cast<std::byte *>(Buf.data()) + N);
+    }
+  };
+
+  auto [First, FirstEnd] = readAll();
+  EXPECT_EQ(FirstEnd, 0) << "the read failed rather than ending: " << std::strerror(errno);
+  EXPECT_EQ(First, Expected);
+
+  ASSERT_EQ(::lseek(Fd, 0, SEEK_SET), 0);
+  auto [Again, AgainEnd] = readAll();
+  EXPECT_EQ(AgainEnd, 0) << "the second read failed rather than ending: " << std::strerror(errno);
+  EXPECT_EQ(Again, Expected) << "the file read differently once its stream memory had been given back";
+
+  ::close(Fd);
+}
+
+// One reader walking forwards keeps a fetch in flight while another seeking
+// about stops the streaming it fills. Neither may see the other's bytes.
+TEST_P(Mount, ConcurrentReadersOnOneHandleStayCorrect) {
+  remountWith(streamArgs());
+
+  const int Fd = ::open((At / "alpha.bin").c_str(), O_RDONLY);
+  ASSERT_GE(Fd, 0) << std::strerror(errno);
+
+  const auto Expected = localBytes(Alpha);
+  std::atomic<bool> Wrong{false};
+  std::atomic<bool> Stop{false};
+
+  const auto checkAt = [&](uint64_t Off, size_t Size) {
+    std::vector<char> Buf(Size);
+    const ssize_t N = ::pread(Fd, Buf.data(), Size, static_cast<off_t>(Off));
+    if (N <= 0) return;
+    if (!std::equal(Buf.begin(), Buf.begin() + N, reinterpret_cast<const char *>(Expected.data()) + Off)) Wrong = true;
+  };
+
+  std::thread Forwards([&] {
+    for (uint64_t Off = 0; !Stop && Off + (1u << 20) <= Expected.size(); Off += 1u << 20) checkAt(Off, 1u << 20);
+  });
+
+  std::mt19937 Rolls(7);
+  for (int I = 0; I < 400 && !Wrong; I++) {
+    const uint64_t Off = (Rolls() % (Expected.size() / 4096)) * 4096;
+    checkAt(Off, std::min<size_t>(4096, Expected.size() - Off));
+  }
+  Stop = true;
+  Forwards.join();
+
+  EXPECT_FALSE(Wrong) << "a reader saw bytes that were not its own";
+  ::close(Fd);
 }
 
 TEST_P(Mount, ListsTheDirectory) {

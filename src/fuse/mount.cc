@@ -850,6 +850,26 @@ bool reserve(File &F, AddressSpace &Window, uint64_t Room, size_t Holding = 0) {
 
 uint64_t chunkOf(const Mount &M, const File &F) { return std::max<uint64_t>(F.Page, (M.Opts.StreamChunk / F.Page) * F.Page); }
 
+// A file that stopped streaming holds two chunks it no longer reads from until
+// it closes. Given back, they cost one claim to take again.
+void stopStreaming(File &F) {
+  F.StreamLen = 0;
+  F.Streaming = false;
+  if (F.InFlight || F.Reading > 0) return;
+  F.Stream.release();
+  F.Spare.release();
+}
+
+// While this lives a second read on the same handle cannot give the pages
+// back underneath the fetch.
+struct Filling {
+  File &F;
+  explicit Filling(File &Which) : F(Which) { F.Reading++; }
+  Filling(const Filling &) = delete;
+  Filling &operator=(const Filling &) = delete;
+  ~Filling() { F.Reading--; }
+};
+
 void prefetch(Mount &M, File &F) {
   if (F.InFlight) return;
   const uint64_t Next = F.StreamStart + chunkOf(M, F);
@@ -885,20 +905,21 @@ Coro<void> streamedRead(Mount &M, ::fuse_req_t Req, File &F, size_t Size, uint64
   if (!F.covers(Off, Size, At)) {
     if (Start >= F.Size) {
       if (F.CheckedAtSize == F.Size && F.Size != 0) {
+        stopStreaming(F);
         ::fuse_reply_buf(Req, nullptr, 0);
         co_return;
       }
       co_await settle(F);
       auto Grown = co_await currentSize(M, F.Path);
       if (!Grown) {
-        F.StreamLen = 0;
-        F.Streaming = false;
+        stopStreaming(F);
         co_await windowedRead(M, Req, F, Size, Off);
         co_return;
       }
       F.Size = *Grown;
       F.CheckedAtSize = F.Size;
       if (Start >= F.Size) {
+        stopStreaming(F);
         ::fuse_reply_buf(Req, nullptr, 0);
         co_return;
       }
@@ -909,9 +930,13 @@ Coro<void> streamedRead(Mount &M, ::fuse_req_t Req, File &F, size_t Size, uint64
       F.InFlight = false;
       F.Fetching = {};
       if (!Got) {
-        F.StreamLen = 0;
-        F.Streaming = false;
+        stopStreaming(F);
         F.Failed = true;
+        co_await windowedRead(M, Req, F, Size, Off);
+        co_return;
+      }
+      if (!F.Streaming) {
+        stopStreaming(F);
         co_await windowedRead(M, Req, F, Size, Off);
         co_return;
       }
@@ -932,14 +957,24 @@ Coro<void> streamedRead(Mount &M, ::fuse_req_t Req, File &F, size_t Size, uint64
                      static_cast<unsigned long long>(Start),
                      static_cast<unsigned long long>(Room));
 
-      auto Got = co_await fetchChunk(M, F, Start, F.Stream);
+      auto Got = co_await [&]() -> Coro<Result<uint64_t>> {
+        const Filling Mine(F);
+        co_return co_await fetchChunk(M, F, Start, F.Stream);
+      }();
       if (!Got) {
-        F.StreamLen = 0;
-        F.Streaming = false;
+        stopStreaming(F);
         F.Failed = true;
         co_await windowedRead(M, Req, F, Size, Off);
         co_return;
       }
+      // A read that stopped streaming while this fetched left the pages to
+      // whoever was last out of them.
+      if (!F.Streaming) {
+        stopStreaming(F);
+        co_await windowedRead(M, Req, F, Size, Off);
+        co_return;
+      }
+
       F.StreamStart = Start;
       F.StreamLen = static_cast<size_t>(*Got);
       F.StreamStamp = At;
@@ -948,11 +983,11 @@ Coro<void> streamedRead(Mount &M, ::fuse_req_t Req, File &F, size_t Size, uint64
 
   if (Off < F.StreamStart || Off - F.StreamStart >= F.StreamLen) {
     if (Off < F.Size) {
-      F.StreamLen = 0;
-      F.Streaming = false;
+      stopStreaming(F);
       co_await windowedRead(M, Req, F, Size, Off);
       co_return;
     }
+    stopStreaming(F);
     ::fuse_reply_buf(Req, nullptr, 0);
     co_return;
   }
@@ -997,8 +1032,7 @@ Coro<void> doRead(Mount &M, ::fuse_req_t Req, ::fuse_ino_t Ino, size_t Size, uin
     co_await settle(*F);
     F->Covered = 0;
     F->Frontier = Off;
-    F->Streaming = false;
-    F->StreamLen = 0;
+    stopStreaming(*F);
   }
 
   const uint64_t End = std::min(Off + Size, F->Size);
