@@ -98,10 +98,6 @@ const struct file_operations railfs_file_ops = {
 };
 
 
-
-
-
-
 // /proc/mounts has to name what was mounted, or two railfs mounts are
 // indistinguishable from each other.
 static int railfs_show_options(struct seq_file *m, struct dentry *root)
@@ -149,10 +145,6 @@ static void railfs_put_super(struct super_block *sb)
 }
 
 
-
-
-
-
 const struct file_operations railfs_dir_ops = {
 	.owner = THIS_MODULE,
 	.read = generic_read_dir,
@@ -182,19 +174,9 @@ char *railfs_child_path(struct inode *dir, struct dentry *dentry)
 }
 
 
-
-
-
-
-
-
-
 const struct dentry_operations railfs_dentry_ops = {
 	.d_revalidate = railfs_revalidate,
 };
-
-
-
 
 
 const struct inode_operations railfs_dir_inode_ops = {
@@ -220,10 +202,6 @@ const struct inode_operations railfs_link_inode_ops = {
 	.setattr = railfs_setattr,
 	.getattr = simple_getattr,
 };
-
-
-
-
 
 
 static const struct super_operations railfs_super_ops = {
