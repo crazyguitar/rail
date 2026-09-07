@@ -185,6 +185,10 @@ struct ListReply {
   uint64_t Id = 0;
   bool Found = false;
   std::vector<ListEntry> Entries;
+  // The directory and the one above it, which are not entries but which a
+  // caller naming "." and ".." must answer for.
+  FileAttrs Self;
+  FileAttrs Parent;
 };
 
 struct OpenRequest {
@@ -267,7 +271,13 @@ enum class MetaOp : uint16_t {
   Symlink = 9,
   ReadLink = 10,
   HardLink = 11,
+  // Brings a file into existence, or empties one that is there.
+  Create = 12,
 };
+
+// A create asking for no particular mode: one already there keeps its
+// permissions, a new one takes the usual default.
+inline constexpr uint32_t kKeepMode = 0xFFFFFFFFu;
 
 struct MetaRequest {
   uint64_t Id = 0;
@@ -287,6 +297,9 @@ struct MetaReply {
   // What a link points at, for ReadLink. Empty for every other operation.
   std::string Target;
   uint32_t Errno = 0;
+  // What the peer holds for the path this acted on. Ino is zero when there is
+  // nothing to report, as for a removal.
+  FileAttrs Attrs;
 };
 
 struct StatFsRequest {

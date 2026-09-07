@@ -47,11 +47,11 @@ Coro<Result<void>> metadataRound(FileClient &Client, const std::string &Name, si
       break;
     }
     case MetadataOp::SetMode:
-      if (auto Changed = co_await Client.setMode(Name, 0644); !Changed) co_return Changed;
+      if (auto Changed = co_await Client.setMode(Name, 0644); !Changed) co_return std::unexpected(Changed.error());
       break;
     case MetadataOp::Truncate:
       // Keep the shared data fixture's size and contents intact.
-      if (auto Changed = co_await Client.truncate(Name, Size); !Changed) co_return Changed;
+      if (auto Changed = co_await Client.truncate(Name, Size); !Changed) co_return std::unexpected(Changed.error());
       break;
     case MetadataOp::StatFs: {
       auto Seen = co_await Client.statFs(Name);

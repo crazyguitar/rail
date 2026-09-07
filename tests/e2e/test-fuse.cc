@@ -660,6 +660,38 @@ TEST_P(Mount, ConcurrentReadersStayCorrectWithoutStreaming) {
   expectConcurrentReadsStayCorrect();
 }
 
+// What the mount makes comes back whole from the operation's own reply.
+TEST_P(Mount, WhatIsMadeComesBackWhole) {
+  ASSERT_TRUE(std::filesystem::create_directory(At / "asked-once"));
+  struct ::stat Dir{};
+  ASSERT_EQ(::stat((At / "asked-once").c_str(), &Dir), 0) << std::strerror(errno);
+  EXPECT_TRUE(S_ISDIR(Dir.st_mode));
+  EXPECT_NE(Dir.st_ino, 0u);
+
+  {
+    std::ofstream Out(At / "asked-once.bin");
+    Out << "made";
+  }
+  struct ::stat Made{};
+  ASSERT_EQ(::stat((At / "asked-once.bin").c_str(), &Made), 0) << std::strerror(errno);
+  EXPECT_TRUE(S_ISREG(Made.st_mode)) << "a created file came back as something else";
+  EXPECT_NE(Made.st_ino, Dir.st_ino);
+
+  // Reopened, the numbers have to be the ones the peer holds, not any this
+  // mount invented while it had no answer.
+  struct ::stat Again{};
+  ASSERT_EQ(::stat((At / "asked-once.bin").c_str(), &Again), 0);
+  EXPECT_EQ(Again.st_ino, Made.st_ino) << "the file reported one number when made and another when asked";
+
+  ::DIR *Open = ::opendir((At / "asked-once").c_str());
+  ASSERT_NE(Open, nullptr) << std::strerror(errno);
+  uint64_t Dot = 0;
+  while (::dirent *E = ::readdir(Open))
+    if (std::string(E->d_name) == ".") Dot = E->d_ino;
+  ::closedir(Open);
+  EXPECT_EQ(Dot, Dir.st_ino) << "dot did not match the directory a stat reports";
+}
+
 TEST_P(Mount, ListsTheDirectory) {
   std::vector<std::string> Names;
   for (const auto &E : std::filesystem::directory_iterator(At)) Names.push_back(E.path().filename().string());

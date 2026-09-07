@@ -865,6 +865,101 @@ TEST_P(Service, AttributesCarryTheOwnerTheDaemonSaw) {
   run((*C)->close());
 }
 
+// An operation says what the peer then holds, so a caller need not ask. The
+// second call it replaces could fail after the work had already succeeded.
+TEST_P(Service, MakingSomethingAnswersForWhatItMade) {
+  auto C = client();
+  ASSERT_TRUE(C) << C.error().message();
+
+  const auto agrees = [&](const proto::FileAttrs &Made, const std::string &Named, const char *What) {
+    EXPECT_NE(Made.Ino, 0u) << What << " answered with no identity";
+    auto Seen = run((*C)->stat(Named));
+    ASSERT_TRUE(Seen) << Seen.error().message();
+    ASSERT_TRUE(Seen->Found) << What << " is not there";
+    EXPECT_EQ(Made.Ino, Seen->Attrs.Ino) << What << " named a different file than a stat finds";
+    EXPECT_EQ(Made.Dev, Seen->Attrs.Dev) << What << " named a different filesystem";
+    EXPECT_EQ(Made.Mode, Seen->Attrs.Mode) << What << " reported a mode a stat does not";
+    EXPECT_EQ(Made.Directory, Seen->Attrs.Directory) << What << " reported the wrong kind";
+  };
+
+  auto Dir = run((*C)->makeDirectory("answered-dir", 0755));
+  ASSERT_TRUE(Dir) << Dir.error().message();
+  ASSERT_NO_FATAL_FAILURE(agrees(*Dir, "answered-dir", "mkdir"));
+  EXPECT_TRUE(Dir->Directory) << "mkdir answered with something that is not a directory";
+  EXPECT_EQ(Dir->Mode, 0755u) << "mkdir did not leave the mode it was given";
+
+  // Asked for, not assumed: the umask of whoever runs the daemon must not
+  // reach the file, and a mode of nothing is a mode.
+  auto Made = run((*C)->createFile("answered-file.bin", 0640));
+  ASSERT_TRUE(Made) << Made.error().message();
+  ASSERT_NO_FATAL_FAILURE(agrees(*Made, "answered-file.bin", "create"));
+  EXPECT_FALSE(Made->Directory);
+  EXPECT_EQ(Made->Mode, 0640u) << "create did not leave the mode it was given";
+
+  auto Sealed = run((*C)->createFile("answered-sealed.bin", 0));
+  ASSERT_TRUE(Sealed) << Sealed.error().message();
+  EXPECT_EQ(Sealed->Mode, 0u) << "a mode of nothing was taken for no mode at all";
+
+  // Over one that is already there, where open() would leave the old mode.
+  auto Again = run((*C)->createFile("answered-file.bin", 0600));
+  ASSERT_TRUE(Again) << Again.error().message();
+  EXPECT_EQ(Again->Mode, 0600u) << "creating over a file left it with the mode it had";
+  EXPECT_EQ(Again->Ino, Made->Ino) << "creating over a file should keep the file";
+
+  // And asking for no mode changes none.
+  auto Kept = run((*C)->createFile("answered-file.bin", proto::kKeepMode));
+  ASSERT_TRUE(Kept) << Kept.error().message();
+  EXPECT_EQ(Kept->Mode, 0600u) << "a create that named no mode widened the file it truncated";
+
+  auto Link = run((*C)->makeLink("answered-link", "answered-file.bin"));
+  ASSERT_TRUE(Link) << Link.error().message();
+  ASSERT_NO_FATAL_FAILURE(agrees(*Link, "answered-link", "symlink"));
+  EXPECT_TRUE(Link->Link) << "symlink answered with something that is not a link";
+
+  auto Second = run((*C)->hardLink("answered-file.bin", "answered-again.bin"));
+  ASSERT_TRUE(Second) << Second.error().message();
+  ASSERT_NO_FATAL_FAILURE(agrees(*Second, "answered-again.bin", "hard link"));
+  EXPECT_EQ(Second->Ino, Made->Ino) << "a second name for one file should share its identity";
+
+  auto Cut = run((*C)->truncate("answered-file.bin", 0));
+  ASSERT_TRUE(Cut) << Cut.error().message();
+  ASSERT_NO_FATAL_FAILURE(agrees(*Cut, "answered-file.bin", "truncate"));
+
+  run((*C)->close());
+}
+
+// A listing answers for the directory it lists and the one above it, which are
+// not entries of it. Without these the mounts asked twice more.
+TEST_P(Service, AListingAnswersForItselfAndItsParent) {
+  ASSERT_TRUE(peer().makeDirectory(Root + "/listed"));
+  ASSERT_TRUE(peer().makeDirectory(Root + "/listed/inner"));
+
+  auto C = client();
+  ASSERT_TRUE(C) << C.error().message();
+
+  auto Listed = run((*C)->list("listed"));
+  ASSERT_TRUE(Listed) << Listed.error().message();
+  ASSERT_TRUE(Listed->Found);
+
+  auto Itself = run((*C)->stat("listed"));
+  ASSERT_TRUE(Itself) << Itself.error().message();
+  auto Above = run((*C)->stat("."));
+  ASSERT_TRUE(Above) << Above.error().message();
+
+  EXPECT_NE(Listed->Self.Ino, 0u) << "a listing should say which directory it read";
+  EXPECT_EQ(Listed->Self.Ino, Itself->Attrs.Ino) << "the listing named a different directory than a stat finds";
+  EXPECT_TRUE(Listed->Self.Directory);
+
+  EXPECT_NE(Listed->Parent.Ino, 0u) << "a listing should say what is above it";
+  EXPECT_EQ(Listed->Parent.Ino, Above->Attrs.Ino) << "the listing named a different parent than a stat finds";
+
+  auto Missing = run((*C)->list("no-such-directory"));
+  ASSERT_TRUE(Missing) << Missing.error().message();
+  EXPECT_FALSE(Missing->Found) << "a listing of nothing should not claim to have read a directory";
+
+  run((*C)->close());
+}
+
 // A streamed transfer and plain reads on one client, overlapped, so the pages
 // of one and the replies of the other are in flight together. Both have to
 // come back whole.
@@ -1029,7 +1124,8 @@ TEST_P(Service, ALeasedTruncateDoesNotStallOtherSessions) {
   ASSERT_TRUE(Ready);
   ASSERT_EQ(*Ready, "ready");
 
-  auto Pending = (*Mutating)->truncate("leased.bin", 0);
+  const std::string Leased = "leased.bin";
+  auto Pending = (*Mutating)->truncate(Leased, 0);
   Pending.start();
   auto Blocked = Holder->readLine();
   ASSERT_TRUE(Blocked);
@@ -1045,8 +1141,60 @@ TEST_P(Service, ALeasedTruncateDoesNotStallOtherSessions) {
   EXPECT_TRUE(Released);
   if (Released) EXPECT_EQ(*Released, "released") << "truncate stalled the serving loop";
 
-  auto Collect = [](Coro<Result<void>> &Task) -> Coro<Result<void>> { co_return co_await Task.join(); };
+  auto Collect = [](Coro<Result<proto::FileAttrs>> &Task) -> Coro<Result<void>> {
+    if (auto Done = co_await Task.join(); !Done) co_return std::unexpected(Done.error());
+    co_return Result<void>{};
+  };
   EXPECT_TRUE(run(Collect(Pending)));
+  run((*Mutating)->close());
+  run((*Other)->close());
+}
+
+// A create empties a file that is there, so a read lease on it must break
+// first, and waiting for that on the serving loop would hold every session.
+TEST_P(Service, ALeasedCreateDoesNotStallOtherSessions) {
+  const auto Local = makeFile("service-leased-create.bin", 4096, 95);
+  seedRemote(Local, Root + "/leased-create.bin");
+  seedRemote(Local, Root + "/beside-create.bin");
+  auto Mutating = client();
+  ASSERT_TRUE(Mutating);
+  auto Other = client();
+  ASSERT_TRUE(Other);
+
+  const auto Helper = serviceBinary().parent_path().parent_path().parent_path() / "tests/e2e/rail-lease-holder";
+  const std::string Release = Root + "/release-create-lease";
+  auto Holder = peer().run({Helper.string(), Root + "/leased-create.bin", Release});
+  ASSERT_TRUE(Holder) << Holder.error().message();
+  auto Ready = Holder->readLine();
+  ASSERT_TRUE(Ready);
+  ASSERT_EQ(*Ready, "ready");
+
+  // Named, not a literal: the path is taken by reference and the operation
+  // runs after this statement, by which time a temporary would be gone.
+  const std::string Leased = "leased-create.bin";
+  auto Pending = (*Mutating)->createFile(Leased, 0644);
+  Pending.start();
+  auto Blocked = Holder->readLine();
+  ASSERT_TRUE(Blocked);
+  ASSERT_EQ(*Blocked, "blocked");
+
+  // Only a reply on the unrelated session can release the lease. An inline
+  // create deadlocks this handshake until the helper's failure timeout.
+  auto Seen = run((*Other)->stat("beside-create.bin"));
+  EXPECT_TRUE(Seen);
+  if (Seen) EXPECT_TRUE(Seen->Found);
+  EXPECT_TRUE(peer().makeDirectory(Release));
+  auto Released = Holder->readLine();
+  EXPECT_TRUE(Released);
+  if (Released) EXPECT_EQ(*Released, "released") << "create stalled the serving loop";
+
+  auto Collect = [](Coro<Result<proto::FileAttrs>> &Task) -> Coro<Result<void>> {
+    if (auto Done = co_await Task.join(); !Done) co_return std::unexpected(Done.error());
+    co_return Result<void>{};
+  };
+  auto Made = run(Collect(Pending));
+  EXPECT_TRUE(Made) << (Made ? "" : Made.error().message());
+
   run((*Mutating)->close());
   run((*Other)->close());
 }

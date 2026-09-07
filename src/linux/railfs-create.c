@@ -16,6 +16,7 @@ int railfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 {
 	struct railfs_options *opts = dir->i_sb->s_fs_info;
 	struct railfs_attrs attrs = {};
+	struct railfs_meta_req req = { .op = RAILFS_META_CREATE, .made = &attrs };
 	struct inode *inode = NULL;
 	char *path;
 	int err;
@@ -29,15 +30,21 @@ int railfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 		return -ENOMEM;
 	}
 
-	err = railfs_pool_create_file(opts->pool, path);
+	req.path = path;
+	req.mode = mode & RAILFS_MODE_BITS;
+
+	err = railfs_pool_meta_send(opts->pool, &req);
 	if (err) {
 		goto out;
 	}
 
-	attrs.mode = mode & RAILFS_MODE_BITS;
-	err = railfs_attrs_of_new(opts, path, &attrs);
-	if (err) {
-		goto out;
+	// Zeroed attributes are not attributes: a mode of nothing describes a
+	// file this mount would then instantiate wrongly.
+	if (!attrs.ino) {
+		err = railfs_attrs_of_new(opts, path, &attrs);
+		if (err) {
+			goto out;
+		}
 	}
 
 	inode = railfs_inode_for(dir->i_sb, &attrs, path);

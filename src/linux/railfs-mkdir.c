@@ -18,6 +18,7 @@ struct dentry *railfs_mkdir_op(struct mnt_idmap *idmap, struct inode *dir, struc
 {
 	struct railfs_options *opts = dir->i_sb->s_fs_info;
 	struct railfs_attrs attrs = {};
+	struct railfs_meta_req req = { .op = RAILFS_META_MKDIR, .made = &attrs };
 	struct inode *inode = NULL;
 	struct dentry *result = NULL;
 	char *path;
@@ -32,18 +33,22 @@ struct dentry *railfs_mkdir_op(struct mnt_idmap *idmap, struct inode *dir, struc
 		return ERR_PTR(-ENOMEM);
 	}
 
-	err = railfs_pool_meta(opts->pool, RAILFS_META_MKDIR, path, 0);
+	req.path = path;
+
+	err = railfs_pool_meta_send(opts->pool, &req);
 	if (err) {
 		result = ERR_PTR(err);
 		goto out;
 	}
 
-	attrs.mode = mode & RAILFS_MODE_BITS;
-	attrs.directory = 1;
-	err = railfs_attrs_of_new(opts, path, &attrs);
-	if (err) {
-		result = ERR_PTR(err);
-		goto out;
+	// Zeroed attributes are not attributes: a mode of nothing describes a
+	// plain file, so ask rather than instantiate one.
+	if (!attrs.ino) {
+		err = railfs_attrs_of_new(opts, path, &attrs);
+		if (err) {
+			result = ERR_PTR(err);
+			goto out;
+		}
 	}
 
 	inode = railfs_inode_for(dir->i_sb, &attrs, path);

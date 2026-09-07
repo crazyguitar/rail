@@ -108,6 +108,10 @@ struct railfs_meta_req {
 	u32 mode;
 	s64 mtime;
 	char **link;
+	/* Filled from the reply when the peer reported them, so a caller that
+	 * has just made something need not ask what it is.
+	 */
+	struct railfs_attrs *made;
 };
 
 int railfs_meta_send(struct railfs_conn *conn, const struct railfs_meta_req *req);

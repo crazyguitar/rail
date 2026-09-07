@@ -453,7 +453,7 @@ proto::MetaRequest metaOf(proto::MetaOp Op, const std::string &Path) {
 
 } // namespace
 
-Coro<Result<void>> FileClient::sendMeta(const proto::MetaRequest &Given) {
+Coro<Result<proto::FileAttrs>> FileClient::sendMeta(const proto::MetaRequest &Given) {
   proto::MetaRequest Meta = Given;
   Meta.Id = P->NextId++;
 
@@ -463,20 +463,32 @@ Coro<Result<void>> FileClient::sendMeta(const proto::MetaRequest &Given) {
   auto Reply = asReply<proto::MetaReply>(co_await Ex.wait());
   if (!Reply) co_return std::unexpected(Reply.error());
   if (!Reply->Ok) co_return refusal(*Reply);
-  co_return Result<void>{};
+  co_return Reply->Attrs;
 }
 
-Coro<Result<void>> FileClient::makeDirectory(const std::string &Path, uint32_t Mode) {
+Coro<Result<proto::FileAttrs>> FileClient::createFile(const std::string &Path, uint32_t Mode) {
+  auto Meta = metaOf(proto::MetaOp::Create, Path);
+  Meta.Mode = Mode;
+  co_return co_await sendMeta(Meta);
+}
+
+Coro<Result<proto::FileAttrs>> FileClient::makeDirectory(const std::string &Path, uint32_t Mode) {
   auto Meta = metaOf(proto::MetaOp::MakeDirectory, Path);
   Meta.Mode = Mode;
   co_return co_await sendMeta(Meta);
 }
 
-Coro<Result<void>> FileClient::removeFile(const std::string &Path) { co_return co_await sendMeta(metaOf(proto::MetaOp::RemoveFile, Path)); }
+Coro<Result<void>> FileClient::removeFile(const std::string &Path) {
+  if (auto R = co_await sendMeta(metaOf(proto::MetaOp::RemoveFile, Path)); !R) co_return std::unexpected(R.error());
+  co_return Result<void>{};
+}
 
-Coro<Result<void>> FileClient::removeDirectory(const std::string &Path) { co_return co_await sendMeta(metaOf(proto::MetaOp::RemoveDirectory, Path)); }
+Coro<Result<void>> FileClient::removeDirectory(const std::string &Path) {
+  if (auto R = co_await sendMeta(metaOf(proto::MetaOp::RemoveDirectory, Path)); !R) co_return std::unexpected(R.error());
+  co_return Result<void>{};
+}
 
-Coro<Result<void>> FileClient::makeLink(const std::string &Path, const std::string &Target) {
+Coro<Result<proto::FileAttrs>> FileClient::makeLink(const std::string &Path, const std::string &Target) {
   auto Meta = metaOf(proto::MetaOp::Symlink, Path);
   Meta.Target = Target;
   co_return co_await sendMeta(Meta);
@@ -497,7 +509,7 @@ Coro<Result<std::string>> FileClient::readLink(const std::string &Path) {
   co_return Reply->Target;
 }
 
-Coro<Result<void>> FileClient::hardLink(const std::string &Path, const std::string &Target) {
+Coro<Result<proto::FileAttrs>> FileClient::hardLink(const std::string &Path, const std::string &Target) {
   auto Meta = metaOf(proto::MetaOp::HardLink, Path);
   Meta.Target = Target;
   co_return co_await sendMeta(Meta);
@@ -506,22 +518,23 @@ Coro<Result<void>> FileClient::hardLink(const std::string &Path, const std::stri
 Coro<Result<void>> FileClient::rename(const std::string &From, const std::string &To) {
   auto Meta = metaOf(proto::MetaOp::Rename, From);
   Meta.Target = To;
-  co_return co_await sendMeta(Meta);
+  if (auto R = co_await sendMeta(Meta); !R) co_return std::unexpected(R.error());
+  co_return Result<void>{};
 }
 
-Coro<Result<void>> FileClient::truncate(const std::string &Path, uint64_t Size) {
+Coro<Result<proto::FileAttrs>> FileClient::truncate(const std::string &Path, uint64_t Size) {
   auto Meta = metaOf(proto::MetaOp::Truncate, Path);
   Meta.Size = Size;
   co_return co_await sendMeta(Meta);
 }
 
-Coro<Result<void>> FileClient::setMode(const std::string &Path, uint32_t Mode) {
+Coro<Result<proto::FileAttrs>> FileClient::setMode(const std::string &Path, uint32_t Mode) {
   auto Meta = metaOf(proto::MetaOp::SetMode, Path);
   Meta.Mode = Mode;
   co_return co_await sendMeta(Meta);
 }
 
-Coro<Result<void>> FileClient::setMtime(const std::string &Path, int64_t Mtime) {
+Coro<Result<proto::FileAttrs>> FileClient::setMtime(const std::string &Path, int64_t Mtime) {
   auto Meta = metaOf(proto::MetaOp::SetMtime, Path);
   Meta.Mtime = Mtime;
   co_return co_await sendMeta(Meta);
@@ -530,7 +543,8 @@ Coro<Result<void>> FileClient::setMtime(const std::string &Path, int64_t Mtime) 
 Coro<Result<void>> FileClient::fsync(const std::string &Path, uint64_t Handle) {
   proto::MetaRequest Meta = metaOf(proto::MetaOp::Fsync, Path);
   Meta.Handle = Handle;
-  co_return co_await sendMeta(Meta);
+  if (auto R = co_await sendMeta(Meta); !R) co_return std::unexpected(R.error());
+  co_return Result<void>{};
 }
 
 Coro<Result<proto::StatFsReply>> FileClient::statFs(const std::string &Path) {

@@ -658,6 +658,30 @@ TEST_P(Nfs, CreateMakesAFileThatLookupFinds) {
   EXPECT_EQ(Found.size(), kHandleSize);
 }
 
+// An unchecked create names no attributes, so it empties the file without
+// touching who may read it.
+TEST_P(Nfs, CreateWithoutAttributesLeavesThePermissions) {
+  ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
+  ASSERT_TRUE(peer().run({"bash", "-c", "echo guarded > " + Root + "/guarded.bin && chmod 600 " + Root + "/guarded.bin"}));
+  runOnPeerToCompletion({"true"});
+
+  nfs::XdrWriter Args;
+  Args.opaque(RootHandle);
+  Args.text("guarded.bin");
+  Args.u32(0);
+  putNoAttrs(Args);
+  auto R = Probe.call(nfs::kNfsProgram, kNfsCreate, Args.bytes());
+  ASSERT_TRUE(R) << R.error().message();
+  nfs::XdrReader Body(R->Body);
+  ASSERT_EQ(Body.u32(), 0u);
+
+  auto Seen = peer().run({"stat", "-c", "%a", Root + "/guarded.bin"});
+  ASSERT_TRUE(Seen) << "could not stat the file on the peer";
+  auto Line = Seen->readLine();
+  ASSERT_TRUE(Line);
+  EXPECT_EQ(*Line, "600") << "a create that named no mode changed the permissions";
+}
+
 TEST_P(Nfs, CommitOnAFileAnswersOk) {
   ASSERT_NO_FATAL_FAILURE(mountThroughProbe());
 

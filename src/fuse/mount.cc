@@ -226,9 +226,12 @@ int errnoOf(const Error &Why) {
   return std::find(std::begin(kAnswerable), std::end(kAnswerable), Number) != std::end(kAnswerable) ? Number : EIO;
 }
 
-// What the peer holds for a name just made here. A number invented instead
-// would be one no later stat agrees with, so a failure is answered.
-Coro<Result<proto::FileAttrs>> attrsOfNew(vfs::Remotes::Lease &Held, const std::string &Path) {
+// What the peer holds for a name just made. Its reply carries this, so only a
+// peer that could not read it back costs a question: zeroed attributes
+// describe a plain file of mode nothing, which must not be instantiated.
+Coro<Result<proto::FileAttrs>> orAsk(vfs::Remotes::Lease &Held, const std::string &Path, Result<proto::FileAttrs> Made) {
+  if (!Made || Made->Ino != 0) co_return Made;
+
   auto Seen = co_await Held.client().stat(Path);
   if (!Seen) co_return std::unexpected(Seen.error());
   if (!Seen->Found) co_return failMessage("the peer lost a name it had just made");
@@ -686,21 +689,26 @@ Coro<void> doOpenDir(Mount &M, ::fuse_req_t Req, ::fuse_ino_t Ino, ::fuse_file_i
 
   Shard::OpenDir Open;
   Open.Entries = std::move(Entries);
-  auto Self = co_await Held->client().stat(pathOf(M, Ino));
-  auto Above = co_await Held->client().stat(parentPathOf(M, Ino));
-  if (!Self || !Above) {
-    Held->discard();
-    ::fuse_reply_err(Req, EIO);
-    co_return;
+  // The listing answers for both, so dot and dot-dot cost nothing more. Above
+  // the mount's own root is outside it, so there the root stands for both.
+  Open.Self = Listed->Self;
+  Open.Parent = Ino == kRootIno ? Listed->Self : Listed->Parent;
+
+  // Only when the peer could not read the one above back, and a directory
+  // whose parent has gone since is not one this can answer for.
+  if (Open.Parent.Ino == 0) {
+    auto Above = co_await Held->client().stat(parentPathOf(M, Ino));
+    if (!Above) {
+      Held->discard();
+      ::fuse_reply_err(Req, EIO);
+      co_return;
+    }
+    if (!Above->Found) {
+      ::fuse_reply_err(Req, ENOENT);
+      co_return;
+    }
+    Open.Parent = Above->Attrs;
   }
-  // Gone between the listing and this: caching nothing would hand out the
-  // made-up numbers the stat is here to avoid.
-  if (!Self->Found || !Above->Found) {
-    ::fuse_reply_err(Req, ENOENT);
-    co_return;
-  }
-  Open.Self = Self->Attrs;
-  Open.Parent = Above->Attrs;
 
   const uint64_t Handle = shard(M).NextDir++;
   shard(M).OpenDirs.emplace(Handle, std::move(Open));
@@ -1223,13 +1231,8 @@ Coro<void> doCreate(Mount &M, ::fuse_req_t Req, ::fuse_ino_t Parent, std::string
     co_return;
   }
 
-  if (auto W = co_await Held->client().write(Path, 0, {}, true); !W) {
-    Held->discard();
-    releaseIno(M, Parent, Name);
-    ::fuse_reply_err(Req, EIO);
-    co_return;
-  }
-  if (auto C = co_await Held->client().setMode(Path, Mode & 07777); !C) {
+  auto Made = co_await orAsk(*Held, Path, co_await Held->client().createFile(Path, Mode & 07777));
+  if (!Made) {
     Held->discard();
     releaseIno(M, Parent, Name);
     ::fuse_reply_err(Req, EIO);
@@ -1244,14 +1247,6 @@ Coro<void> doCreate(Mount &M, ::fuse_req_t Req, ::fuse_ino_t Parent, std::string
 
   if (auto Opened = co_await Held->client().openFile(Path, true); Opened && Opened->Ok)
     F.OnSlot[Held->index()] = {Opened->Handle, Held->generation()};
-
-  auto Made = co_await attrsOfNew(*Held, Path);
-  if (!Made) {
-    Held->discard();
-    releaseIno(M, Parent, Name);
-    ::fuse_reply_err(Req, EIO);
-    co_return;
-  }
 
   ::fuse_entry_param E{};
   E.ino = insertIno(M, Parent, Name);
@@ -1309,16 +1304,10 @@ Coro<void> doMakeDirectory(Mount &M, ::fuse_req_t Req, ::fuse_ino_t Parent, std:
     co_return;
   }
 
-  if (auto R = co_await Held->client().makeDirectory(Path, Mode & 07777); !R) {
-    Held->discard();
-    ::fuse_reply_err(Req, errnoOf(R.error()));
-    co_return;
-  }
-
-  auto Made = co_await attrsOfNew(*Held, Path);
+  auto Made = co_await orAsk(*Held, Path, co_await Held->client().makeDirectory(Path, Mode & 07777));
   if (!Made) {
     Held->discard();
-    ::fuse_reply_err(Req, EIO);
+    ::fuse_reply_err(Req, errnoOf(Made.error()));
     co_return;
   }
 
@@ -1368,16 +1357,10 @@ Coro<void> doSymlink(Mount &M, ::fuse_req_t Req, std::string Target, ::fuse_ino_
     co_return;
   }
 
-  if (auto R = co_await Held->client().makeLink(Path, Target); !R) {
-    Held->discard();
-    ::fuse_reply_err(Req, errnoOf(R.error()));
-    co_return;
-  }
-
-  auto Made = co_await attrsOfNew(*Held, Path);
+  auto Made = co_await orAsk(*Held, Path, co_await Held->client().makeLink(Path, Target));
   if (!Made) {
     Held->discard();
-    ::fuse_reply_err(Req, EIO);
+    ::fuse_reply_err(Req, errnoOf(Made.error()));
     co_return;
   }
 
@@ -1406,20 +1389,10 @@ Coro<void> doHardLink(Mount &M, ::fuse_req_t Req, ::fuse_ino_t Ino, ::fuse_ino_t
     co_return;
   }
 
-  if (auto R = co_await Held->client().hardLink(Path, Second); !R) {
+  auto Made = co_await orAsk(*Held, Second, co_await Held->client().hardLink(Path, Second));
+  if (!Made) {
     Held->discard();
-    ::fuse_reply_err(Req, errnoOf(R.error()));
-    co_return;
-  }
-
-  auto Info = co_await Held->client().stat(Second);
-  if (!Info) {
-    Held->discard();
-    ::fuse_reply_err(Req, errnoOf(Info.error()));
-    co_return;
-  }
-  if (!Info->Found) {
-    ::fuse_reply_err(Req, ENOENT);
+    ::fuse_reply_err(Req, errnoOf(Made.error()));
     co_return;
   }
 
@@ -1427,7 +1400,7 @@ Coro<void> doHardLink(Mount &M, ::fuse_req_t Req, ::fuse_ino_t Ino, ::fuse_ino_t
   E.ino = insertIno(M, Parent, Name);
   E.attr_timeout = M.Opts.AttrTimeout;
   E.entry_timeout = M.Opts.EntryTimeout;
-  fillRemoteAttr(E.attr, E.ino, Info->Attrs);
+  fillRemoteAttr(E.attr, E.ino, *Made);
   ::fuse_reply_entry(Req, &E);
 }
 

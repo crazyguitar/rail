@@ -18,8 +18,8 @@ int railfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *den
 {
 	struct inode *inode = d_inode(old_dentry);
 	struct railfs_options *opts = dir->i_sb->s_fs_info;
-	struct railfs_meta_req req = { .op = RAILFS_META_HARDLINK };
 	struct railfs_attrs attrs = {};
+	struct railfs_meta_req req = { .op = RAILFS_META_HARDLINK, .made = &attrs };
 	struct railfs_path *first = NULL;
 	struct inode *second;
 	char *path = NULL;
@@ -55,15 +55,17 @@ int railfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *den
 
 	// A second inode, not a second reference: an inode here remembers the one
 	// path its reads ask for, so sharing it makes the surviving name
-	// unreadable once the other is unlinked.
-	attrs.size = i_size_read(inode);
-	attrs.mode = inode->i_mode & RAILFS_MODE_BITS;
-	attrs.mtime = inode_get_mtime_sec(inode);
-	attrs.links = inode->i_nlink + 1;
-
-	err = railfs_attrs_of_new(opts, path, &attrs);
-	if (err) {
-		goto out;
+	// unreadable once the other is unlinked. The peer's own answer stands
+	// where it gave one; these are a guess for where it did not.
+	if (!attrs.ino) {
+		attrs.size = i_size_read(inode);
+		attrs.mode = inode->i_mode & RAILFS_MODE_BITS;
+		attrs.mtime = inode_get_mtime_sec(inode);
+		attrs.links = inode->i_nlink + 1;
+		err = railfs_attrs_of_new(opts, path, &attrs);
+		if (err) {
+			goto out;
+		}
 	}
 
 	second = railfs_inode_for(dir->i_sb, &attrs, path);

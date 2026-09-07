@@ -48,6 +48,8 @@
 #define RAILFS_META_SYMLINK 9
 #define RAILFS_META_READLINK 10
 #define RAILFS_META_HARDLINK 11
+/* Brings a file into existence, or empties one that is there. */
+#define RAILFS_META_CREATE 12
 
 enum railfs_msg_type {
 	RAILFS_MSG_HELLO = 1,

@@ -555,8 +555,9 @@ int railfs_list(struct railfs_conn *conn, const char *path, struct railfs_dirent
 		goto out;
 	}
 
-	// Smallest an entry can be: a four byte name length and the attributes.
-	// Without this a count off the wire asks for an allocation of any size.
+	// Smallest an entry can be: a four byte name length and the attributes,
+	// and the directory and its parent follow them. Without this a count off
+	// the wire asks for an allocation of any size.
 	if ((u64)n * 54 > payload_len) {
 		err = -EBADMSG;
 		goto out;
@@ -954,6 +955,14 @@ int railfs_meta_send(struct railfs_conn *conn, const struct railfs_meta_req *req
 	}
 	if (!err) {
 		err = railfs_get_u32(&c, &code);
+	}
+	if (!err) {
+		struct railfs_attrs attrs = {};
+
+		err = railfs_get_attrs(&c, &attrs);
+		if (!err && req->made) {
+			*req->made = attrs;
+		}
 	}
 	if (err) {
 		goto out;

@@ -472,6 +472,21 @@ public:
       auto Listed = co_await offLoop([Dir = *Path] { return listDirectory(Dir); });
       Reply.Found = Listed.Found;
       Reply.Entries = std::move(Listed.Entries);
+
+      // Dot and dot-dot are not entries, and two local stats are cheaper than
+      // two round trips. One that cannot be read back was removed as it was
+      // listed, and is answered for as missing.
+      if (Reply.Found) {
+        bool Seen = false;
+        Reply.Self = attrsOf(*Path, Seen);
+        Reply.Found = Seen;
+
+        if (Reply.Found) {
+          bool Above = false;
+          Reply.Parent = *Path == Root ? Reply.Self : attrsOf(Path->parent_path(), Above);
+          if (!Above && *Path != Root) Reply.Parent = proto::FileAttrs{};
+        }
+      }
     }
     co_return co_await Control.send(Reply);
   }
@@ -606,6 +621,21 @@ public:
     Reply.Errno = Why.Code.category() == std::generic_category() ? static_cast<uint32_t>(Why.Code.value()) : EACCES;
   }
 
+  // open() leaves an existing mode alone and filters a new one through the
+  // umask, so what was asked for is set rather than assumed.
+  static Result<void> setModeOf(int Fd, uint32_t Mode) {
+    if (::fchmod(Fd, static_cast<::mode_t>(Mode)) != 0) return failErrno("create");
+    return {};
+  }
+
+  // What the peer now holds for a path just made. Nothing for a removal.
+  static void made(proto::MetaReply &Reply, const std::filesystem::path &Path) {
+    if (!Reply.Ok) return;
+    bool Seen = false;
+    auto Attrs = attrsOf(Path, Seen);
+    if (Seen) Reply.Attrs = Attrs;
+  }
+
   static void landed(proto::MetaReply &Reply, int Failed, const char *What) {
     if (Failed == 0) {
       Reply.Ok = true;
@@ -659,6 +689,7 @@ public:
       }
       if (Linking) landed(Reply, ::link(Path->c_str(), Target->c_str()), "link");
       else landed(Reply, ::rename(Path->c_str(), Target->c_str()), "rename");
+      made(Reply, *Target);
       co_return co_await Control.send(Reply);
     }
 
@@ -673,6 +704,7 @@ public:
         ::close(Fd);
         if (!Cut) refused(Reply, fail(std::error_code(Why, std::generic_category()), "truncate").error());
         else Reply.Ok = true;
+        made(Reply, *Path);
         co_return co_await Control.send(Reply);
       }
       if (errno != EWOULDBLOCK) {
@@ -685,6 +717,42 @@ public:
       });
       if (!Done) refused(Reply, Done.error());
       else Reply.Ok = true;
+      made(Reply, *Path);
+      co_return co_await Control.send(Reply);
+    }
+
+    // The open a write would do, without the bytes. Inline unless a lease is
+    // in the way, as truncate does: waiting out a break here would stall every
+    // other session.
+    if (Meta.Op == proto::MetaOp::Create) {
+      // Asked for nothing in particular: one there keeps what it has.
+      const bool Keep = Meta.Mode == proto::kKeepMode;
+      const uint32_t Wanted = Keep ? 0644 : Meta.Mode & 07777;
+
+      const int Fd = ::open(Path->c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NONBLOCK, Wanted);
+      if (Fd >= 0) {
+        auto R = Keep ? Result<void>{} : setModeOf(Fd, Wanted);
+        if (!R) refused(Reply, R.error());
+        else Reply.Ok = true;
+        ::close(Fd);
+        made(Reply, *Path);
+        co_return co_await Control.send(Reply);
+      }
+      if (errno != EWOULDBLOCK) {
+        refused(Reply, failErrno("create").error());
+        co_return co_await Control.send(Reply);
+      }
+
+      auto Done = co_await offLoop([Path = *Path, Wanted, Keep]() -> Result<void> {
+        const int Fd = ::open(Path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, Wanted);
+        if (Fd < 0) return failErrno("create");
+        auto R = Keep ? Result<void>{} : setModeOf(Fd, Wanted);
+        ::close(Fd);
+        return R;
+      });
+      if (!Done) refused(Reply, Done.error());
+      else Reply.Ok = true;
+      made(Reply, *Path);
       co_return co_await Control.send(Reply);
     }
 
@@ -701,6 +769,7 @@ public:
 
     if (auto R = applyMeta(Meta, *Path); !R) refused(Reply, R.error());
     else Reply.Ok = true;
+    made(Reply, *Path);
     co_return co_await Control.send(Reply);
   }
 

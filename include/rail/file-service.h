@@ -92,16 +92,19 @@ public:
   Coro<Result<proto::OpenReply>> openFile(const std::string &Path, bool Writable);
   Coro<Result<void>> closeFile(uint64_t Handle);
 
-  Coro<Result<void>> makeDirectory(const std::string &Path, uint32_t Mode = 0755);
+  // Answers with what the peer then holds, so a caller need not ask.
+  // Brings a file into existence, or empties one that is there.
+  Coro<Result<proto::FileAttrs>> createFile(const std::string &Path, uint32_t Mode = 0644);
+  Coro<Result<proto::FileAttrs>> makeDirectory(const std::string &Path, uint32_t Mode = 0755);
   Coro<Result<void>> removeFile(const std::string &Path);
   Coro<Result<void>> removeDirectory(const std::string &Path);
   Coro<Result<void>> rename(const std::string &From, const std::string &To);
-  Coro<Result<void>> truncate(const std::string &Path, uint64_t Size);
-  Coro<Result<void>> setMode(const std::string &Path, uint32_t Mode);
-  Coro<Result<void>> setMtime(const std::string &Path, int64_t Mtime);
+  Coro<Result<proto::FileAttrs>> truncate(const std::string &Path, uint64_t Size);
+  Coro<Result<proto::FileAttrs>> setMode(const std::string &Path, uint32_t Mode);
+  Coro<Result<proto::FileAttrs>> setMtime(const std::string &Path, int64_t Mtime);
   Coro<Result<void>> fsync(const std::string &Path, uint64_t Handle = 0);
-  Coro<Result<void>> makeLink(const std::string &Path, const std::string &Target);
-  Coro<Result<void>> hardLink(const std::string &Path, const std::string &Target);
+  Coro<Result<proto::FileAttrs>> makeLink(const std::string &Path, const std::string &Target);
+  Coro<Result<proto::FileAttrs>> hardLink(const std::string &Path, const std::string &Target);
   Coro<Result<std::string>> readLink(const std::string &Path);
   Coro<Result<proto::StatFsReply>> statFs(const std::string &Path);
 
@@ -123,7 +126,7 @@ public:
 private:
   struct Impl;
 
-  Coro<Result<void>> sendMeta(const proto::MetaRequest &Meta);
+  Coro<Result<proto::FileAttrs>> sendMeta(const proto::MetaRequest &Meta);
   Coro<Result<uint64_t>>
   submitPosted(const std::string &Path, uint64_t Offset, std::span<std::byte> Into, Page *Landing, size_t Want, uint64_t Handle);
   Coro<Result<uint64_t>> fetchThrough(const std::string &Path, uint64_t Offset, uint64_t Want, PageSink &Landing, uint64_t Handle);

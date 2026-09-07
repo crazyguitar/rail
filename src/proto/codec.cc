@@ -214,6 +214,8 @@ void encode(const Message &M, std::vector<std::byte> &Payload) {
             W.str(E.Name);
             writeAttrs(W, E.Attrs);
           }
+          writeAttrs(W, V.Self);
+          writeAttrs(W, V.Parent);
         } else if constexpr (std::is_same_v<T, ReadRequest>) {
           W.u64(V.Id);
           W.str(V.Path);
@@ -285,6 +287,7 @@ void encode(const Message &M, std::vector<std::byte> &Payload) {
           W.str(V.Error);
           W.str(V.Target);
           W.u32(V.Errno);
+          writeAttrs(W, V.Attrs);
         } else if constexpr (std::is_same_v<T, StatFsRequest>) {
           W.u64(V.Id);
           W.str(V.Path);
@@ -434,6 +437,8 @@ Result<Message> decode(Type T, std::span<const std::byte> Payload) {
       E.Attrs = readAttrs(R);
       V.Entries.push_back(std::move(E));
     }
+    V.Self = readAttrs(R);
+    V.Parent = readAttrs(R);
     M = V;
     break;
   }
@@ -529,6 +534,7 @@ Result<Message> decode(Type T, std::span<const std::byte> Payload) {
     V.Error = R.str();
     V.Target = R.str();
     V.Errno = R.u32();
+    V.Attrs = readAttrs(R);
     M = V;
     break;
   }

@@ -17,8 +17,8 @@
 int railfs_symlink(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, const char *symname)
 {
 	struct railfs_options *opts = dir->i_sb->s_fs_info;
-	struct railfs_meta_req req = { .op = RAILFS_META_SYMLINK, .target = symname };
 	struct railfs_attrs attrs = {};
+	struct railfs_meta_req req = { .op = RAILFS_META_SYMLINK, .target = symname, .made = &attrs };
 	struct inode *inode;
 	char *path;
 	int err;
@@ -39,14 +39,18 @@ int railfs_symlink(struct mnt_idmap *idmap, struct inode *dir, struct dentry *de
 		goto out;
 	}
 
+	// Zeroed attributes are not attributes: a mode of nothing describes a
+	// plain file, so ask rather than instantiate one.
+	if (!attrs.ino) {
+		err = railfs_attrs_of_new(opts, path, &attrs);
+		if (err) {
+			goto out;
+		}
+	}
+
 	attrs.mode = RAILFS_LINK_MODE;
 	attrs.link = 1;
 	attrs.size = strlen(symname);
-
-	err = railfs_attrs_of_new(opts, path, &attrs);
-	if (err) {
-		goto out;
-	}
 
 	inode = railfs_inode_for(dir->i_sb, &attrs, path);
 	if (!inode) {

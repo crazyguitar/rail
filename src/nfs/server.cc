@@ -125,6 +125,17 @@ uint64_t fileIdOf(const proto::FileAttrs &A, const std::string &Path) {
 
 std::string joinPath(const std::string &Parent, const std::string &Name) { return Parent == "." ? Name : Parent + "/" + Name; }
 
+// What the peer holds for a name just made. Its reply carries this, so only a
+// peer that could not read it back costs a question.
+Coro<Result<proto::FileAttrs>> orAsk(vfs::Remotes::Lease &Held, const std::string &Path, Result<proto::FileAttrs> Made) {
+  if (!Made || Made->Ino != 0) co_return Made;
+
+  auto Seen = co_await Held.client().stat(Path);
+  if (!Seen) co_return std::unexpected(Seen.error());
+  if (!Seen->Found) co_return failMessage("the peer lost a name it had just made");
+  co_return Seen->Attrs;
+}
+
 bool insideExport(const std::string &Path, const std::string &Root) {
   if (Path.empty() || Path.front() == '/') return false;
   for (const auto &Part : std::filesystem::path(Path))
@@ -717,14 +728,15 @@ private:
 
     forget(Target);
 
-    auto Info = co_await Held->client().stat(Target);
+    // The operation answered for what it made, so nothing more is asked.
+    auto Info = co_await orAsk(*Held, Target, std::move(Made));
     if (!Info) co_return co_await replyBroken(Conn, C, failureFields(Proc::MakeDirectory), Info.error(), *Held);
 
     XdrWriter W;
     W.u32(kOk);
     W.boolean(true);
     W.opaque(Known.encode(Target));
-    writePostAttrs(W, Info->Attrs, Target);
+    writePostAttrs(W, *Info, Target);
     writeNoWcc(W);
     co_return co_await reply(Conn, C.Xid, W);
   }
@@ -810,14 +822,15 @@ private:
 
     forget(Target);
 
-    auto Info = co_await Held->client().stat(Target);
+    // The operation answered for what it made, so nothing more is asked.
+    auto Info = co_await orAsk(*Held, Target, std::move(Made));
     if (!Info) co_return co_await replyBroken(Conn, C, failureFields(Proc::Symlink), Info.error(), *Held);
 
     XdrWriter W;
     W.u32(kOk);
     W.boolean(true);
     W.opaque(Known.encode(Target));
-    writePostAttrs(W, Info->Attrs, Target);
+    writePostAttrs(W, *Info, Target);
     writeNoWcc(W);
     co_return co_await reply(Conn, C.Xid, W);
   }
@@ -844,12 +857,13 @@ private:
 
     forget(Target);
 
-    auto Info = co_await Held->client().stat(*Existing);
+    // The operation answered for what it made, so nothing more is asked.
+    auto Info = co_await orAsk(*Held, *Existing, std::move(Made));
     if (!Info) co_return co_await replyBroken(Conn, C, failureFields(Proc::Link), Info.error(), *Held);
 
     XdrWriter W;
     W.u32(kOk);
-    writePostAttrs(W, Info->Attrs, *Existing);
+    writePostAttrs(W, *Info, *Existing);
     writeNoWcc(W);
     co_return co_await reply(Conn, C.Xid, W);
   }
@@ -947,24 +961,20 @@ private:
     if (!Seen) co_return co_await replyBroken(Conn, C, failureFields(Proc::Create), Seen.error(), *Held);
     if (Seen->Found && How == 1) co_return co_await replyStatus(Conn, C, kErrExist, failureFields(Proc::Create));
 
-    auto Made = co_await Held->client().write(Target, 0, {}, true);
+    // A create that named no mode leaves an existing file's permissions alone.
+    auto Made = co_await Held->client().createFile(Target, Ask.HasMode ? Ask.Mode : proto::kKeepMode);
     if (!Made) co_return co_await replyBroken(Conn, C, failureFields(Proc::Create), Made.error(), *Held);
-
-    if (Ask.HasMode) {
-      auto Set = co_await Held->client().setMode(Target, Ask.Mode);
-      if (!Set) co_return co_await replyBroken(Conn, C, failureFields(Proc::Create), Set.error(), *Held);
-    }
 
     forget(Target);
 
-    auto Info = co_await Held->client().stat(Target);
+    auto Info = co_await orAsk(*Held, Target, std::move(Made));
     if (!Info) co_return co_await replyBroken(Conn, C, failureFields(Proc::Create), Info.error(), *Held);
 
     XdrWriter W;
     W.u32(kOk);
     W.boolean(true);
     W.opaque(Known.encode(Target));
-    writePostAttrs(W, Info->Attrs, Target);
+    writePostAttrs(W, *Info, Target);
     writeNoWcc(W);
     co_return co_await reply(Conn, C.Xid, W);
   }
@@ -1154,21 +1164,21 @@ private:
       if (!Listed) co_return co_await replyBroken(Conn, C, 1, Listed.error(), *Held);
       if (!Listed->Found) co_return co_await replyStatus(Conn, C, kErrNotDir, 1);
 
-      auto Self = co_await Held->client().stat(*Path);
-      if (!Self) co_return co_await replyBroken(Conn, C, 1, Self.error(), *Held);
-
-      const std::string Up = parentPath(*Path, Opts.Remote.Root);
-      proto::FileAttrs Above = Self->Attrs;
-      if (Up != *Path) {
-        auto Parent = co_await Held->client().stat(Up);
-        if (!Parent) co_return co_await replyBroken(Conn, C, 1, Parent.error(), *Held);
-        Above = Parent->Attrs;
-      }
-
       Listing.Path = *Path;
+      Listing.Self = Listed->Self;
+      // The directory above this export's own root is outside it, so the
+      // answer is clamped here, as the paths are.
+      Listing.Parent = *Path == Opts.Remote.Root ? Listed->Self : Listed->Parent;
+
+      // Only when the peer could not read the one above back, and a directory
+      // whose parent has gone since is not one this can answer for.
+      if (Listing.Parent.Ino == 0) {
+        auto Above = co_await Held->client().stat(parentPath(*Path, Opts.Remote.Root));
+        if (!Above) co_return co_await replyBroken(Conn, C, 1, Above.error(), *Held);
+        if (!Above->Found) co_return co_await replyStatus(Conn, C, kErrNoEnt, 1);
+        Listing.Parent = Above->Attrs;
+      }
       Listing.Entries = std::move(Listed->Entries);
-      Listing.Self = Self->Attrs;
-      Listing.Parent = Above;
       std::ranges::sort(Listing.Entries, [](const proto::ListEntry &A, const proto::ListEntry &B) { return A.Name < B.Name; });
     }
     const std::vector<proto::ListEntry> &Entries = Listing.Entries;
