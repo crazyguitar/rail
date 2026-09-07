@@ -31,6 +31,9 @@ struct File {
   AddressSpace Stream;
   vfs::Window Have;
   vfs::Gate Filling;
+  // One reader refills the stream chunk at a time. Two that both miss it would
+  // otherwise fetch into the same pages and each reply with the other's bytes.
+  vfs::Gate Refilling;
   // One opener at a time. Several readers can now share a session, and two of
   // them arriving on the same one would each open the file and each keep a
   // handle the daemon never hears about again.

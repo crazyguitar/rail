@@ -865,6 +865,58 @@ TEST_P(Service, AttributesCarryTheOwnerTheDaemonSaw) {
   run((*C)->close());
 }
 
+// A streamed transfer and plain reads on one client, overlapped, so the pages
+// of one and the replies of the other are in flight together. Both have to
+// come back whole.
+//
+// This does not force the numbers to collide, which is what kStreamTags now
+// prevents: a request id climbs by one and a page key by a whole page, and a
+// client allows only sixteen reads in flight, so a test cannot steer one onto
+// the other without reaching inside the client. What it does cover is the
+// traffic that would expose such a collision.
+TEST_P(Service, AStreamAndReadsOverlapOnOneClient) {
+  const auto Big = makeFile("service-stream-vs-read.bin", 24u << 20, 91);
+  seedRemote(Big, Root + "/stream-vs-read.bin");
+  const auto Small = makeFile("service-point-read.bin", 64u << 10, 92);
+  seedRemote(Small, Root + "/point-read.bin");
+
+  auto C = client();
+  ASSERT_TRUE(C) << C.error().message();
+
+  const auto Wanted = localBytes(Small);
+  std::vector<std::byte> Landed(std::filesystem::file_size(Big));
+  std::vector<std::vector<std::byte>> Points(24, std::vector<std::byte>(Wanted.size()));
+  std::vector<Result<ReadOutcome>> Seen;
+
+  // Named, not a literal: the path is taken by reference and the transfer
+  // starts after this statement, by which time a temporary would be gone.
+  const std::string Streaming = "stream-vs-read.bin";
+  const std::string Point = "point-read.bin";
+
+  auto Both = [&]() -> Coro<Result<void>> {
+    auto Streamed = (*C)->fetchInto(Streaming, 0, Landed);
+    Streamed.start();
+
+    // While the stream is in flight, and numbering pages as it goes.
+    for (auto &Into : Points) Seen.push_back(co_await (*C)->read(Point, 0, Into));
+
+    auto Done = co_await Streamed.join();
+    if (!Done) co_return std::unexpected(Done.error());
+    co_return Result<void>{};
+  };
+
+  auto Ran = run(Both());
+  ASSERT_TRUE(Ran) << "the streamed transfer failed: " << Ran.error().message();
+
+  EXPECT_EQ(Landed, localBytes(Big)) << "the stream landed bytes that were not its own";
+  for (size_t At = 0; At < Points.size(); At++) {
+    ASSERT_TRUE(Seen[At]) << "point read " << At << " failed: " << Seen[At].error().message();
+    EXPECT_EQ(Points[At], Wanted) << "point read " << At << " was handed a page of the stream";
+  }
+
+  run((*C)->close());
+}
+
 // A client that vanishes without closing would hold its session until the
 // daemon restarts; the socket's keepalive timer is what notices it.
 TEST_P(Service, AnAcceptedSessionHasKeepaliveArmed) {

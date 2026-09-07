@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -32,6 +33,7 @@
 #include <sys/statvfs.h>
 #include <sys/sysmacros.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -424,6 +426,74 @@ protected:
     for (auto &Running : Ranks) Running.join();
   }
 
+  // The readers run in a child, because a read of a wedged mount cannot be
+  // interrupted and the parent can kill what it cannot interrupt.
+  // Every read is compared against the file itself, and a short read or an
+  // error counts against it the same as wrong bytes.
+  static bool everyReadMatches(const std::filesystem::path &Which, const std::vector<std::byte> &Expected) {
+    constexpr size_t kStride = 1u << 20;
+    constexpr size_t kPoint = 4096;
+    constexpr int kPointReads = 400;
+
+    const int Fd = ::open(Which.c_str(), O_RDONLY);
+    if (Fd < 0) return false;
+
+    std::atomic<int> Wrong{0};
+    std::atomic<bool> Stop{false};
+    const auto matches = [&](uint64_t Off, size_t Size) {
+      std::vector<char> Buf(Size);
+      size_t Got = 0;
+      while (Got < Size) {
+        const ssize_t N = ::pread(Fd, Buf.data() + Got, Size - Got, static_cast<off_t>(Off + Got));
+        if (N <= 0) break;
+        Got += static_cast<size_t>(N);
+      }
+      if (Got != Size || !std::equal(Buf.begin(), Buf.end(), reinterpret_cast<const char *>(Expected.data()) + Off)) Wrong++;
+    };
+
+    std::thread Forwards([&] {
+      while (!Stop && Wrong == 0)
+        for (uint64_t Off = 0; !Stop && Off + kStride <= Expected.size(); Off += kStride) matches(Off, kStride);
+    });
+
+    std::mt19937 Rolls(7);
+    for (int I = 0; I < kPointReads && Wrong == 0; I++) matches((Rolls() % (Expected.size() / kPoint)) * kPoint, kPoint);
+
+    Stop = true;
+    Forwards.join();
+    ::close(Fd);
+    return Wrong == 0;
+  }
+
+  // A read of a wedged mount cannot be interrupted, so the parent kills what
+  // it cannot wait for. Nothing when the time runs out.
+  static std::optional<int> endedWithin(::pid_t Child, std::chrono::milliseconds Patience) {
+    const auto Deadline = std::chrono::steady_clock::now() + Patience;
+    int Status = 0;
+    while (std::chrono::steady_clock::now() < Deadline) {
+      if (::waitpid(Child, &Status, WNOHANG) == Child) return Status;
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    ::kill(Child, SIGKILL);
+    ::waitpid(Child, &Status, 0);
+    return std::nullopt;
+  }
+
+  // The readers run in a child so that a mount which stops answering fails
+  // this test rather than holding the suite.
+  void expectConcurrentReadsStayCorrect() {
+    const auto Expected = localBytes(Alpha);
+
+    const ::pid_t Child = ::fork();
+    ASSERT_GE(Child, 0) << "could not fork: " << std::strerror(errno);
+    if (Child == 0) ::_exit(everyReadMatches(At / "alpha.bin", Expected) ? 0 : 1);
+
+    const auto Status = endedWithin(Child, std::chrono::seconds(30));
+    ASSERT_TRUE(Status) << "the mount stopped answering: the readers were still waiting after 30 s";
+    EXPECT_TRUE(WIFEXITED(*Status) && WEXITSTATUS(*Status) == 0) << "a reader saw bytes that were not its own, or a read failed";
+  }
+
   std::vector<std::string> streamArgs(std::vector<std::string> More = {}) {
     std::vector<std::string> Argv{"--page-size", "1", "--pages", "12", "--stream-after", "1", "--stream-chunk", "1", "-v"};
     Argv.insert(Argv.end(), More.begin(), More.end());
@@ -580,35 +650,14 @@ TEST_P(Mount, AFileReadToItsEndReadsTheSameAgain) {
 // about stops the streaming it fills. Neither may see the other's bytes.
 TEST_P(Mount, ConcurrentReadersOnOneHandleStayCorrect) {
   remountWith(streamArgs());
+  expectConcurrentReadsStayCorrect();
+}
 
-  const int Fd = ::open((At / "alpha.bin").c_str(), O_RDONLY);
-  ASSERT_GE(Fd, 0) << std::strerror(errno);
-
-  const auto Expected = localBytes(Alpha);
-  std::atomic<bool> Wrong{false};
-  std::atomic<bool> Stop{false};
-
-  const auto checkAt = [&](uint64_t Off, size_t Size) {
-    std::vector<char> Buf(Size);
-    const ssize_t N = ::pread(Fd, Buf.data(), Size, static_cast<off_t>(Off));
-    if (N <= 0) return;
-    if (!std::equal(Buf.begin(), Buf.begin() + N, reinterpret_cast<const char *>(Expected.data()) + Off)) Wrong = true;
-  };
-
-  std::thread Forwards([&] {
-    for (uint64_t Off = 0; !Stop && Off + (1u << 20) <= Expected.size(); Off += 1u << 20) checkAt(Off, 1u << 20);
-  });
-
-  std::mt19937 Rolls(7);
-  for (int I = 0; I < 400 && !Wrong; I++) {
-    const uint64_t Off = (Rolls() % (Expected.size() / 4096)) * 4096;
-    checkAt(Off, std::min<size_t>(4096, Expected.size() - Off));
-  }
-  Stop = true;
-  Forwards.join();
-
-  EXPECT_FALSE(Wrong) << "a reader saw bytes that were not its own";
-  ::close(Fd);
+// The same with streaming never reached, so the reads take the direct and
+// windowed paths, which claim their landing memory separately.
+TEST_P(Mount, ConcurrentReadersStayCorrectWithoutStreaming) {
+  remountWith({"--page-size", "1", "--pages", "12", "--stream-after", "1024"});
+  expectConcurrentReadsStayCorrect();
 }
 
 TEST_P(Mount, ListsTheDirectory) {

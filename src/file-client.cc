@@ -23,6 +23,15 @@
 
 namespace rail {
 
+namespace {
+// A stream's pages and a request's id are one namespace on the data channel,
+// and the two are counted separately. Kept apart by the top bit, a read can
+// never be handed the frame of a page that happens to share its number. No
+// test forces that collision: it needs an id and a page key to meet, which a
+// caller cannot steer from outside the client.
+constexpr uint64_t kStreamTags = 1ull << 63;
+} // namespace
+
 struct FileClient::Impl {
   proto::ControlChannel Control;
   std::unique_ptr<DataChannel> Channel;
@@ -546,7 +555,7 @@ Coro<Result<uint64_t>> FileClient::fetch(const std::string &Path, const std::fil
 
   proto::FetchRequest F;
   F.Id = P->NextId++;
-  F.TagBase = P->TagCursor;
+  F.TagBase = P->TagCursor | kStreamTags;
   F.Path = Path;
   F.Offset = 0;
   F.Length = ~uint64_t{0};
@@ -595,7 +604,7 @@ Coro<Result<uint64_t>> FileClient::store(const std::filesystem::path &Local, con
 
   proto::StoreRequest St;
   St.Id = P->NextId++;
-  St.TagBase = P->TagCursor;
+  St.TagBase = P->TagCursor | kStreamTags;
   St.Path = Path;
   St.Offset = 0;
   St.Length = Size;
@@ -666,7 +675,7 @@ Coro<Result<uint64_t>> FileClient::fetchThrough(const std::string &Path, uint64_
 
   proto::FetchRequest F;
   F.Id = P->NextId++;
-  F.TagBase = P->TagCursor;
+  F.TagBase = P->TagCursor | kStreamTags;
   F.Path = Path;
   F.Offset = Offset;
   F.Length = Want;
@@ -717,7 +726,7 @@ FileClient::storeThrough(const std::string &Path, uint64_t Offset, uint64_t Leng
 
   proto::StoreRequest St;
   St.Id = P->NextId++;
-  St.TagBase = P->TagCursor;
+  St.TagBase = P->TagCursor | kStreamTags;
   St.Path = Path;
   St.Offset = Offset;
   St.Length = Length;

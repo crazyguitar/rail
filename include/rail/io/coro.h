@@ -86,6 +86,8 @@ public:
   // Waits for a coroutine already begun with start(). Distinct from co_await on
   // the coroutine itself, which resumes it: a started coroutine may be parked
   // on an event, so this only registers a continuation.
+  // One waiter. A started coroutine keeps room for a single continuation, so a
+  // second join would overwrite the first and leave it parked for good.
   auto join() noexcept {
     struct Awaiter {
       HandleType H;

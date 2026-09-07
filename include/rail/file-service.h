@@ -109,6 +109,9 @@ public:
 
   Coro<Result<uint64_t>> fetch(const std::string &Path, const std::filesystem::path &Local);
   Coro<Result<uint64_t>> store(const std::filesystem::path &Local, const std::string &Path);
+  // Every path here is taken by reference and read when the coroutine runs, so
+  // one that is started rather than awaited must be given a name that outlives
+  // it. A temporary is gone by then and the peer is sent whatever is left.
   Coro<Result<uint64_t>> fetchInto(const std::string &Path, uint64_t Offset, std::span<std::byte> Into, uint64_t Handle = 0);
   Coro<Result<uint64_t>> fetchInto(const std::string &Path, uint64_t Offset, AddressSpace &Into, uint64_t Handle = 0);
   Coro<Result<uint64_t>> storeFrom(std::span<const std::byte> From, const std::string &Path, uint64_t Offset, bool Truncate, uint64_t Handle = 0);

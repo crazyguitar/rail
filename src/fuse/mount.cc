@@ -744,7 +744,13 @@ Coro<void> directRead(Mount &M, ::fuse_req_t Req, File &F, size_t Size, uint64_t
     co_return;
   }
 
-  Page *Landing = F.Have.page(Size);
+  // Registered memory of its own, not the file's window: two reads on one
+  // handle take the same page from there and land on top of each other.
+  AddressSpace Own;
+  Own.claim(Memory::get(), Size, 1);
+  const auto Room = Own.at(0, Size);
+  Page *Landing = Room.Where && Room.Where->region() ? Room.Where : nullptr;
+
   std::vector<std::byte> Fallback;
   if (!Landing) Fallback.resize(Size);
 
@@ -892,6 +898,25 @@ void prefetch(Mount &M, File &F) {
                  static_cast<unsigned long long>(Room));
 }
 
+// Reads what the chunk already holds. Nothing here suspends, so no other read
+// can move the chunk out from under it.
+void replyFromStream(Mount &M, ::fuse_req_t Req, File &F, size_t Size, uint64_t Off) {
+  const uint64_t Into = Off - F.StreamStart;
+  const size_t Mine = std::min<size_t>(Size, F.StreamLen - static_cast<size_t>(Into));
+  replyFrom(M, Req, F.Stream, F.StreamStart + Into, Mine);
+}
+
+// Gives the turn back however the read ends, including one that replies and
+// returns from the middle.
+struct Returning {
+  vfs::Gate &G;
+
+  explicit Returning(vfs::Gate &G) : G(G) {}
+  Returning(const Returning &) = delete;
+  Returning &operator=(const Returning &) = delete;
+  ~Returning() { G.give(); }
+};
+
 Coro<void> streamedRead(Mount &M, ::fuse_req_t Req, File &F, size_t Size, uint64_t Off) {
   const uint64_t Chunk = chunkOf(M, F);
   const uint64_t Start = (Off / Chunk) * Chunk;
@@ -903,6 +928,15 @@ Coro<void> streamedRead(Mount &M, ::fuse_req_t Req, File &F, size_t Size, uint64
 
   const uint64_t At = writesTo(M, F.Path);
   if (!F.covers(Off, Size, At)) {
+    co_await F.Refilling.take();
+    const Returning Turn(F.Refilling);
+
+    // Whoever held it may have fetched exactly this chunk while we waited.
+    if (F.covers(Off, Size, At)) {
+      replyFromStream(M, Req, F, Size, Off);
+      co_return;
+    }
+
     if (Start >= F.Size) {
       if (F.CheckedAtSize == F.Size && F.Size != 0) {
         stopStreaming(F);
@@ -950,6 +984,11 @@ Coro<void> streamedRead(Mount &M, ::fuse_req_t Req, File &F, size_t Size, uint64
       const uint64_t Room = std::min<uint64_t>(Chunk, F.Size - Start);
       reserve(F, F.Stream, Room);
 
+      // What the chunk held stops being true the moment the fetch starts
+      // writing over it, and a reader that skipped this turn on a hit would
+      // reply from pages being overwritten.
+      F.StreamLen = 0;
+
       if (M.Opts.Verbose)
         std::fprintf(stderr,
                      "railfs: streaming %s from %llu for %llu\n",
@@ -992,10 +1031,7 @@ Coro<void> streamedRead(Mount &M, ::fuse_req_t Req, File &F, size_t Size, uint64
     co_return;
   }
 
-  const uint64_t Into = Off - F.StreamStart;
-  const size_t Mine = std::min<size_t>(Size, F.StreamLen - static_cast<size_t>(Into));
-  replyFrom(M, Req, F.Stream, F.StreamStart + Into, Mine);
-
+  replyFromStream(M, Req, F, Size, Off);
   prefetch(M, F);
 }
 
@@ -1029,6 +1065,11 @@ Coro<void> doRead(Mount &M, ::fuse_req_t Req, ::fuse_ino_t Ino, size_t Size, uin
 
   const bool NearFrontier = Off + kSequentialSlack >= F->Frontier && Off <= F->Frontier + kSequentialSlack;
   if (!NearFrontier) {
+    // Under the same turn as the refill: a started fetch keeps room for one
+    // continuation, so two readers joining it would lose the first.
+    co_await F->Refilling.take();
+    const Returning Turn(F->Refilling);
+
     co_await settle(*F);
     F->Covered = 0;
     F->Frontier = Off;
