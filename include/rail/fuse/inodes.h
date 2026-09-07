@@ -26,6 +26,8 @@ public:
   void release(Ino Parent, const std::string &Name);
   void forget(Ino I, uint64_t Count);
   std::string path(Ino I) const;
+  // The root is its own parent, so walking up never leaves the export.
+  Ino parent(Ino I) const;
   void reparent(Ino Parent, const std::string &Name, Ino NewParent, const std::string &NewName);
   void drop(Ino Parent, const std::string &Name);
 

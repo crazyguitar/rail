@@ -65,6 +65,9 @@ struct RemoteCopy {
 
 bool resetRemoteRoot(const std::string &Root, const std::vector<RemoteCopy> &Copies);
 
+// Waits for it, unlike peer().run, which only starts one.
+void runOnPeerToCompletion(const std::vector<std::string> &Argv);
+
 void stopPeerProcess(const std::string &Name);
 void killPeerProcess(const std::string &Name);
 

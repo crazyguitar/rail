@@ -232,6 +232,8 @@ char *railfs_path_of(struct dentry *dentry);
 char *railfs_path_under(const char *parent, const char *name);
 char *railfs_child_path(struct inode *dir, struct dentry *dentry);
 unsigned long railfs_ino_of(const char *name);
+u64 railfs_file_id(const struct railfs_attrs *a, const char *path);
+int railfs_attrs_of_new(struct railfs_options *opts, const char *path, struct railfs_attrs *a);
 
 /* The operation tables, which live with the superblock in railfs-main.c because
  * that is what hands them to a new inode.

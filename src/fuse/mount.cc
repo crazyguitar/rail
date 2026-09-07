@@ -1,6 +1,7 @@
 #define FUSE_USE_VERSION 31
 
 #include "rail/fuse/mount.h"
+#include "rail/vfs/file-id.h"
 
 #include "rail/fuse/files.h"
 #include "rail/fuse/inodes.h"
@@ -50,7 +51,13 @@ struct Shard {
   vfs::Remotes Pool;
   std::vector<std::byte> Scratch;
   Files Open;
-  std::unordered_map<uint64_t, std::vector<proto::ListEntry>> OpenDirs;
+  struct OpenDir {
+    std::vector<proto::ListEntry> Entries;
+    // Dot and dot-dot are not entries, so their identity is asked for once.
+    proto::FileAttrs Self;
+    proto::FileAttrs Parent;
+  };
+  std::unordered_map<uint64_t, OpenDir> OpenDirs;
   std::unordered_map<std::string, uint64_t> Written;
   std::vector<Coro<void>> Running;
   uint64_t NextDir = 1;
@@ -127,6 +134,11 @@ bool knownIno(Mount &M, ::fuse_ino_t Ino) {
 std::string pathOf(Mount &M, ::fuse_ino_t Ino) {
   std::lock_guard<std::mutex> Held(M.KnownLock);
   return M.Known.path(Ino);
+}
+
+std::string parentPathOf(Mount &M, ::fuse_ino_t Ino) {
+  std::lock_guard<std::mutex> Held(M.KnownLock);
+  return M.Known.path(M.Known.parent(Ino));
 }
 
 std::string pathUnder(Mount &M, ::fuse_ino_t Parent, const std::string &Name) {
@@ -214,8 +226,19 @@ int errnoOf(const Error &Why) {
   return std::find(std::begin(kAnswerable), std::end(kAnswerable), Number) != std::end(kAnswerable) ? Number : EIO;
 }
 
+// What the peer holds for a name just made here. A number invented instead
+// would be one no later stat agrees with, so a failure is answered.
+Coro<Result<proto::FileAttrs>> attrsOfNew(vfs::Remotes::Lease &Held, const std::string &Path) {
+  auto Seen = co_await Held.client().stat(Path);
+  if (!Seen) co_return std::unexpected(Seen.error());
+  if (!Seen->Found) co_return failMessage("the peer lost a name it had just made");
+  co_return Seen->Attrs;
+}
+
 void fillRemoteAttr(struct ::stat &S, ::fuse_ino_t Ino, const proto::FileAttrs &A) {
-  S.st_ino = Ino;
+  // The peer's number, so a rename keeps it and two names for one file share
+  // it. Ino stays the key the kernel calls back with.
+  S.st_ino = A.Ino != 0 ? vfs::fileIdOf(A) : Ino;
   S.st_mode = (A.Link ? S_IFLNK : A.Directory ? S_IFDIR : S_IFREG) | (A.Mode & 07777);
   S.st_nlink = A.Directory ? 2 : std::max<uint32_t>(1, A.Links);
   S.st_size = static_cast<off_t>(A.Size);
@@ -661,8 +684,26 @@ Coro<void> doOpenDir(Mount &M, ::fuse_req_t Req, ::fuse_ino_t Ino, ::fuse_file_i
   std::vector<proto::ListEntry> Entries = std::move(Listed->Entries);
   std::ranges::sort(Entries, [](const proto::ListEntry &A, const proto::ListEntry &B) { return A.Name < B.Name; });
 
+  Shard::OpenDir Open;
+  Open.Entries = std::move(Entries);
+  auto Self = co_await Held->client().stat(pathOf(M, Ino));
+  auto Above = co_await Held->client().stat(parentPathOf(M, Ino));
+  if (!Self || !Above) {
+    Held->discard();
+    ::fuse_reply_err(Req, EIO);
+    co_return;
+  }
+  // Gone between the listing and this: caching nothing would hand out the
+  // made-up numbers the stat is here to avoid.
+  if (!Self->Found || !Above->Found) {
+    ::fuse_reply_err(Req, ENOENT);
+    co_return;
+  }
+  Open.Self = Self->Attrs;
+  Open.Parent = Above->Attrs;
+
   const uint64_t Handle = shard(M).NextDir++;
-  shard(M).OpenDirs.emplace(Handle, std::move(Entries));
+  shard(M).OpenDirs.emplace(Handle, std::move(Open));
   Fi.fh = packHandle(ThisShard, Handle);
   ::fuse_reply_open(Req, &Fi);
 }
@@ -1129,13 +1170,19 @@ Coro<void> doCreate(Mount &M, ::fuse_req_t Req, ::fuse_ino_t Parent, std::string
   if (auto Opened = co_await Held->client().openFile(Path, true); Opened && Opened->Ok)
     F.OnSlot[Held->index()] = {Opened->Handle, Held->generation()};
 
+  auto Made = co_await attrsOfNew(*Held, Path);
+  if (!Made) {
+    Held->discard();
+    releaseIno(M, Parent, Name);
+    ::fuse_reply_err(Req, EIO);
+    co_return;
+  }
+
   ::fuse_entry_param E{};
   E.ino = insertIno(M, Parent, Name);
   E.attr_timeout = M.Opts.AttrTimeout;
   E.entry_timeout = M.Opts.EntryTimeout;
-  proto::FileAttrs A;
-  A.Mode = Mode & 07777;
-  fillRemoteAttr(E.attr, E.ino, A);
+  fillRemoteAttr(E.attr, E.ino, *Made);
 
   Fi.fh = packHandle(ThisShard, shard(M).Open.open(std::move(F)));
   if (M.Opts.DirectIo) Fi.direct_io = 1;
@@ -1193,14 +1240,18 @@ Coro<void> doMakeDirectory(Mount &M, ::fuse_req_t Req, ::fuse_ino_t Parent, std:
     co_return;
   }
 
+  auto Made = co_await attrsOfNew(*Held, Path);
+  if (!Made) {
+    Held->discard();
+    ::fuse_reply_err(Req, EIO);
+    co_return;
+  }
+
   ::fuse_entry_param E{};
   E.ino = insertIno(M, Parent, Name);
   E.attr_timeout = M.Opts.AttrTimeout;
   E.entry_timeout = M.Opts.EntryTimeout;
-  proto::FileAttrs A;
-  A.Directory = true;
-  A.Mode = Mode & 07777;
-  fillRemoteAttr(E.attr, E.ino, A);
+  fillRemoteAttr(E.attr, E.ino, *Made);
   ::fuse_reply_entry(Req, &E);
 }
 
@@ -1248,15 +1299,18 @@ Coro<void> doSymlink(Mount &M, ::fuse_req_t Req, std::string Target, ::fuse_ino_
     co_return;
   }
 
+  auto Made = co_await attrsOfNew(*Held, Path);
+  if (!Made) {
+    Held->discard();
+    ::fuse_reply_err(Req, EIO);
+    co_return;
+  }
+
   ::fuse_entry_param E{};
   E.ino = insertIno(M, Parent, Name);
   E.attr_timeout = M.Opts.AttrTimeout;
   E.entry_timeout = M.Opts.EntryTimeout;
-  proto::FileAttrs A;
-  A.Link = true;
-  A.Mode = 0777;
-  A.Size = Target.size();
-  fillRemoteAttr(E.attr, E.ino, A);
+  fillRemoteAttr(E.attr, E.ino, *Made);
   ::fuse_reply_entry(Req, &E);
 }
 
@@ -1521,7 +1575,8 @@ void replyDir(Mount &M, ::fuse_req_t Req, ::fuse_ino_t Ino, size_t Size, off_t O
     ::fuse_reply_err(Req, EBADF);
     return;
   }
-  const std::vector<proto::ListEntry> &Entries = It->second;
+  const Shard::OpenDir &Open = It->second;
+  const std::vector<proto::ListEntry> &Entries = Open.Entries;
 
   std::vector<char> Buf(Size);
   size_t Used = 0;
@@ -1530,7 +1585,7 @@ void replyDir(Mount &M, ::fuse_req_t Req, ::fuse_ino_t Ino, size_t Size, off_t O
     struct ::stat S{};
     if (I < 2) {
       Name = I == 0 ? "." : "..";
-      S.st_ino = Ino;
+      fillRemoteAttr(S, Ino, I == 0 ? Open.Self : Open.Parent);
       S.st_mode = S_IFDIR | 0755;
     } else {
       const auto &E = Entries[I - 2];

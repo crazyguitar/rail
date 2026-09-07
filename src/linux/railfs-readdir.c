@@ -74,9 +74,8 @@ static int railfs_emit_entry(struct file *file, struct dir_context *ctx, const c
 		goto out;
 	}
 
-	// The same number a later stat reports. Hashing the bare name here
-	// gave one file two inode numbers depending on which call asked.
-	if (!dir_emit(ctx, name.name, name.len, railfs_ino_of(path), type)) {
+	// The same number a later stat reports, which is the peer's own.
+	if (!dir_emit(ctx, name.name, name.len, railfs_file_id(&entry->attrs, path), type)) {
 		err = -ENOSPC;
 		goto out;
 	}

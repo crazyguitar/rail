@@ -244,13 +244,13 @@ void seedRemoteOnce(const std::filesystem::path &Local, const std::string &Remot
   if (seedRemote(Local, Remote)) Seeded.insert(Remote);
 }
 
-namespace {
-
 void runOnPeerToCompletion(const std::vector<std::string> &Argv) {
   auto Ran = peer().run(Argv);
   if (!Ran) return;
   while (Ran->readLine()) {}
 }
+
+namespace {
 
 bool peerHasProcess(const std::string &Name) {
   auto Ran = peer().run({"pgrep", "-x", "--", Name});

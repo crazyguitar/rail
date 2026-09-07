@@ -43,6 +43,11 @@ int railfs_symlink(struct mnt_idmap *idmap, struct inode *dir, struct dentry *de
 	attrs.link = 1;
 	attrs.size = strlen(symname);
 
+	err = railfs_attrs_of_new(opts, path, &attrs);
+	if (err) {
+		goto out;
+	}
+
 	inode = railfs_inode_for(dir->i_sb, &attrs, path);
 	if (!inode) {
 		err = -ENOMEM;

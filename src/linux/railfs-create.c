@@ -35,6 +35,11 @@ int railfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	}
 
 	attrs.mode = mode & RAILFS_MODE_BITS;
+	err = railfs_attrs_of_new(opts, path, &attrs);
+	if (err) {
+		goto out;
+	}
+
 	inode = railfs_inode_for(dir->i_sb, &attrs, path);
 	if (!inode) {
 		err = -ENOMEM;

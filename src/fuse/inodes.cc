@@ -80,6 +80,11 @@ void Inodes::forget(Ino I, uint64_t Count) {
   erase(It);
 }
 
+Ino Inodes::parent(Ino I) const {
+  auto It = Nodes.find(I);
+  return It == Nodes.end() ? kRootIno : It->second.Parent;
+}
+
 std::string Inodes::path(Ino I) const {
   std::vector<const std::string *> Parts;
   for (Ino At = I; At != kRootIno;) {

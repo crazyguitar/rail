@@ -61,6 +61,11 @@ int railfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *den
 	attrs.mtime = inode_get_mtime_sec(inode);
 	attrs.links = inode->i_nlink + 1;
 
+	err = railfs_attrs_of_new(opts, path, &attrs);
+	if (err) {
+		goto out;
+	}
+
 	second = railfs_inode_for(dir->i_sb, &attrs, path);
 	if (!second) {
 		err = -ENOMEM;

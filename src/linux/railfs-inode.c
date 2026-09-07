@@ -133,7 +133,6 @@ static int railfs_inode_take_name(struct inode *inode, void *wanted)
 	struct railfs_path *path = wanted;
 
 	inode->i_private = railfs_path_get(path);
-	inode->i_ino = railfs_ino_of(path->name);
 	return 0;
 }
 
@@ -172,10 +171,11 @@ static umode_t railfs_mode_of(const struct railfs_attrs *a)
 	return mode | S_IFREG;
 }
 
-static void railfs_fill_new_inode(struct inode *inode, const struct railfs_attrs *a)
+static void railfs_fill_new_inode(struct inode *inode, const struct railfs_attrs *a, const char *path)
 {
 	struct railfs_options *opts = inode->i_sb->s_fs_info;
 
+	inode->i_ino = railfs_file_id(a, path);
 	inode->i_mode = railfs_mode_of(a);
 	inode->i_uid = opts ? opts->uid : GLOBAL_ROOT_UID;
 	inode->i_gid = opts ? opts->gid : GLOBAL_ROOT_GID;
@@ -203,6 +203,32 @@ static void railfs_fill_new_inode(struct inode *inode, const struct railfs_attrs
 	RAILFS_I(inode)->mine = false;
 }
 
+/*
+ * What the peer holds for a name just made here. A number made up instead
+ * would be one no later lookup agrees with, so a failure is returned.
+ */
+int railfs_attrs_of_new(struct railfs_options *opts, const char *path, struct railfs_attrs *a)
+{
+	struct railfs_attrs fresh = {};
+	bool found = false;
+	int err;
+
+	if (!opts || !opts->pool) {
+		return -ENOTCONN;
+	}
+
+	err = railfs_pool_stat(opts->pool, path, &fresh, &found);
+	if (err) {
+		return err;
+	}
+	if (!found) {
+		return -ENOENT;
+	}
+
+	*a = fresh;
+	return 0;
+}
+
 struct inode *railfs_inode_for(struct super_block *sb, const struct railfs_attrs *a, const char *path)
 {
 	struct railfs_path *name = railfs_path_new(path);
@@ -222,7 +248,7 @@ struct inode *railfs_inode_for(struct super_block *sb, const struct railfs_attrs
 		return inode;
 	}
 
-	railfs_fill_new_inode(inode, a);
+	railfs_fill_new_inode(inode, a, path);
 	unlock_new_inode(inode);
 	return inode;
 }
@@ -231,8 +257,7 @@ void railfs_rehash_inode(struct inode *inode, struct railfs_path *fresh)
 {
 	remove_inode_hash(inode);
 	railfs_path_replace(inode, fresh);
-	inode->i_ino = railfs_ino_of(fresh->name);
-	__insert_inode_hash(inode, inode->i_ino);
+	__insert_inode_hash(inode, railfs_ino_of(fresh->name));
 }
 
 // Asks the peer what it holds now. Nothing else in this mount ever notices a

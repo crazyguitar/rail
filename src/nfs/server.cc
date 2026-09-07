@@ -1,4 +1,5 @@
 #include "rail/nfs/server.h"
+#include "rail/vfs/file-id.h"
 
 #include "rail/vfs/remotes.h"
 
@@ -114,13 +115,7 @@ Digest digestOf(const std::string &Path) {
 // than a digest of the path, which made a renamed file look like a different
 // one. A peer too old to send one falls back to the name.
 uint64_t fileIdOf(const proto::FileAttrs &A, const std::string &Path) {
-  if (A.Ino != 0) {
-    uint64_t Id = A.Ino ^ (A.Dev * 0x9E3779B97F4A7C15ULL);
-    Id ^= Id >> 33;
-    Id *= 0xFF51AFD7ED558CCDULL;
-    Id ^= Id >> 33;
-    return Id ? Id : 1;
-  }
+  if (A.Ino != 0) return vfs::fileIdOf(A);
 
   const Digest D = digestOf(Path);
   uint64_t Id = 0;

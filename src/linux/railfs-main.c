@@ -549,6 +549,26 @@ unsigned long railfs_ino_of(const char *name)
 	return h ? h : 1;
 }
 
+/*
+ * What a caller sees as the file's number: the peer's device and inode, so a
+ * rename keeps it and two names for one file share it. Not the hash bucket an
+ * inode is found in, which stays the path.
+ */
+u64 railfs_file_id(const struct railfs_attrs *a, const char *path)
+{
+	u64 id;
+
+	if (!a || !a->ino) {
+		return railfs_ino_of(path);
+	}
+
+	id = a->ino ^ (a->dev * 0x9E3779B97F4A7C15ULL);
+	id ^= id >> 33;
+	id *= 0xFF51AFD7ED558CCDULL;
+	id ^= id >> 33;
+	return id ? id : 1;
+}
+
 
 // kill_anon_super, not kill_litter_super: nothing here is pinned at fill_super
 // time any more. Every dentry comes from lookup and belongs to the dcache, and

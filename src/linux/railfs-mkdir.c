@@ -40,6 +40,12 @@ struct dentry *railfs_mkdir_op(struct mnt_idmap *idmap, struct inode *dir, struc
 
 	attrs.mode = mode & RAILFS_MODE_BITS;
 	attrs.directory = 1;
+	err = railfs_attrs_of_new(opts, path, &attrs);
+	if (err) {
+		result = ERR_PTR(err);
+		goto out;
+	}
+
 	inode = railfs_inode_for(dir->i_sb, &attrs, path);
 	if (!inode) {
 		result = ERR_PTR(-ENOMEM);

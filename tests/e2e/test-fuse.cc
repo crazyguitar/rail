@@ -438,6 +438,64 @@ TEST_P(Mount, StatMatchesTheSource) {
   EXPECT_TRUE(S_ISREG(S.st_mode));
 }
 
+// A rename keeps a file's number and a second name for it shares one.
+// Numbering by the mount's own path gave a renamed file a new one.
+TEST_P(Mount, TheInodeNumberIsThePeersOwn) {
+  struct ::stat Before{};
+  ASSERT_EQ(::stat((At / "alpha.bin").c_str(), &Before), 0);
+  EXPECT_NE(Before.st_ino, 0u);
+
+  struct ::stat Other{};
+  ASSERT_EQ(::stat((At / "sub" / "nested.bin").c_str(), &Other), 0);
+  EXPECT_NE(Before.st_ino, Other.st_ino) << "two files must not share a number";
+
+  runOnPeerToCompletion({"ln", Root + "/alpha.bin", Root + "/alpha-link.bin"});
+  struct ::stat Link{};
+  ASSERT_EQ(::stat((At / "alpha-link.bin").c_str(), &Link), 0);
+  EXPECT_EQ(Link.st_ino, Before.st_ino) << "a second name for one file must share its number";
+
+  runOnPeerToCompletion({"mv", Root + "/alpha-link.bin", Root + "/alpha-moved.bin"});
+  struct ::stat Moved{};
+  ASSERT_EQ(::stat((At / "alpha-moved.bin").c_str(), &Moved), 0);
+  EXPECT_EQ(Moved.st_ino, Before.st_ino) << "a renamed file is still the same file";
+}
+
+// A file made here, and a listing's dot entries, report the number a stat
+// does. Numbers invented locally disagreed with it.
+TEST_P(Mount, MadeFilesAndDotEntriesReportTheSameNumberAsAStat) {
+  const auto Made = At / "made-here.bin";
+  {
+    std::ofstream Out(Made, std::ios::binary);
+    Out << "made";
+  }
+
+  struct ::stat AtCreate{};
+  ASSERT_EQ(::stat(Made.c_str(), &AtCreate), 0);
+
+  ASSERT_TRUE(std::filesystem::create_directory(At / "made-dir"));
+  struct ::stat Dir{};
+  ASSERT_EQ(::stat((At / "made-dir").c_str(), &Dir), 0);
+
+  struct ::stat Sub{};
+  ASSERT_EQ(::stat((At / "sub").c_str(), &Sub), 0);
+  struct ::stat Root{};
+  ASSERT_EQ(::stat(At.c_str(), &Root), 0);
+
+  ::DIR *Open = ::opendir((At / "sub").c_str());
+  ASSERT_NE(Open, nullptr);
+  uint64_t Dot = 0;
+  uint64_t DotDot = 0;
+  while (::dirent *E = ::readdir(Open)) {
+    if (std::string(E->d_name) == ".") Dot = E->d_ino;
+    if (std::string(E->d_name) == "..") DotDot = E->d_ino;
+  }
+  ::closedir(Open);
+
+  EXPECT_EQ(Dot, Sub.st_ino) << "dot should be the directory it lists";
+  EXPECT_EQ(DotDot, Root.st_ino) << "dot-dot should be that directory's parent";
+  EXPECT_NE(AtCreate.st_ino, Dir.st_ino) << "a made file and a made directory are not the same";
+}
+
 TEST_P(Mount, ListsTheDirectory) {
   std::vector<std::string> Names;
   for (const auto &E : std::filesystem::directory_iterator(At)) Names.push_back(E.path().filename().string());

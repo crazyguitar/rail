@@ -394,6 +394,51 @@ TEST_F(Kernel, ListsWhatTheDaemonExports) {
   EXPECT_NE(Listing.find("b.txt"), std::string::npos) << Listing;
 }
 
+// A rename keeps a file's number and a listing agrees with a stat. Hashing
+// the name gave a renamed file a new one.
+TEST_F(Kernel, TheInodeNumberIsThePeersOwn) {
+  ASSERT_TRUE(mountIt(defaultOptions()));
+
+  struct ::stat Before{};
+  ASSERT_EQ(::stat((Mountpoint + "/a.txt").c_str(), &Before), 0);
+  EXPECT_NE(Before.st_ino, 0u);
+
+  struct ::stat Other{};
+  ASSERT_EQ(::stat((Mountpoint + "/b.txt").c_str(), &Other), 0);
+  EXPECT_NE(Before.st_ino, Other.st_ino) << "two files must not share a number";
+
+  runOnPeerToCompletion({"mv", Export + "/a.txt", Export + "/moved.txt"});
+  struct ::stat Moved{};
+  ASSERT_EQ(::stat((Mountpoint + "/moved.txt").c_str(), &Moved), 0);
+  EXPECT_EQ(Moved.st_ino, Before.st_ino) << "a renamed file is still the same file";
+}
+
+// A file made here reports the number a lookup finds; one invented here
+// disagreed with it.
+TEST_F(Kernel, AMadeFileReportsTheNumberTheDaemonHasForIt) {
+  ASSERT_TRUE(mountIt(defaultOptions()));
+
+  const std::string Made = Mountpoint + "/made-here.txt";
+  {
+    std::ofstream Out(Made);
+    Out << "made";
+  }
+
+  struct ::stat AtCreate{};
+  ASSERT_EQ(::stat(Made.c_str(), &AtCreate), 0);
+
+  auto Reported = peer().run({"stat", "-c", "%d %i", Export + "/made-here.txt"});
+  ASSERT_TRUE(Reported) << "could not stat the made file on the peer";
+  ASSERT_TRUE(Reported->readLine()) << "no answer from the peer";
+
+  ASSERT_TRUE(unmountFilesystem(Mountpoint).has_value());
+  ASSERT_TRUE(mountIt(defaultOptions()));
+
+  struct ::stat Fresh{};
+  ASSERT_EQ(::stat(Made.c_str(), &Fresh), 0);
+  EXPECT_EQ(Fresh.st_ino, AtCreate.st_ino) << "the number a made file reports must be the one a lookup finds";
+}
+
 TEST_F(Kernel, ReportsTheSizeTheDaemonGave) {
   ASSERT_TRUE(mountIt(defaultOptions()));
 
