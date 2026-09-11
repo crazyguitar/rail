@@ -35,7 +35,7 @@ static int railfs_folio_op(struct railfs_conn *conn, void *arg)
 
 int railfs_fill_folio(struct folio *folio)
 {
-	struct inode *inode = folio->mapping->host;
+	struct inode *inode = folio_inode(folio);
 	struct railfs_options *opts = inode->i_sb->s_fs_info;
 	struct railfs_path *name = railfs_path_hold(inode);
 	size_t size = folio_size(folio);
@@ -74,6 +74,13 @@ int railfs_read_folio(struct file *file, struct folio *folio)
 	folio_unlock(folio);
 	return err;
 }
+
+#if !RAILFS_HAS_READ_FOLIO
+int railfs_readpage(struct file *file, struct page *page)
+{
+	return railfs_read_folio(file, page_folio(page));
+}
+#endif
 
 struct railfs_fetch {
 	struct work_struct work;
@@ -142,7 +149,7 @@ static void railfs_fill_around(struct railfs_fetch *fetch, const void *buf, size
 		size_t size;
 		loff_t at;
 
-		folio = __filemap_get_folio(fetch->mapping, index, FGP_LOCK | FGP_CREAT | FGP_NOWAIT, mapping_gfp_mask(fetch->mapping));
+		folio = railfs_get_folio(fetch->mapping, index, FGP_LOCK | FGP_CREAT | FGP_NOWAIT);
 		if (IS_ERR(folio)) {
 			continue;
 		}

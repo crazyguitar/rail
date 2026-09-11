@@ -154,3 +154,10 @@ ssize_t railfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 	return done;
 }
+
+#if !RAILFS_HAS_FMODE_CAN_ODIRECT
+ssize_t railfs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
+{
+	return -EINVAL;
+}
+#endif

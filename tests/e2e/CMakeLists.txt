@@ -11,6 +11,7 @@ add_executable(rail-e2e
   test-delta.cc
   test-memory.cc
   test-pages.cc
+  test-rdma-devices.cc
   test-edge.cc
   test-failure.cc
   test-throughput.cc

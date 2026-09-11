@@ -14,6 +14,8 @@
 #include <linux/kref.h>
 #include <linux/wait.h>
 
+#include "railfs-compat.h"
+
 #include "railfs-tcp.h"
 
 #define RAILFS_MAGIC 0x5241494c /* "RAIL" */
@@ -179,18 +181,41 @@ static inline struct railfs_inode *RAILFS_I(struct inode *inode)
 extern struct workqueue_struct *railfs_page_wq;
 int railfs_fill_folio(struct folio *folio);
 int railfs_read_folio(struct file *file, struct folio *folio);
+#if !RAILFS_HAS_READ_FOLIO
+int railfs_readpage(struct file *file, struct page *page);
+#endif
 
 /* O_DIRECT is served by the buffered path, then evicted from the cache. */
 ssize_t railfs_read_iter(struct kiocb *iocb, struct iov_iter *to);
 ssize_t railfs_write_iter(struct kiocb *iocb, struct iov_iter *from);
 int railfs_direct_open(struct file *file);
 void railfs_direct_release(struct file *file);
+#if !RAILFS_HAS_FMODE_CAN_ODIRECT
+ssize_t railfs_direct_IO(struct kiocb *iocb, struct iov_iter *iter);
+#endif
 void railfs_readahead(struct readahead_control *rac);
 int railfs_writepages(struct address_space *mapping, struct writeback_control *wbc);
+#if RAILFS_HAS_KIOCB_WRITE_BEGIN
 int railfs_write_begin(const struct kiocb *iocb, struct address_space *mapping, loff_t pos, unsigned int len,
 		     struct folio **foliop, void **fsdata);
 int railfs_write_end(const struct kiocb *iocb, struct address_space *mapping, loff_t pos, unsigned int len,
 		   unsigned int copied, struct folio *folio, void *fsdata);
+#elif RAILFS_HAS_FOLIO_WRITE_BEGIN
+int railfs_write_begin(struct file *file, struct address_space *mapping, loff_t pos, unsigned int len,
+		     struct folio **foliop, void **fsdata);
+int railfs_write_end(struct file *file, struct address_space *mapping, loff_t pos, unsigned int len,
+		   unsigned int copied, struct folio *folio, void *fsdata);
+#else
+#if RAILFS_HAS_WRITE_BEGIN_FLAGS
+int railfs_write_begin(struct file *file, struct address_space *mapping, loff_t pos, unsigned int len, unsigned int flags,
+		     struct page **pagep, void **fsdata);
+#else
+int railfs_write_begin(struct file *file, struct address_space *mapping, loff_t pos, unsigned int len,
+		     struct page **pagep, void **fsdata);
+#endif
+int railfs_write_end(struct file *file, struct address_space *mapping, loff_t pos, unsigned int len,
+		   unsigned int copied, struct page *page, void *fsdata);
+#endif
 
 /* One operation per file, each declared here because the operation tables
  * that name them live with the superblock.
@@ -198,6 +223,9 @@ int railfs_write_end(const struct kiocb *iocb, struct address_space *mapping, lo
 struct dentry *railfs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags);
 int railfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl);
 struct dentry *railfs_mkdir_op(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode);
+#if !RAILFS_HAS_MKDIR_DENTRY
+int railfs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode);
+#endif
 int railfs_remove(struct inode *dir, struct dentry *dentry, u16 op);
 int railfs_unlink(struct inode *dir, struct dentry *dentry);
 int railfs_rmdir(struct inode *dir, struct dentry *dentry);
@@ -224,7 +252,11 @@ void railfs_tune_folios(struct inode *inode);
 struct inode *railfs_inode_for(struct super_block *sb, const struct railfs_attrs *a, const char *path);
 void railfs_rehash_inode(struct inode *inode, struct railfs_path *fresh);
 int railfs_refresh(struct inode *inode, bool force);
+#if RAILFS_HAS_REVALIDATE_NAME
 int railfs_revalidate(struct inode *dir, const struct qstr *name, struct dentry *dentry, unsigned int flags);
+#else
+int railfs_revalidate(struct dentry *dentry, unsigned int flags);
+#endif
 
 /* Paths and inode numbers, shared by every operation that names a file. */
 const char *railfs_export_root(const struct railfs_options *opts);

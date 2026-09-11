@@ -1,5 +1,7 @@
 #include "rail/transport/rdma-devices.h"
+#include "../linux/rdma-link-rate.h"
 
+#include <algorithm>
 #include <format>
 
 #ifdef RAIL_HAVE_RDMA
@@ -33,13 +35,18 @@ std::vector<RdmaPort> activeRdmaPorts() {
         ibv_port_attr Port{};
         if (ibv_query_port(Ctx, P, &Port) != 0) continue;
         if (Port.state != IBV_PORT_ACTIVE) continue;
-        Active.push_back({ibv_get_device_name(List[I]), P});
+        Active.push_back({ibv_get_device_name(List[I]), P, rail_rdma_rate_mbps(Port.active_speed, Port.active_width)});
       }
     }
     ibv_close_device(Ctx);
   }
 
   ibv_free_device_list(List);
+  std::sort(Active.begin(), Active.end(), [](const RdmaPort &A, const RdmaPort &B) {
+    if (A.RateMbps != B.RateMbps) return A.RateMbps > B.RateMbps;
+    if (A.Device != B.Device) return A.Device < B.Device;
+    return A.Port < B.Port;
+  });
   return Active;
 }
 

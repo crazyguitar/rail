@@ -10,6 +10,8 @@
 #include <linux/mm.h>
 #include <linux/types.h>
 
+#include "railfs-compat.h"
+
 #include "railfs-msg.h"
 
 struct railfs_cursor {

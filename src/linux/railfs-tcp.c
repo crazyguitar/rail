@@ -62,6 +62,7 @@ static int send_all(struct socket *sock, const void *buf, size_t len)
 	struct kvec vec = { .iov_base = (void *)buf, .iov_len = len };
 	struct msghdr msg = { .msg_flags = MSG_NOSIGNAL };
 	size_t done = 0;
+	int n;
 
 	if (!sock) {
 		return -ENOTCONN;
@@ -71,8 +72,7 @@ static int send_all(struct socket *sock, const void *buf, size_t len)
 		vec.iov_base = (void *)((const u8 *)buf + done);
 		vec.iov_len = len - done;
 
-		int n = kernel_sendmsg(sock, &msg, &vec, 1, len - done);
-
+		n = kernel_sendmsg(sock, &msg, &vec, 1, len - done);
 		if (n <= 0) {
 			return n ? n : -ECONNRESET;
 		}
@@ -86,6 +86,7 @@ static int recv_all(struct socket *sock, void *buf, size_t len)
 	struct kvec vec;
 	struct msghdr msg = { .msg_flags = MSG_WAITALL };
 	size_t done = 0;
+	int n;
 
 	if (!sock) {
 		return -ENOTCONN;
@@ -95,8 +96,7 @@ static int recv_all(struct socket *sock, void *buf, size_t len)
 		vec.iov_base = (u8 *)buf + done;
 		vec.iov_len = len - done;
 
-		int n = kernel_recvmsg(sock, &msg, &vec, 1, len - done, MSG_WAITALL);
-
+		n = kernel_recvmsg(sock, &msg, &vec, 1, len - done, MSG_WAITALL);
 		if (n <= 0) {
 			return n ? n : -ECONNRESET;
 		}

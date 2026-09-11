@@ -331,9 +331,8 @@ int railfs_refresh(struct inode *inode, bool force)
 	return 0;
 }
 
-// A name is only as good as the last time the peer confirmed it. Since 6.15 the
-// parent and the name arrive alongside the dentry, and neither is wanted here.
-int railfs_revalidate(struct inode *dir, const struct qstr *name, struct dentry *dentry, unsigned int flags)
+// A name is only as good as the last time the peer confirmed it.
+static int railfs_revalidate_dentry(struct dentry *dentry, unsigned int flags)
 {
 	struct railfs_options *opts = dentry->d_sb->s_fs_info;
 	struct inode *inode = d_inode(dentry);
@@ -364,3 +363,16 @@ int railfs_revalidate(struct inode *dir, const struct qstr *name, struct dentry 
 	// missing file.
 	return 1;
 }
+
+// Since 6.14 the parent and the name arrive too; neither is wanted here.
+#if RAILFS_HAS_REVALIDATE_NAME
+int railfs_revalidate(struct inode *dir, const struct qstr *name, struct dentry *dentry, unsigned int flags)
+{
+	return railfs_revalidate_dentry(dentry, flags);
+}
+#else
+int railfs_revalidate(struct dentry *dentry, unsigned int flags)
+{
+	return railfs_revalidate_dentry(dentry, flags);
+}
+#endif

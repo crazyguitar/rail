@@ -4,6 +4,8 @@
 
 #include <linux/net.h>
 
+#include "railfs-compat.h"
+
 #include "railfs-rdma.h"
 
 struct railfs_peer {
