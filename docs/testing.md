@@ -21,6 +21,9 @@ tree at the same path. A peer that is behind fails as a refused connection.
 | `RAIL_PEER` | the far host, as both ssh and the data channel reach it; required, no default |
 | `RAIL_DIR` | working directory on both sides, default `/tmp/rail-e2e` |
 | `RAIL_KERNEL_TESTS` | ask for the privileged suites; without it they are left out |
+| `RAIL_GDS_TESTS` | with the above, the GPUDirect Storage suite: needs a GPU, nvidia-fs and cuFile on this side, and an rdma peer |
+
+See [GPUDirect Storage](gds.md) for the patched driver, cuFile settings, and GPU tests.
 
 ## Root
 

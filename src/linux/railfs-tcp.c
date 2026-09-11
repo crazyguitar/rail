@@ -647,7 +647,7 @@ static int railfs_read_reply(struct railfs_conn *conn, struct railfs_cursor *c, 
 // The bytes themselves, off whichever channel this connection has. Returns how
 // many arrived, which the tcp path learns from a header and the fabric knows in
 // advance because the peer sends everything that was asked for.
-static int railfs_take_payload(struct railfs_conn *conn, u64 id, void **buf, u32 len, u32 *got)
+static int railfs_take_payload(struct railfs_conn *conn, u64 id, void **buf, struct sg_table *gpu, u32 len, u32 *got)
 {
 	u8 header[RAILFS_DATA_HEADER_SIZE];
 	u32 frame_len = 0;
@@ -655,13 +655,22 @@ static int railfs_take_payload(struct railfs_conn *conn, u64 id, void **buf, u32
 	int err;
 
 	if (conn->rail) {
-		err = *buf ? railfs_rdma_fetch(conn->rail, id, *buf, len) : railfs_rdma_fetch_landed(conn->rail, id, len, (const void **)buf);
+		if (gpu) {
+			err = railfs_rdma_fetch_sg(conn->rail, id, gpu, len);
+		} else {
+			err = *buf ? railfs_rdma_fetch(conn->rail, id, *buf, len) : railfs_rdma_fetch_landed(conn->rail, id, len,
+												       (const void **)buf);
+		}
 		if (err < 0) {
 			return err;
 		}
 
 		*got = len;
 		return 0;
+	}
+
+	if (gpu) {
+		return -EOPNOTSUPP;
 	}
 
 	err = recv_all(conn->data, header, sizeof(header));
@@ -694,7 +703,22 @@ static int railfs_take_payload(struct railfs_conn *conn, u64 id, void **buf, u32
 	return 0;
 }
 
-static int railfs_read_core(struct railfs_conn *conn, const char *path, u64 offset, void **buf, u32 len)
+static bool railfs_gpu_allowed(const struct railfs_conn *conn)
+{
+	if (!conn->rail) {
+		pr_warn_once("railfs: gpu buffers need an rdma mount\n");
+		return false;
+	}
+
+	if (conn->verify) {
+		pr_warn_once("railfs: gpu buffers need a noverify mount; the cpu cannot hash gpu memory\n");
+		return false;
+	}
+
+	return true;
+}
+
+static int railfs_read_core(struct railfs_conn *conn, const char *path, u64 offset, void **buf, struct sg_table *gpu, u32 len)
 {
 	struct railfs_cursor c;
 	u8 *payload = NULL;
@@ -721,9 +745,13 @@ static int railfs_read_core(struct railfs_conn *conn, const char *path, u64 offs
 		return -EOPNOTSUPP;
 	}
 
+	if (gpu && !railfs_gpu_allowed(conn)) {
+		return -EOPNOTSUPP;
+	}
+
 	// Taken before the request goes out: failing after it would leave the
 	// payload unread on the socket.
-	if (!*buf && conn->data && !conn->landing) {
+	if (!gpu && !*buf && conn->data && !conn->landing) {
 		conn->landing = kvmalloc(RAILFS_PAGE_SIZE, GFP_NOFS);
 		if (!conn->landing) {
 			return -ENOMEM;
@@ -779,8 +807,15 @@ static int railfs_read_core(struct railfs_conn *conn, const char *path, u64 offs
 		goto unlock;
 	}
 
+	/* A stale size must not expose the GPU buffer to the peer's EOF padding. */
+	if (gpu && (!ok || reply_len != len)) {
+		conn->dead = true;
+		err = ok && !reply_len ? 0 : -ESTALE;
+		goto unlock;
+	}
+
 	pull = railfs_now();
-	err = railfs_lose_on(conn, railfs_take_payload(conn, id, buf, len, &frame_len));
+	err = railfs_lose_on(conn, railfs_take_payload(conn, id, buf, gpu, len, &frame_len));
 	railfs_trace_add(RAILFS_PHASE_READ_PULL, pull, len);
 	if (err) {
 		goto unlock;
@@ -798,7 +833,7 @@ static int railfs_read_core(struct railfs_conn *conn, const char *path, u64 offs
 	// digest field, not with a shorter frame, so checking it here would fail
 	// every read rather than skip the check.
 	digest = railfs_now();
-	if (conn->verify && railfs_matches_digest(&c, payload, *buf, frame_len, path, offset)) {
+	if (conn->verify && !gpu && railfs_matches_digest(&c, payload, *buf, frame_len, path, offset)) {
 		err = -EBADMSG;
 	}
 	railfs_trace_add(RAILFS_PHASE_READ_DIGEST, digest, frame_len);
@@ -814,7 +849,7 @@ int railfs_read(struct railfs_conn *conn, const char *path, u64 offset, void *bu
 {
 	void *into = buf;
 
-	return railfs_read_core(conn, path, offset, &into, len);
+	return railfs_read_core(conn, path, offset, &into, NULL, len);
 }
 
 // The bytes stay where the transport put them, the fabric's landing page or
@@ -822,10 +857,17 @@ int railfs_read(struct railfs_conn *conn, const char *path, u64 offset, void *bu
 int railfs_read_landed(struct railfs_conn *conn, const char *path, u64 offset, u32 len, const void **landed)
 {
 	void *into = NULL;
-	int got = railfs_read_core(conn, path, offset, &into, len);
+	int got = railfs_read_core(conn, path, offset, &into, NULL, len);
 
 	*landed = into;
 	return got;
+}
+
+int railfs_read_sg(struct railfs_conn *conn, const char *path, u64 offset, struct sg_table *pages, u32 len)
+{
+	void *into = NULL;
+
+	return railfs_read_core(conn, path, offset, &into, pages, len);
 }
 
 // The mirror of railfs_take_payload: the bytes out, on whichever channel this
@@ -867,6 +909,18 @@ static int railfs_give_payload_folios(struct railfs_conn *conn, u64 id, struct f
 	}
 
 	return left ? -EMSGSIZE : 0;
+}
+
+static int railfs_give_payload_sg(struct railfs_conn *conn, u64 id, struct sg_table *pages, u32 len)
+{
+	int err;
+
+	if (!conn->rail) {
+		return -EOPNOTSUPP;
+	}
+
+	err = railfs_rdma_push_sg(conn->rail, id, pages, len);
+	return err < 0 ? err : 0;
 }
 
 static int railfs_give_payload(struct railfs_conn *conn, u64 id, const void *buf, u32 len)
@@ -1028,9 +1082,9 @@ int railfs_create_file(struct railfs_conn *conn, const char *path)
 // the payload digest only when the session asked for verification, which this
 // one does not - the kernel has no xxhash.
 static int railfs_write_from(struct railfs_conn *conn, const char *path, u64 offset, const void *buf, struct folio **folios,
-			   unsigned int nr, u32 len, bool truncate)
+			   unsigned int nr, struct sg_table *gpu, u32 len, bool truncate)
 {
-	u8 digest[RAILFS_DIGEST_SIZE];
+	u8 digest[RAILFS_DIGEST_SIZE] = {};
 	struct railfs_cursor c;
 	u8 *payload = NULL;
 	u8 *frame = NULL;
@@ -1053,12 +1107,16 @@ static int railfs_write_from(struct railfs_conn *conn, const char *path, u64 off
 		return -EOPNOTSUPP;
 	}
 
+	if (gpu && !railfs_gpu_allowed(conn)) {
+		return -EOPNOTSUPP;
+	}
+
 	// Straight out of the folio when there is one, so nothing is copied only to
 	// be hashed.
 	mark = railfs_now();
 	if (folios) {
 		railfs_digest_folios(folios, nr, len, digest);
-	} else {
+	} else if (!gpu) {
 		railfs_digest(buf, len, digest);
 	}
 	railfs_trace_add(RAILFS_PHASE_WRITE_DIGEST, mark, len);
@@ -1098,7 +1156,13 @@ static int railfs_write_from(struct railfs_conn *conn, const char *path, u64 off
 
 	// The daemon posts its receive as soon as it has the request, so the bytes
 	// follow immediately on the data channel with the request id as the key.
-	err = folios ? railfs_give_payload_folios(conn, id, folios, nr, len) : railfs_give_payload(conn, id, buf, len);
+	if (folios) {
+		err = railfs_give_payload_folios(conn, id, folios, nr, len);
+	} else if (gpu) {
+		err = railfs_give_payload_sg(conn, id, gpu, len);
+	} else {
+		err = railfs_give_payload(conn, id, buf, len);
+	}
 	err = railfs_lose_on(conn, err);
 	if (err) {
 		goto unlock;
@@ -1703,11 +1767,16 @@ void railfs_disconnect(struct railfs_conn *conn)
 
 int railfs_write(struct railfs_conn *conn, const char *path, u64 offset, const void *buf, u32 len, bool truncate)
 {
-	return railfs_write_from(conn, path, offset, buf, NULL, 0, len, truncate);
+	return railfs_write_from(conn, path, offset, buf, NULL, 0, NULL, len, truncate);
 }
 
 int railfs_write_folios(struct railfs_conn *conn, const char *path, u64 offset, struct folio **folios, unsigned int nr, u32 len,
 		      bool truncate)
 {
-	return railfs_write_from(conn, path, offset, NULL, folios, nr, len, truncate);
+	return railfs_write_from(conn, path, offset, NULL, folios, nr, NULL, len, truncate);
+}
+
+int railfs_write_sg(struct railfs_conn *conn, const char *path, u64 offset, struct sg_table *pages, u32 len, bool truncate)
+{
+	return railfs_write_from(conn, path, offset, NULL, NULL, 0, pages, len, truncate);
 }

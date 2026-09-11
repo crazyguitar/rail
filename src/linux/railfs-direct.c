@@ -10,6 +10,7 @@
 #include <linux/uio.h>
 
 #include "railfs.h"
+#include "railfs-gds.h"
 
 // In runs rather than per call: at 256 KiB that is two thousand evictions a
 // read, and a write waits on the peer for each one.
@@ -124,6 +125,10 @@ ssize_t railfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		return generic_file_read_iter(iocb, to);
 	}
 
+	if (railfs_gds_claims(to)) {
+		return railfs_gds_read_iter(iocb, to);
+	}
+
 	iocb->ki_flags &= ~IOCB_DIRECT;
 	done = generic_file_read_iter(iocb, to);
 	iocb->ki_flags |= IOCB_DIRECT;
@@ -142,6 +147,10 @@ ssize_t railfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 	if (!(iocb->ki_flags & IOCB_DIRECT)) {
 		return generic_file_write_iter(iocb, from);
+	}
+
+	if (railfs_gds_claims(from)) {
+		return railfs_gds_write_iter(iocb, from);
 	}
 
 	iocb->ki_flags &= ~IOCB_DIRECT;
