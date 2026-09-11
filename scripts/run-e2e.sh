@@ -53,11 +53,13 @@ check_prerequisites() {
 # Slurm's node names resolve nowhere else, so the peer is its NodeAddr.
 OnNode=$(cat <<'INNER'
 set -e
-Nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
-Second=$(echo "$Nodes" | sed -n 2p)
-Serving=$(scontrol show node "$Second" | grep -oE 'NodeAddr=[^ ]+' | cut -d= -f2)
-[ -z "$Serving" ] && Serving="$Second"
-[ -n "$PEER_OVERRIDE" ] && Serving="$PEER_OVERRIDE"
+Serving="$PEER_OVERRIDE"
+if [ -z "$Serving" ]; then
+  Nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
+  Second=$(echo "$Nodes" | sed -n 2p)
+  Serving=$(scontrol show node "$Second" | grep -oE 'NodeAddr=[^ ]+' | cut -d= -f2)
+  [ -z "$Serving" ] && Serving="$Second"
+fi
 
 Marker="/tmp/rail-e2e-running-$SLURM_JOB_ID"
 if [ "$SLURM_PROCID" != "0" ]; then

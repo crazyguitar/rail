@@ -14,6 +14,7 @@
 #include <linux/mm.h>
 #include <linux/pagemap.h>
 #include <linux/slab.h>
+#include <linux/uio.h>
 #include <linux/writeback.h>
 
 #ifdef CONFIG_HIGHMEM
@@ -29,6 +30,7 @@
 #define RAILFS_HAS_FMODE_CAN_ODIRECT RAILFS_KERNEL_AT_LEAST(5, 19)
 #define RAILFS_HAS_WRITE_BEGIN_FLAGS (!RAILFS_KERNEL_AT_LEAST(5, 19))
 #define RAILFS_HAS_MNT_IDMAP RAILFS_KERNEL_AT_LEAST(6, 3)
+#define RAILFS_HAS_EXTRACT_PAGES RAILFS_KERNEL_AT_LEAST(6, 5)
 #define RAILFS_HAS_FOLIO_WRITEPAGE_T RAILFS_KERNEL_AT_LEAST(6, 3)
 #define RAILFS_HAS_FGP_WRITEBEGIN RAILFS_KERNEL_AT_LEAST(6, 4)
 #define RAILFS_HAS_FGF_ORDER RAILFS_KERNEL_AT_LEAST(6, 6)
@@ -45,6 +47,47 @@
 #define RAILFS_HAS_KIOCB_WRITE_BEGIN RAILFS_KERNEL_AT_LEAST(6, 17)
 #define RAILFS_HAS_MMAP_PREPARE RAILFS_KERNEL_AT_LEAST(6, 17)
 #define RAILFS_HAS_DEFAULT_D_OP RAILFS_KERNEL_AT_LEAST(6, 17)
+
+static inline ssize_t railfs_extract_pages(struct iov_iter *iter, struct page ***pages, size_t size,
+					 unsigned int maxpages, size_t *offset)
+{
+#if RAILFS_HAS_EXTRACT_PAGES
+	return iov_iter_extract_pages(iter, pages, size, maxpages, 0, offset);
+#else
+	ssize_t got;
+
+	if (!*pages) {
+		*pages = kvmalloc_array(maxpages, sizeof(**pages), GFP_KERNEL);
+		if (!*pages) {
+			return -ENOMEM;
+		}
+	}
+#if RAILFS_KERNEL_AT_LEAST(6, 0)
+	got = iov_iter_get_pages2(iter, *pages, size, maxpages, offset);
+#else
+	got = iov_iter_get_pages(iter, *pages, size, maxpages, offset);
+	if (got > 0) {
+		iov_iter_advance(iter, got);
+	}
+#endif
+	return got;
+#endif
+}
+
+static inline void railfs_release_pages(const struct iov_iter *iter, struct page **pages, unsigned int nr)
+{
+#if RAILFS_HAS_EXTRACT_PAGES
+	if (iov_iter_extract_will_pin(iter)) {
+		unpin_user_pages(pages, nr);
+	}
+#else
+	unsigned int i;
+
+	for (i = 0; i < nr; i++) {
+		put_page(pages[i]);
+	}
+#endif
+}
 
 #if !RAILFS_HAS_FOLIO
 struct folio {

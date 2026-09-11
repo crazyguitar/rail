@@ -94,6 +94,8 @@ void railfs_free_dirents(struct railfs_dirent *entries, u32 count);
 int railfs_read(struct railfs_conn *conn, const char *path, u64 offset, void *buf, u32 len);
 int railfs_read_landed(struct railfs_conn *conn, const char *path, u64 offset, u32 len, const void **landed);
 
+int railfs_read_sg(struct railfs_conn *conn, const char *path, u64 offset, struct sg_table *pages, u32 len);
+
 /* Writes len bytes of buf to path at offset. Returns the byte count the peer
  * accepted, or a negative errno.
  */
@@ -135,6 +137,7 @@ int railfs_write(struct railfs_conn *conn, const char *path, u64 offset, const v
 int railfs_write_folios(struct railfs_conn *conn, const char *path, u64 offset, struct folio **folios, unsigned int nr, u32 len,
 		      bool truncate);
 
+int railfs_write_sg(struct railfs_conn *conn, const char *path, u64 offset, struct sg_table *pages, u32 len, bool truncate);
 int railfs_pool_stat(struct railfs_pool *pool, const char *path, struct railfs_attrs *out, bool *found);
 int railfs_pool_list(struct railfs_pool *pool, const char *path, struct railfs_dirent **out, u32 *count);
 int railfs_pool_space_of(struct railfs_pool *pool, const char *path, struct railfs_space *out);
