@@ -47,6 +47,7 @@ set(RAILFS_SOURCES
     railfs-proto.h
     railfs-tcp.h
     railfs-rdma.h
+    rdma-link-rate.h
     railfs-trace.h)
 
 # kbuild reads this from src=, so it has to sit beside the sources. Generated

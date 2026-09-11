@@ -9,11 +9,10 @@ namespace rail {
 struct RdmaPort {
   std::string Device;
   uint8_t Port = 1;
+  uint32_t RateMbps = 0;
 };
 
-// Ports in the ACTIVE state. UCX stripes a rendezvous transfer across these,
-// so an empty list means it will quietly fall back to sockets over whatever
-// ordinary network exists, at a fraction of the speed.
+// Fastest first, then device name and port number.
 std::vector<RdmaPort> activeRdmaPorts();
 
 std::string describe(const std::vector<RdmaPort> &Ports);

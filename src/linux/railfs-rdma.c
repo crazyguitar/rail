@@ -18,6 +18,7 @@
 
 #include "railfs-rdma.h"
 #include "railfs-proto.h"
+#include "rdma-link-rate.h"
 
 #define RAILFS_CQ_DEPTH 64
 
@@ -74,6 +75,7 @@ struct railfs_line {
 	struct ib_device *device;
 	u32 port;
 	u32 index;
+	u32 rate_mbps;
 	struct ib_pd *pd;
 	struct ib_cq *cq;
 	struct ib_qp *qp;
@@ -145,9 +147,12 @@ static u32 railfs_shared_lines(struct railfs_rdma *rail)
 	return rail->live;
 }
 
-#define RAILFS_MAX_DEVICES 8
+struct railfs_device {
+	struct list_head link;
+	struct ib_device *device;
+};
 
-static struct ib_device *railfs_known[RAILFS_MAX_DEVICES];
+static LIST_HEAD(railfs_known);
 static DEFINE_MUTEX(railfs_known_lock);
 
 static int railfs_rdma_probe(struct ib_device *device);
@@ -162,58 +167,58 @@ static struct ib_client railfs_ib_client = {
 
 static int railfs_rdma_probe(struct ib_device *device)
 {
-	unsigned int i;
+	struct railfs_device *known = kzalloc(sizeof(*known), GFP_KERNEL);
 
-	mutex_lock(&railfs_known_lock);
-
-	for (i = 0; i < RAILFS_MAX_DEVICES; i++) {
-		if (!railfs_known[i]) {
-			railfs_known[i] = device;
-			break;
-		}
+	if (!known) {
+		return -ENOMEM;
 	}
 
+	known->device = device;
+	ib_set_client_data(device, &railfs_ib_client, known);
+	mutex_lock(&railfs_known_lock);
+	list_add_tail(&known->link, &railfs_known);
 	mutex_unlock(&railfs_known_lock);
 	return 0;
 }
 
 static void railfs_rdma_forget(struct ib_device *device, void *data)
 {
-	unsigned int i;
+	struct railfs_device *known = data;
 
 	mutex_lock(&railfs_known_lock);
-
-	for (i = 0; i < RAILFS_MAX_DEVICES; i++) {
-		if (railfs_known[i] == device) {
-			railfs_known[i] = NULL;
-			break;
-		}
-	}
-
+	list_del(&known->link);
 	mutex_unlock(&railfs_known_lock);
+	kfree(known);
 }
 
-// Half the devices on this hardware are down, and a queue pair on one of those
-// reaches ready and then carries nothing. Every active port is collected rather
-// than only the first: two of them is twice the bandwidth, and one rail is what
-// the mount used to be capped at.
+static bool railfs_line_precedes(const struct railfs_line *a, const struct railfs_line *b)
+{
+	int names;
+
+	if (a->rate_mbps != b->rate_mbps) {
+		return a->rate_mbps > b->rate_mbps;
+	}
+	names = strcmp(a->device->name, b->device->name);
+	return names ? names < 0 : a->port < b->port;
+}
+
+// Match userspace rail ordering.
 static u32 railfs_active_lines(struct railfs_line *out, u32 room)
 {
+	struct railfs_device *known;
 	u32 found = 0;
-	unsigned int i;
 
 	mutex_lock(&railfs_known_lock);
 
-	for (i = 0; i < RAILFS_MAX_DEVICES && found < room; i++) {
-		struct ib_device *device = railfs_known[i];
+	list_for_each_entry(known, &railfs_known, link) {
+		struct ib_device *device = known->device;
 		u32 port;
-
-		if (!device) {
-			continue;
-		}
 
 		rdma_for_each_port(device, port) {
 			struct ib_port_attr attr;
+			struct railfs_line candidate = { .device = device, .port = port };
+			u32 position;
+			u32 shift;
 
 			if (ib_query_port(device, port, &attr)) {
 				continue;
@@ -223,11 +228,20 @@ static u32 railfs_active_lines(struct railfs_line *out, u32 room)
 				continue;
 			}
 
-			out[found].device = device;
-			out[found].port = port;
-			out[found].index = found;
-			found++;
-			break;
+			candidate.rate_mbps = rail_rdma_rate_mbps(attr.active_speed, attr.active_width);
+			for (position = 0; position < found; position++) {
+				if (railfs_line_precedes(&candidate, &out[position])) {
+					break;
+				}
+			}
+			if (position == room) {
+				continue;
+			}
+			for (shift = min(found, room - 1); shift > position; shift--) {
+				out[shift] = out[shift - 1];
+			}
+			out[position] = candidate;
+			found = min(found + 1, room);
 		}
 	}
 
@@ -535,6 +549,7 @@ struct railfs_rdma *railfs_rdma_open(struct railfs_wire *wire)
 	for (i = 0; i < lines; i++) {
 		rail->line[i] = found[i];
 		rail->line[i].rail = rail;
+		rail->line[i].index = i;
 	}
 
 	// Counted before anything can fail, so close gives back whatever was
