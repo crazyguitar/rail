@@ -43,6 +43,24 @@ jobs:
           RAIL_MEMORY_REGIONS: 4
         run: ./build/tests/e2e/rail-e2e --gtest_filter='Codec.*:SafePath.*:Loop.*:Uring.*:Xdr.*:Pages.*'
 
+  module-floor:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the 5.15 headers
+        run: |
+          sudo apt-get update -qq
+          pkg=$(apt-cache search --names-only '^linux-headers-5\.15\.0-[0-9]+-generic$' | awk '{print $1}' | sort -V | tail -1)
+          sudo apt-get install -y -qq --no-install-recommends build-essential kmod "$pkg"
+          echo "KDIR=/usr/src/$pkg" >> "$GITHUB_ENV"
+
+      - name: Build the module against 5.15
+        run: make -C "$KDIR" M="$PWD/src/linux" modules
+
+      - name: Check the module
+        run: modinfo src/linux/railfs.ko
+
   package:
     runs-on: ubuntu-24.04
     steps:

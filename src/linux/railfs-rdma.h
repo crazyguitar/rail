@@ -4,6 +4,8 @@
 
 #include <linux/types.h>
 
+#include "railfs-compat.h"
+
 /* Mirrors src/transport/rdma-data-channel.cc. The blob below is memcpy'd onto
  * the wire by the peer, so every field here is layout, not convenience.
  */

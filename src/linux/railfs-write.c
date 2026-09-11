@@ -233,130 +233,191 @@ out:
 	return flush;
 }
 
+struct railfs_writeback {
+	struct address_space *mapping;
+	struct writeback_control *wbc;
+	struct railfs_options *opts;
+	struct railfs_path *path;
+	struct railfs_flush *flush;
+	unsigned int room;
+	int refusal;
+};
+
+static void railfs_flush_stage(struct railfs_flush *flush)
+{
+	u64 gather = railfs_now();
+	unsigned int seen;
+	size_t at = 0;
+
+	for (seen = 0; seen < flush->nr; seen++) {
+		size_t part = min_t(size_t, flush->len - at, folio_size(flush->folios[seen]));
+
+		memcpy_from_folio((char *)flush->buf + at, flush->folios[seen], 0, part);
+		at += part;
+	}
+	railfs_trace_add(RAILFS_PHASE_WRITE_GATHER, gather, flush->len);
+}
+
+// Staged into a buffer only once a flush outgrows one send's scatter list.
+static int railfs_flush_add(struct railfs_flush *flush, struct folio *folio, size_t bytes)
+{
+	if (!flush->nr) {
+		flush->offset = folio_pos(folio);
+	}
+
+	if (flush->nr >= RAILFS_MAX_SEND_FOLIOS && !flush->buf) {
+		flush->buf = kvmalloc(RAILFS_PAGE_SIZE, GFP_NOFS);
+		if (!flush->buf) {
+			return -ENOMEM;
+		}
+	}
+
+	if (flush->nr == RAILFS_MAX_SEND_FOLIOS) {
+		railfs_flush_stage(flush);
+	}
+
+	if (flush->nr >= RAILFS_MAX_SEND_FOLIOS) {
+		u64 gather = railfs_now();
+
+		memcpy_from_folio((char *)flush->buf + flush->len, folio, 0, bytes);
+		railfs_trace_add(RAILFS_PHASE_WRITE_GATHER, gather, bytes);
+	}
+
+	flush->folios[flush->nr++] = folio;
+	flush->len += bytes;
+	return 0;
+}
+
+static bool railfs_flush_fits(const struct railfs_flush *flush, loff_t pos, size_t bytes)
+{
+	return pos == flush->offset + (loff_t)flush->len && flush->len + bytes <= RAILFS_PAGE_SIZE && flush->nr < flush->room;
+}
+
+// The iterator holds a batch of references that only its own end releases, so
+// after a refusal the rest are deferred, not the loop left.
+static int railfs_writeback_gather(struct railfs_writeback *wb, struct folio *folio, size_t bytes)
+{
+	loff_t pos = folio_pos(folio);
+	int err;
+
+	if (wb->refusal) {
+		return wb->refusal;
+	}
+
+	if (wb->flush && !railfs_flush_fits(wb->flush, pos, bytes)) {
+		err = railfs_flush_queue(wb->flush, wb->wbc);
+		wb->flush = NULL;
+		if (err) {
+			wb->refusal = err;
+			return err;
+		}
+	}
+
+	if (!wb->flush) {
+		wb->flush = railfs_flush_new(wb->mapping, wb->opts, wb->path, wb->room);
+	}
+
+	if (!wb->flush) {
+		return -ENOMEM;
+	}
+
+	return railfs_flush_add(wb->flush, folio, bytes);
+}
+
+static int railfs_writeback_folio(struct folio *folio, struct writeback_control *wbc, void *data)
+{
+	struct railfs_writeback *wb = data;
+	loff_t isize = i_size_read(wb->mapping->host);
+	loff_t pos = folio_pos(folio);
+	size_t bytes = folio_size(folio);
+	int err;
+
+	if (pos >= isize) {
+		bytes = 0;
+	} else if (pos + (loff_t)bytes > isize) {
+		bytes = (size_t)(isize - pos);
+	}
+
+	folio_start_writeback(folio);
+	folio_unlock(folio);
+
+	if (!bytes) {
+		folio_end_writeback(folio);
+		return 0;
+	}
+
+	if (bytes > RAILFS_PAGE_SIZE) {
+		return railfs_flush_big(wb->mapping, wbc, wb->opts, wb->path->name, folio, bytes);
+	}
+
+	err = railfs_writeback_gather(wb, folio, bytes);
+	if (err) {
+		railfs_folio_defer(wbc, folio);
+	}
+	return err;
+}
+
+#if RAILFS_HAS_WRITEBACK_ITER
+static int railfs_writeback_each(struct railfs_writeback *wb, struct writeback_control *wbc)
+{
+	struct folio *folio = NULL;
+	int error = 0;
+
+	while ((folio = writeback_iter(wb->mapping, wbc, folio, &error))) {
+		error = railfs_writeback_folio(folio, wbc, wb);
+	}
+	return error;
+}
+#elif RAILFS_HAS_FOLIO_WRITEPAGE_T
+static int railfs_writeback_each(struct railfs_writeback *wb, struct writeback_control *wbc)
+{
+	return write_cache_pages(wb->mapping, wbc, railfs_writeback_folio, wb);
+}
+#else
+static int railfs_writeback_page(struct page *page, struct writeback_control *wbc, void *data)
+{
+	return railfs_writeback_folio(page_folio(page), wbc, data);
+}
+
+static int railfs_writeback_each(struct railfs_writeback *wb, struct writeback_control *wbc)
+{
+	return write_cache_pages(wb->mapping, wbc, railfs_writeback_page, wb);
+}
+#endif
+
 int railfs_writepages(struct address_space *mapping, struct writeback_control *wbc)
 {
 	struct inode *inode = mapping->host;
 	struct railfs_options *opts = inode->i_sb->s_fs_info;
-	struct railfs_path *path = railfs_path_hold(inode);
-	unsigned int room = RAILFS_PAGE_SIZE / PAGE_SIZE;
-	struct railfs_flush *flush = NULL;
-	struct folio *folio = NULL;
-	bool refused = false;
-	int error = 0;
-	u64 gather;
+	struct railfs_writeback wb = {
+		.mapping = mapping,
+		.wbc = wbc,
+		.opts = opts,
+		.path = railfs_path_hold(inode),
+		.room = RAILFS_PAGE_SIZE / PAGE_SIZE,
+	};
+	int error;
 
-	if (!opts || !opts->pool || !path || !railfs_page_wq) {
+	if (!opts || !opts->pool || !wb.path || !railfs_page_wq) {
 		error = -ENOTCONN;
 		goto out;
 	}
 
-	while ((folio = writeback_iter(mapping, wbc, folio, &error))) {
-		loff_t isize = i_size_read(inode);
-		loff_t pos = folio_pos(folio);
-		size_t bytes = folio_size(folio);
+	error = railfs_writeback_each(&wb, wbc);
 
-		if (pos >= isize) {
-			bytes = 0;
-		} else if (pos + (loff_t)bytes > isize) {
-			bytes = (size_t)(isize - pos);
-		}
-
-		folio_start_writeback(folio);
-		folio_unlock(folio);
-
-		if (!bytes) {
-			folio_end_writeback(folio);
-			error = 0;
-			continue;
-		}
-
-		// The iterator holds a batch of references that only its own end
-		// releases, so after a refusal the rest are deferred, not the loop left.
-		if (refused) {
-			railfs_folio_defer(wbc, folio);
-			continue;
-		}
-
-		if (bytes > RAILFS_PAGE_SIZE) {
-			error = railfs_flush_big(mapping, wbc, opts, path->name, folio, bytes);
-			continue;
-		}
-
-		if (flush && (pos != flush->offset + (loff_t)flush->len || flush->len + bytes > RAILFS_PAGE_SIZE || flush->nr == flush->room)) {
-			error = railfs_flush_queue(flush, wbc);
-			flush = NULL;
-			if (error) {
-				refused = true;
-				railfs_folio_defer(wbc, folio);
-				continue;
-			}
-		}
-
-		if (!flush) {
-			flush = railfs_flush_new(mapping, opts, path, room);
-		}
-
-		if (!flush) {
-			railfs_folio_defer(wbc, folio);
-			error = -ENOMEM;
-			continue;
-		}
-
-		if (!flush->nr) {
-			flush->offset = pos;
-		}
-
-		// Copied only once a flush outgrows what one send can scatter. Up to
-		// that they are left where they are and sent from the page cache.
-		if (flush->nr >= RAILFS_MAX_SEND_FOLIOS && !flush->buf) {
-			flush->buf = kvmalloc(RAILFS_PAGE_SIZE, GFP_NOFS);
-			if (!flush->buf) {
-				railfs_folio_defer(wbc, folio);
-				error = -ENOMEM;
-				continue;
-			}
-		}
-
-		if (flush->nr == RAILFS_MAX_SEND_FOLIOS) {
-			unsigned int seen;
-			size_t at = 0;
-
-			gather = railfs_now();
-			for (seen = 0; seen < flush->nr; seen++) {
-				size_t part = min_t(size_t, flush->len - at, folio_size(flush->folios[seen]));
-
-				memcpy_from_folio((char *)flush->buf + at, flush->folios[seen], 0, part);
-				at += part;
-			}
-			railfs_trace_add(RAILFS_PHASE_WRITE_GATHER, gather, flush->len);
-		}
-
-		if (flush->nr >= RAILFS_MAX_SEND_FOLIOS) {
-			gather = railfs_now();
-			memcpy_from_folio((char *)flush->buf + flush->len, folio, 0, bytes);
-			railfs_trace_add(RAILFS_PHASE_WRITE_GATHER, gather, bytes);
-		}
-
-		flush->folios[flush->nr++] = folio;
-		flush->len += bytes;
-		error = 0;
-	}
-
-	if (flush) {
-		int queued = railfs_flush_queue(flush, wbc);
+	if (wb.flush) {
+		int queued = railfs_flush_queue(wb.flush, wbc);
 
 		if (queued && !error) {
 			error = queued;
 		}
 	}
-
 out:
-	railfs_path_put(path);
+	railfs_path_put(wb.path);
 	return error;
 }
 
-int railfs_write_begin(const struct kiocb *iocb, struct address_space *mapping, loff_t pos, unsigned int len, struct folio **foliop,
-			    void **fsdata)
+static int railfs_write_begin_folio(struct address_space *mapping, loff_t pos, unsigned int len, struct folio **foliop)
 {
 	struct folio *folio;
 	int err = 0;
@@ -365,7 +426,7 @@ int railfs_write_begin(const struct kiocb *iocb, struct address_space *mapping, 
 	// is two hundred and fifty six separate folios, which is that many copies
 	// into the flush buffer and far more scatter entries than a queue pair will
 	// take. The mapping already allows the order; the read path uses it.
-	folio = __filemap_get_folio(mapping, pos >> PAGE_SHIFT, FGP_WRITEBEGIN | fgf_set_order(len), mapping_gfp_mask(mapping));
+	folio = railfs_get_folio(mapping, pos >> PAGE_SHIFT, FGP_WRITEBEGIN | fgf_set_order(len));
 	if (IS_ERR(folio)) {
 		err = PTR_ERR(folio);
 		goto out;
@@ -394,8 +455,7 @@ out:
 	return err;
 }
 
-int railfs_write_end(const struct kiocb *iocb, struct address_space *mapping, loff_t pos, unsigned int len, unsigned int copied,
-			  struct folio *folio, void *fsdata)
+static int railfs_write_end_folio(struct address_space *mapping, loff_t pos, unsigned int len, unsigned int copied, struct folio *folio)
 {
 	struct inode *inode = mapping->host;
 	loff_t last = pos + copied;
@@ -425,3 +485,56 @@ out:
 	return copied;
 }
 
+#if RAILFS_HAS_KIOCB_WRITE_BEGIN
+int railfs_write_begin(const struct kiocb *iocb, struct address_space *mapping, loff_t pos, unsigned int len, struct folio **foliop,
+		       void **fsdata)
+{
+	return railfs_write_begin_folio(mapping, pos, len, foliop);
+}
+
+int railfs_write_end(const struct kiocb *iocb, struct address_space *mapping, loff_t pos, unsigned int len, unsigned int copied,
+		     struct folio *folio, void *fsdata)
+{
+	return railfs_write_end_folio(mapping, pos, len, copied, folio);
+}
+#elif RAILFS_HAS_FOLIO_WRITE_BEGIN
+int railfs_write_begin(struct file *file, struct address_space *mapping, loff_t pos, unsigned int len, struct folio **foliop,
+		       void **fsdata)
+{
+	return railfs_write_begin_folio(mapping, pos, len, foliop);
+}
+
+int railfs_write_end(struct file *file, struct address_space *mapping, loff_t pos, unsigned int len, unsigned int copied,
+		     struct folio *folio, void *fsdata)
+{
+	return railfs_write_end_folio(mapping, pos, len, copied, folio);
+}
+#else
+static int railfs_write_begin_page(struct address_space *mapping, loff_t pos, unsigned int len, struct page **pagep)
+{
+	struct folio *folio;
+	int err = railfs_write_begin_folio(mapping, pos, len, &folio);
+
+	if (!err) {
+		*pagep = folio_file_page(folio, pos >> PAGE_SHIFT);
+	}
+	return err;
+}
+
+#if RAILFS_HAS_WRITE_BEGIN_FLAGS
+int railfs_write_begin(struct file *file, struct address_space *mapping, loff_t pos, unsigned int len, unsigned int flags,
+		       struct page **pagep, void **fsdata)
+#else
+int railfs_write_begin(struct file *file, struct address_space *mapping, loff_t pos, unsigned int len, struct page **pagep,
+		       void **fsdata)
+#endif
+{
+	return railfs_write_begin_page(mapping, pos, len, pagep);
+}
+
+int railfs_write_end(struct file *file, struct address_space *mapping, loff_t pos, unsigned int len, unsigned int copied,
+		     struct page *page, void *fsdata)
+{
+	return railfs_write_end_folio(mapping, pos, len, copied, page_folio(page));
+}
+#endif

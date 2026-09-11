@@ -15,6 +15,12 @@ so. Secure Boot needs the module signed - `cmake --build build --target
 railfs-mok` makes a key for this machine, `railfs-sign` stamps the module, and
 `scripts/enroll-mok.sh` walks through enrolling it.
 
+The module builds on kernels 5.15 through 6.17; `src/linux/railfs-compat.h`
+carries the differences. Below 6.12 the page cache cannot be told the largest
+folio one fetch can fill, so the module keeps to single-page folios there and
+`minfolio=` is ignored. 5.15, 6.1, 6.8, 6.11 and 6.14 are compile-checked;
+6.17 is what the suite runs on.
+
 `insmod build/src/linux/railfs.ko` loads it from the build tree. Installing it
 puts it where `modprobe` looks, which the Kubernetes mount needs:
 

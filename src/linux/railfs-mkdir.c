@@ -63,3 +63,10 @@ out:
 	kfree(path);
 	return result;
 }
+
+#if !RAILFS_HAS_MKDIR_DENTRY
+int railfs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode)
+{
+	return PTR_ERR_OR_ZERO(railfs_mkdir_op(idmap, dir, dentry, mode));
+}
+#endif

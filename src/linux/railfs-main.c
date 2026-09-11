@@ -94,7 +94,11 @@ const struct file_operations railfs_file_ops = {
 	.fsync = railfs_fsync,
 	.flush = railfs_file_flush,
 	.llseek = generic_file_llseek,
+#if RAILFS_HAS_MMAP_PREPARE
 	.mmap_prepare = generic_file_mmap_prepare,
+#else
+	.mmap = generic_file_mmap,
+#endif
 };
 
 
@@ -183,7 +187,11 @@ const struct inode_operations railfs_dir_inode_ops = {
 	.lookup = railfs_lookup,
 	.create = railfs_create,
 	.unlink = railfs_unlink,
+#if RAILFS_HAS_MKDIR_DENTRY
 	.mkdir = railfs_mkdir_op,
+#else
+	.mkdir = railfs_mkdir,
+#endif
 	.rmdir = railfs_rmdir,
 	.rename = railfs_rename,
 	.symlink = railfs_symlink,
@@ -614,12 +622,23 @@ struct kmem_cache *railfs_inode_cache;
 struct workqueue_struct *railfs_page_wq;
 
 const struct address_space_operations railfs_aops = {
+#if RAILFS_HAS_READ_FOLIO
 	.read_folio = railfs_read_folio,
+#else
+	.readpage = railfs_readpage,
+#endif
 	.readahead = railfs_readahead,
 	.writepages = railfs_writepages,
 	.write_begin = railfs_write_begin,
 	.write_end = railfs_write_end,
+#if RAILFS_HAS_DIRTY_FOLIO
 	.dirty_folio = filemap_dirty_folio,
+#else
+	.set_page_dirty = __set_page_dirty_nobuffers,
+#endif
+#if !RAILFS_HAS_FMODE_CAN_ODIRECT
+	.direct_IO = railfs_direct_IO,
+#endif
 };
 
 static unsigned int railfs_inflight = RAILFS_FETCH_INFLIGHT;
