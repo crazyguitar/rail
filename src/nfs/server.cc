@@ -4,6 +4,7 @@
 #include "rail/vfs/remotes.h"
 
 #include "rail/app/checksum.h"
+#include "rail/io/inbox.h"
 #include "rail/io/runner.h"
 #include "rail/io/stream.h"
 #include "rail/nfs/rpc.h"
@@ -1394,64 +1395,6 @@ void startSession(const ExportOptions &Opts, std::vector<Live> &Running, Stream 
   Slot.Task.start();
   Running.push_back(std::move(Slot));
 }
-
-class Inbox {
-public:
-  Inbox() : Wake(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)) {}
-  Inbox(const Inbox &) = delete;
-  Inbox &operator=(const Inbox &) = delete;
-  ~Inbox() {
-    if (Wake >= 0) ::close(Wake);
-  }
-
-  bool usable() const { return Wake >= 0; }
-  int wakeFd() const { return Wake; }
-  bool stopped() const { return Stopping.load(); }
-
-  void post(Stream Conn) {
-    {
-      const std::lock_guard<std::mutex> Held(Lock);
-      Handed.push_back(std::move(Conn));
-    }
-    ring();
-  }
-
-  void stop() {
-    Stopping.store(true);
-    ring();
-  }
-
-  std::deque<Stream> take() {
-    const std::lock_guard<std::mutex> Held(Lock);
-    return std::exchange(Handed, {});
-  }
-
-  Coro<void> wakeup() {
-    co_await WaitFor{Wake, EPOLLIN};
-    uint64_t Ticks = 0;
-    [[maybe_unused]] auto Got = ::read(Wake, &Ticks, sizeof(Ticks));
-  }
-
-private:
-  void ring() {
-    const uint64_t One = 1;
-    [[maybe_unused]] auto Wrote = ::write(Wake, &One, sizeof(One));
-  }
-
-  int Wake;
-  std::atomic<bool> Stopping{false};
-  std::mutex Lock;
-  std::deque<Stream> Handed;
-};
-
-struct Attending {
-  Inbox &In;
-
-  explicit Attending(Inbox &In) : In(In) {}
-  Attending(const Attending &) = delete;
-  Attending &operator=(const Attending &) = delete;
-  ~Attending() { Loop::get().forget(In.wakeFd()); }
-};
 
 Coro<Result<void>> serveInbox(const ExportOptions &Opts, Inbox &In) {
   const Attending Mine(In);

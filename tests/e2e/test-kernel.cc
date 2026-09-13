@@ -670,10 +670,36 @@ TEST_F(Kernel, NamesTheConnectionCountItWasGiven) {
   EXPECT_NE(readWholeFile("/proc/mounts").find("conns=4"), std::string::npos);
 }
 
+// A connection carries many requests at once: four readers on a mount with
+// one connection have their fetches on the wire together, not in turn.
+TEST_F(Kernel, SharesOneConnectionAcrossReaders) {
+  std::vector<std::filesystem::path> Locals;
+  for (int I = 0; I < 4; I++) {
+    Locals.push_back(makeFile("kernel-share-" + std::to_string(I) + ".bin", 24u << 20, 60 + I));
+    seedRemote(Locals.back(), Export + "/share" + std::to_string(I) + ".bin");
+  }
+
+  const std::string Readers = "for i in 0 1 2 3; do dd if=" + Mountpoint + "/share$i.bin of=/dev/null bs=1M 2>/dev/null & done; wait";
+
+  ASSERT_TRUE(mountIt(defaultOptions() + ",conns=1"));
+  ASSERT_TRUE(dropCaches().has_value());
+  forgetCounters();
+  [[maybe_unused]] auto Ran = runLocal({"sh", "-c", Readers});
+  const int Together = busiestCalls();
+
+  ASSERT_GE(Together, 0) << "the module did not report its counters; is debugfs mounted";
+  EXPECT_GT(Together, 1) << "a one-connection mount never had more than " << Together << " request in flight";
+  EXPECT_EQ(busiestConnections(), 1);
+
+  for (int I = 0; I < 4; I++) {
+    EXPECT_EQ(digestThrough("share" + std::to_string(I) + ".bin"), digestOf(Locals[I]));
+  }
+}
+
 TEST_F(Kernel, ParallelReadersSpreadAcrossTheConnectionPool) {
-  // Every operation holds a connection for its whole exchange, so a mount with
-  // one is serial by construction. This is the only check that the pool is
-  // actually being spread across.
+  // A connection is busy while any request is on it, so a mount with one can
+  // never show two busy. This is the only check that the pool is actually
+  // being spread across.
   for (int I = 0; I < 4; I++) {
     const auto Local = makeFile("kernel-par-" + std::to_string(I) + ".bin", 24u << 20, 70 + I);
     seedRemote(Local, Export + "/par" + std::to_string(I) + ".bin");

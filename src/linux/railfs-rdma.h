@@ -2,9 +2,14 @@
 #ifndef RAILFS_RDMA_H
 #define RAILFS_RDMA_H
 
+#include <linux/completion.h>
+#include <linux/kref.h>
+#include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/scatterlist.h>
 #include <linux/types.h>
+
+#include <rdma/ib_verbs.h>
 
 #include "railfs-compat.h"
 #include "railfs-msg.h"
@@ -24,14 +29,11 @@
 #define RAILFS_IS_CTS (1u << 31)
 #define RAILFS_RING_BYTES (RAILFS_CTS_SLOTS * RAILFS_CTS_BYTES)
 
-/* How many pages one rail can have on the wire at once. One, because a ranged
- * read offers a page and waits for it. A streamed fetch that raised this was
- * built twice and measured worse both times - see tune.md section 41 - and
- * each slot costs a megabyte of coherent landing memory per rail per
- * connection, because the peer chooses which rail carries a page and every
- * rail has to have somewhere to put it.
+/* Pages one connection can have on the wire at once, each a landing page on
+ * every rail since the peer picks the rail. Matches what the connection
+ * admits, so an admitted transfer always finds a slot.
  */
-#define RAILFS_STREAM_SLOTS 1
+#define RAILFS_STREAM_SLOTS RAILFS_CONN_DEPTH
 
 struct railfs_rail_wire {
 	u8 gid[16];
@@ -48,55 +50,13 @@ struct railfs_wire {
 	struct railfs_rail_wire line[RAILFS_MAX_RAILS];
 } __packed;
 
-struct railfs_rdma;
-
-int railfs_rdma_start(void);
-void railfs_rdma_stop(void);
-
-/* Builds a rail on the first active port and fills wire with what the peer
- * needs to reach it.
- */
-struct railfs_rdma *railfs_rdma_open(struct railfs_wire *wire);
-void railfs_rdma_close(struct railfs_rdma *rdma);
-
-/* Drives the queue pair to ready against the peer named in wire. */
-int railfs_rdma_meet(struct railfs_rdma *rdma, const struct railfs_wire *wire);
-
-/* Tells the peer where to put the payload for key, waits for it to land, and
- * copies it out. Returns the byte count or a negative errno.
- */
-int railfs_rdma_fetch(struct railfs_rdma *rdma, u64 key, void *buf, u32 len);
-int railfs_rdma_fetch_landed(struct railfs_rdma *rdma, u64 key, u32 len, const void **landed);
-
-/* The same exchange split in two, so a caller can have RAILFS_STREAM_SLOTS of
- * them outstanding. Offer says where the page for key should land and returns
- * as soon as the request is on the wire; collect waits for that page and copies
- * it out. A slot may not be offered again until it has been collected.
- */
-int railfs_rdma_offer(struct railfs_rdma *rdma, u32 slot, u64 key, u32 len);
-int railfs_rdma_collect(struct railfs_rdma *rdma, u32 slot, void *buf, u32 len);
-
-/* Waits for the peer to say where it wants the bytes, then writes them there.
- * Returns the byte count or a negative errno.
- */
-int railfs_rdma_push(struct railfs_rdma *rdma, u64 key, const void *buf, u32 len);
-
-/* The same push, reading out of the page cache rather than a staging copy.
- * The folio has to cover the whole length.
- */
-int railfs_rdma_push_folios(struct railfs_rdma *rdma, u64 key, struct folio **folios, unsigned int nr, u32 len);
-
-int railfs_rdma_fetch_sg(struct railfs_rdma *rdma, u64 key, struct sg_table *pages, u32 len);
-int railfs_rdma_push_sg(struct railfs_rdma *rdma, u64 key, struct sg_table *pages, u32 len);
-
 /* One clear-to-send record, written by rdma into the peer's ring. Layout is
  * wire format: struct Cts in src/transport/rdma-data-channel.cc.
  */
 struct railfs_cts {
 	u64 key;
-	/* One per rail. A process repeats one virtual address here; this side
-	 * registers per device and gets a different address on each, which is
-	 * what the second address exists for.
+	/* One per rail: this side registers per device and gets a different
+	 * address on each.
 	 */
 	u64 addr[RAILFS_MAX_RAILS];
 	u32 length;
@@ -104,5 +64,60 @@ struct railfs_cts {
 	u32 rkey[RAILFS_MAX_RAILS];
 	u32 seq;
 } __packed;
+
+struct railfs_rdma;
+
+/* One write waiting for its clear-to-send, matched by key. Shared with the
+ * send completion, which may outlive the caller, so it is counted not owned.
+ */
+struct railfs_push {
+	struct list_head link;
+	struct kref ref;
+	u64 key;
+	struct railfs_cts cts;
+	struct completion asked;
+	struct completion sent;
+	struct ib_cqe cqe;
+	int asked_err;
+	int sent_err;
+};
+
+int railfs_rdma_start(void);
+void railfs_rdma_stop(void);
+
+/* Builds a rail on every active port and fills wire with what the peer needs
+ * to reach them.
+ */
+struct railfs_rdma *railfs_rdma_open(struct railfs_wire *wire);
+void railfs_rdma_close(struct railfs_rdma *rdma);
+
+/* Drives the queue pairs to ready against the peer named in wire. */
+int railfs_rdma_meet(struct railfs_rdma *rdma, const struct railfs_wire *wire);
+
+/* Flushes every queue pair and fails everything waiting. The rail does not
+ * come back; the connection it belongs to is replaced.
+ */
+void railfs_rdma_break(struct railfs_rdma *rdma);
+
+/* A read in two halves: begin offers a slot for key, end waits for the page
+ * (*at is NULL for gpu pages). Every begin owes an end, every end a release.
+ */
+int railfs_rdma_fetch_begin(struct railfs_rdma *rdma, u64 key, u32 len, struct sg_table *gpu, u32 *slot);
+int railfs_rdma_fetch_end(struct railfs_rdma *rdma, u32 slot, const void **at);
+void railfs_rdma_slot_release(struct railfs_rdma *rdma, u32 slot);
+
+/* A slot whose page is still coming but nobody waits for: released by the
+ * landing itself, not before, so a later read cannot be handed the old page.
+ */
+void railfs_rdma_slot_orphan(struct railfs_rdma *rdma, u32 slot);
+
+/* A write in two halves: expect registers the push before the request goes
+ * out, push waits for the clear-to-send, forget drops the caller's reference.
+ */
+struct railfs_push *railfs_rdma_expect(struct railfs_rdma *rdma, u64 key);
+void railfs_rdma_forget(struct railfs_rdma *rdma, struct railfs_push *push);
+int railfs_rdma_push(struct railfs_rdma *rdma, struct railfs_push *push, const void *buf, u32 len);
+int railfs_rdma_push_folios(struct railfs_rdma *rdma, struct railfs_push *push, struct folio **folios, unsigned int nr, u32 len);
+int railfs_rdma_push_sg(struct railfs_rdma *rdma, struct railfs_push *push, struct sg_table *pages, u32 len);
 
 #endif

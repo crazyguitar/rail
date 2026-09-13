@@ -116,9 +116,14 @@ protected:
   }
 
   // Use the module counter; timing-based concurrency checks are flaky.
-  int busiestConnections() {
+  int busiestConnections() { return highWater("conns busy now "); }
+
+  // Requests between their send and their reply, across the mount.
+  int busiestCalls() { return highWater("calls now "); }
+
+  int highWater(const std::string &Line) {
     const std::string Stats = readWholeFile("/sys/kernel/debug/railfs/stats");
-    const auto At = Stats.find("conns busy now ");
+    const auto At = Stats.find(Line);
     if (At == std::string::npos) return -1;
     const auto Most = Stats.find("most ", At);
     if (Most == std::string::npos) return -1;
