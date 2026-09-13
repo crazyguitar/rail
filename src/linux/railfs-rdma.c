@@ -44,6 +44,13 @@
 #define RAILFS_WAIT_MS 30000
 #define RAILFS_ARM_WAIT_MS 5000
 
+// Whether anyone still waits for the page a slot was offered for. The landing
+// and the caller's departure race, and exactly one of them gives the slot
+// back, so they meet on a cmpxchg rather than on a plain flag.
+#define RAILFS_SLOT_LIVE 0
+#define RAILFS_SLOT_ORPHAN 1
+#define RAILFS_SLOT_LANDED 2
+
 // One page offered to the peer and not yet collected. Every slot has its own
 // completion because the peer answers them in whatever order its reader
 // reaches them, and a single completion cannot say which one arrived.
@@ -54,7 +61,7 @@ struct railfs_slot {
 	// are is not known until the completion says.
 	u32 line;
 	bool gpu;
-	bool orphan;
+	atomic_t state;
 };
 
 // One slot's page on one rail: its own allocation, so the pages need not be
@@ -585,6 +592,7 @@ struct railfs_rdma *railfs_rdma_open(struct railfs_wire *wire)
 	// was built.
 	for (slot = 0; slot < RAILFS_STREAM_SLOTS; slot++) {
 		init_completion(&rail->slot[slot].done);
+		atomic_set(&rail->slot[slot].state, RAILFS_SLOT_LIVE);
 	}
 
 	bitmap_fill(rail->free, RAILFS_STREAM_SLOTS);
@@ -791,7 +799,7 @@ static int railfs_gpu_bind(struct railfs_line *line, struct sg_table *pages, enu
 
 	err = railfs_arm(line, mr, access);
 	if (err) {
-		line->rail->broken = true;
+		WRITE_ONCE(line->rail->broken, true);
 		ib_drain_qp(line->qp);
 		goto unmap;
 	}
@@ -810,8 +818,8 @@ static void railfs_gpu_unbind(struct railfs_line *line)
 		return;
 	}
 
-	if (line->rail->broken || railfs_disarm(line, line->gpu_mr)) {
-		line->rail->broken = true;
+	if (READ_ONCE(line->rail->broken) || railfs_disarm(line, line->gpu_mr)) {
+		WRITE_ONCE(line->rail->broken, true);
 		ib_drain_qp(line->qp);
 	}
 
@@ -932,7 +940,7 @@ static void railfs_strand_all(struct railfs_rdma *rail, int err)
 	struct railfs_push *next;
 	u32 slot;
 
-	rail->broken = true;
+	WRITE_ONCE(rail->broken, true);
 
 	for (slot = 0; slot < RAILFS_STREAM_SLOTS; slot++) {
 		rail->slot[slot].err = err;
@@ -1020,14 +1028,16 @@ static void railfs_on_landed(struct ib_cq *cq, struct ib_wc *wc)
 		return;
 	}
 
-	if (rail->slot[imm].orphan) {
-		rail->slot[imm].orphan = false;
+	rail->slot[imm].err = 0;
+	rail->slot[imm].line = line->index;
+
+	// Claim the slot before completing it. Losing the exchange means the
+	// caller has already gone, and the page is ours to throw away.
+	if (atomic_cmpxchg(&rail->slot[imm].state, RAILFS_SLOT_LIVE, RAILFS_SLOT_LANDED) == RAILFS_SLOT_ORPHAN) {
 		railfs_rdma_slot_release(rail, imm);
 		return;
 	}
 
-	rail->slot[imm].err = 0;
-	rail->slot[imm].line = line->index;
 	complete(&rail->slot[imm].done);
 }
 
@@ -1041,7 +1051,7 @@ static void railfs_rail_break(struct railfs_rdma *rail)
 	struct ib_qp_attr attr = {};
 	u32 i;
 
-	rail->broken = true;
+	WRITE_ONCE(rail->broken, true);
 	attr.qp_state = IB_QPS_ERR;
 
 	for (i = 0; i < rail->lines; i++) {
@@ -1049,6 +1059,10 @@ static void railfs_rail_break(struct railfs_rdma *rail)
 			pr_err("railfs: could not flush rail %u after a timeout\n", i);
 		}
 	}
+
+	// The timeout paths reach here without railfs_strand_all, so this is the
+	// only wake anyone parked for a slot gets.
+	wake_up(&rail->slot_room);
 }
 
 void railfs_rdma_break(struct railfs_rdma *rail)
@@ -1107,7 +1121,7 @@ static int railfs_rdma_offer_at(struct railfs_rdma *rail, u32 slot, u64 key, u32
 		return -EMSGSIZE;
 	}
 
-	if (rail->broken) {
+	if (READ_ONCE(rail->broken)) {
 		return -ENOTCONN;
 	}
 
@@ -1116,9 +1130,12 @@ static int railfs_rdma_offer_at(struct railfs_rdma *rail, u32 slot, u64 key, u32
 		return -ENOTCONN;
 	}
 
+	// Armed before the clear-to-send goes out: from here the peer may land a
+	// page at any moment, and the landing has to find the slot claimable.
 	reinit_completion(&rail->slot[slot].done);
 	rail->slot[slot].err = 0;
 	rail->slot[slot].line = 0;
+	atomic_set(&rail->slot[slot].state, RAILFS_SLOT_LIVE);
 
 	post->cts_cqe.done = railfs_on_cts_sent;
 
@@ -1166,19 +1183,19 @@ static int railfs_slot_take(struct railfs_rdma *rail, u32 *slot)
 	for (;;) {
 		u32 at;
 
-		if (rail->broken) {
+		if (READ_ONCE(rail->broken)) {
 			return -ENOTCONN;
 		}
 
 		at = find_first_bit(rail->free, RAILFS_STREAM_SLOTS);
 		if (at < RAILFS_STREAM_SLOTS && test_and_clear_bit(at, rail->free)) {
 			rail->slot[at].gpu = false;
-			rail->slot[at].orphan = false;
+			atomic_set(&rail->slot[at].state, RAILFS_SLOT_LIVE);
 			*slot = at;
 			return 0;
 		}
 
-		if (wait_event_killable(rail->slot_room, rail->broken || railfs_slot_free(rail))) {
+		if (wait_event_killable(rail->slot_room, READ_ONCE(rail->broken) || railfs_slot_free(rail))) {
 			return -ERESTARTSYS;
 		}
 	}
@@ -1201,12 +1218,16 @@ void railfs_rdma_slot_orphan(struct railfs_rdma *rail, u32 slot)
 		return;
 	}
 
-	if (rail->broken) {
+	if (READ_ONCE(rail->broken)) {
 		railfs_rdma_slot_release(rail, slot);
 		return;
 	}
 
-	rail->slot[slot].orphan = true;
+	// Losing the exchange means the page landed while this caller was
+	// leaving, so nothing else is coming and the slot is ours to give back.
+	if (atomic_cmpxchg(&rail->slot[slot].state, RAILFS_SLOT_LIVE, RAILFS_SLOT_ORPHAN) != RAILFS_SLOT_LIVE) {
+		railfs_rdma_slot_release(rail, slot);
+	}
 }
 
 static void railfs_gpu_unbind_all(struct railfs_rdma *rail, u32 bound)
@@ -1227,7 +1248,7 @@ int railfs_rdma_fetch_begin(struct railfs_rdma *rail, u64 key, u32 len, struct s
 	u32 i;
 	int err;
 
-	if (rail->broken || !shared) {
+	if (READ_ONCE(rail->broken) || !shared) {
 		return -ENOTCONN;
 	}
 
@@ -1402,7 +1423,7 @@ static int railfs_rdma_push_from(struct railfs_rdma *rail, struct railfs_push *p
 		goto out;
 	}
 
-	if (rail->broken) {
+	if (READ_ONCE(rail->broken)) {
 		err = -ENOTCONN;
 		goto out;
 	}
@@ -1507,10 +1528,10 @@ static int railfs_rdma_push_from(struct railfs_rdma *rail, struct railfs_push *p
 	}
 
 	if (!wait_for_completion_timeout(&push->sent, msecs_to_jiffies(RAILFS_WAIT_MS))) {
+		// Breaking flushes the send but does not wait for it. Draining does,
+		// which is what makes the mappings below safe to take back.
 		railfs_rail_break(rail);
-
-		// Retain CPU mappings until DMA is known to have stopped.
-		mapped = NULL;
+		ib_drain_qp(post->qp);
 		err = -ETIMEDOUT;
 		goto out;
 	}

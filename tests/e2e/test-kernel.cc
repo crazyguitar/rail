@@ -1122,15 +1122,18 @@ TEST_F(Kernel, DoesNotGiveASmallFileAFolioTheSizeOfTheFloor) {
   ASSERT_TRUE(ran({"ssh", peerHost(), "for i in $(seq 1 500); do head -c 1024 /dev/zero > " + Many + "/f$i; done"}));
 
   ASSERT_TRUE(mountIt("host=" + Host + ",export=many,port=" + std::to_string(kPort) + ",minfolio=262144"));
+  ASSERT_TRUE(openCacheGroup()) << "no cgroup to charge the page cache to";
   ASSERT_TRUE(dropCaches().has_value());
 
-  const long Before = cachedMiB();
+  const long Before = groupCacheMiB();
   ASSERT_GE(Before, 0);
-  [[maybe_unused]] auto Read = runLocal({"sh", "-c", "cat " + Mountpoint + "/* > /dev/null"});
-  const long Grew = cachedMiB() - Before;
+  readCharged("cat " + Mountpoint + "/* > /dev/null");
+  const long Grew = groupCacheMiB() - Before;
 
   // 500 KiB of data. Bounded it costs a few MiB; a floor per file would cost
-  // 125, so the bar is set far from both.
+  // 125, so the bar is set far from both. Charged to a cgroup rather than read
+  // off Cached, which belongs to the whole machine: under a full run another
+  // test's seeding moved it and failed this one.
   EXPECT_LT(Grew, 40) << "cache grew " << Grew << " MiB for 500 KiB of files";
 }
 

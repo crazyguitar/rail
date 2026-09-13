@@ -1056,9 +1056,13 @@ public:
   // spare; the pool the payloads come from is what bounds the memory, so this
   // only has to stop the queue growing without limit.
   static constexpr size_t kMaxInFlight = 64;
-  std::vector<Coro<Result<void>>> Running;
+
+  // Running goes last so it dies first. Stopping a serving thread destroys
+  // handler frames mid-flight, and their locals reach back into the page pool
+  // and both turnstiles as they unwind.
   proto::ControlChannel Control;
   std::unique_ptr<DataChannel> Channel;
+  std::vector<Coro<Result<void>>> Running;
 };
 
 } // namespace
@@ -1254,7 +1258,15 @@ Coro<Result<void>> serveInbox(const std::filesystem::path &Root, const ServiceOp
   for (;;) {
     Sessions.reap();
     for (auto &Client : In.take()) Sessions.admit(std::move(Client));
-    if (In.stopped()) co_return Result<void>{};
+    if (In.stopped()) {
+      // Posted in the moment before the stop, so nobody is coming for it.
+      // Closing says so at once rather than leaving the client to time out.
+      for (auto &Late : In.take()) {
+        std::fprintf(stderr, "raild: closing a client handed to a thread that has stopped\n");
+        Late.close();
+      }
+      co_return Result<void>{};
+    }
 
     co_await ReapWait{In.wakeFd(), Sessions.doorbell()};
     In.drain();
@@ -1273,10 +1285,14 @@ Coro<Result<void>> acceptInTurn(uint16_t Port, std::vector<std::unique_ptr<Inbox
     auto Conn = co_await Listener->accept();
     if (!Conn) co_return std::unexpected(Conn.error());
 
-    size_t Tried = 0;
-    while (Boxes[Next]->stopped() && Tried++ < Boxes.size()) Next = (Next + 1) % Boxes.size();
-    if (Boxes[Next]->stopped()) co_return failMessage("every serving thread has stopped");
-    Boxes[Next]->post(std::move(*Conn));
+    // Offered around the ring until one takes it: a thread that stops between
+    // the check and the handover refuses rather than swallowing the client.
+    bool Handed = false;
+    for (size_t Tried = 0; Tried < Boxes.size() && !Handed; Tried++) {
+      Handed = Boxes[Next]->post(std::move(*Conn));
+      Next = (Next + 1) % Boxes.size();
+    }
+    if (!Handed) co_return failMessage("every serving thread has stopped");
   }
 }
 

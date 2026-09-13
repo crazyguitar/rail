@@ -45,6 +45,12 @@ struct railfs_call {
 	u8 *payload;
 	u32 payload_len;
 	struct completion replied;
+	/* Whether the reader has already handed this call its reply and its
+	 * bytes, so a connection dying afterwards does not fail an answer that
+	 * arrived. Both are set under calls_lock.
+	 */
+	bool answered;
+	bool delivered;
 	/* Where a tcp read's bytes land, when the call expects some. */
 	void *buf;
 	u32 room;
@@ -111,8 +117,15 @@ static int recv_all(struct railfs_conn *conn, struct socket *sock, void *buf, si
 		vec.iov_len = len - done;
 
 		n = kernel_recvmsg(sock, &msg, &vec, 1, len - done, MSG_WAITALL);
-		if (n == -EAGAIN && !READ_ONCE(conn->dead) && !kthread_should_stop()) {
-			continue;
+		if (n == -EAGAIN) {
+			/* On a live connection this says only that the peer is quiet.
+			 * On a dead one it is the shutdown, and -EAGAIN would travel
+			 * on as the reason a call failed.
+			 */
+			if (!READ_ONCE(conn->dead) && !kthread_should_stop()) {
+				continue;
+			}
+			return -ENOTCONN;
 		}
 		if (n <= 0) {
 			return n ? n : -ECONNRESET;
@@ -328,7 +341,7 @@ static int railfs_call_begin(struct railfs_conn *conn, struct railfs_call *call,
 	init_completion(&call->released);
 
 	spin_lock(&conn->calls_lock);
-	if (conn->dead) {
+	if (READ_ONCE(conn->dead)) {
 		err = -ENOTCONN;
 	} else {
 		list_add_tail(&call->link, &conn->calls);
@@ -408,7 +421,7 @@ static int railfs_send(struct railfs_conn *conn, const void *frame, size_t len)
 	int err;
 
 	mutex_lock(&conn->send_lock);
-	err = conn->dead ? -ENOTCONN : send_all(conn->sock, frame, len);
+	err = READ_ONCE(conn->dead) ? -ENOTCONN : send_all(conn->sock, frame, len);
 	mutex_unlock(&conn->send_lock);
 
 	if (err) {
@@ -458,9 +471,20 @@ static int railfs_deliver(struct railfs_conn *conn, u16 type, u8 *payload, u32 l
 		return -EPROTO;
 	}
 
+	/* A second reply for one id would overwrite an answer the caller may
+	 * already be reading, and leak the first payload.
+	 */
+	if (call->answered) {
+		spin_unlock(&conn->calls_lock);
+		pr_err("railfs: a second reply for request %llu\n", id);
+		kfree(payload);
+		return -EPROTO;
+	}
+
 	call->payload = payload;
 	call->payload_len = len;
 	call->err = 0;
+	call->answered = true;
 	complete(&call->replied);
 	spin_unlock(&conn->calls_lock);
 	return 0;
@@ -568,6 +592,7 @@ static int railfs_take_frame(struct railfs_conn *conn)
 	call->busy = false;
 	call->got = frame_len;
 	call->data_err = err;
+	call->delivered = !err;
 	complete(&call->landed);
 	complete(&call->released);
 	spin_unlock(&conn->calls_lock);
@@ -600,17 +625,25 @@ static void railfs_conn_kill(struct railfs_conn *conn, int why)
 	struct railfs_call *call;
 
 	spin_lock(&conn->calls_lock);
-	if (conn->dead) {
+	if (READ_ONCE(conn->dead)) {
 		spin_unlock(&conn->calls_lock);
 		return;
 	}
 
-	conn->dead = true;
+	WRITE_ONCE(conn->dead, true);
 	conn->why = why;
 
+	/* Only what is still outstanding is failed. A call already answered keeps
+	 * its answer: the peer did that work, and failing it here would report an
+	 * error for an operation that happened.
+	 */
 	list_for_each_entry(call, &conn->calls, link) {
-		call->err = why;
-		call->data_err = why;
+		if (!call->answered) {
+			call->err = why;
+		}
+		if (!call->delivered) {
+			call->data_err = why;
+		}
 		complete(&call->replied);
 		complete(&call->landed);
 	}

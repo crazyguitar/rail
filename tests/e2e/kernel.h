@@ -11,6 +11,7 @@
 #include <fstream>
 #include <gtest/gtest.h>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 
@@ -136,6 +137,36 @@ protected:
     const std::string Info = Line == std::string::npos ? std::string{} : Meminfo.substr(Line + 1, 64);
     const auto At = Info.find_first_of("0123456789");
     return At == std::string::npos ? -1 : std::atol(Info.c_str() + At) / 1024;
+  }
+
+  // A cgroup to charge one measurement's page cache to. Cached in
+  // /proc/meminfo counts the whole machine, so anything else reading during
+  // the window lands in it too.
+  static constexpr const char *kCacheGroup = "/sys/fs/cgroup/rail-e2e";
+
+  bool openCacheGroup() {
+    [[maybe_unused]] auto On = writeWholeFile("/sys/fs/cgroup/cgroup.subtree_control", "+memory");
+    std::error_code Ec;
+    std::filesystem::create_directories(kCacheGroup, Ec);
+    return std::filesystem::exists(std::string(kCacheGroup) + "/memory.stat");
+  }
+
+  long groupCacheMiB() {
+    std::istringstream Stat(readWholeFile(std::string(kCacheGroup) + "/memory.stat"));
+
+    for (std::string Line; std::getline(Stat, Line);) {
+      std::istringstream Row(Line);
+      std::string Name;
+      unsigned long long Bytes = 0;
+
+      if ((Row >> Name >> Bytes) && Name == "file") return static_cast<long>(Bytes >> 20);
+    }
+    return -1;
+  }
+
+  // The shell joins the group first, so everything it reads is charged there.
+  void readCharged(const std::string &Script) {
+    [[maybe_unused]] auto Ran = runLocal({"sh", "-c", "echo $$ > " + std::string(kCacheGroup) + "/cgroup.procs; " + Script});
   }
 
   void forgetCounters() { [[maybe_unused]] auto R = writeWholeFile("/sys/kernel/debug/railfs/stats", "reset"); }

@@ -1401,7 +1401,15 @@ Coro<Result<void>> serveInbox(const ExportOptions &Opts, Inbox &In) {
   std::vector<Live> Running;
   for (;;) {
     co_await In.wakeup();
-    if (In.stopped()) co_return Result<void>{};
+    if (In.stopped()) {
+      // Anything handed over in the moment before the stop is closed rather
+      // than left in a queue nobody will drain again.
+      for (auto &Late : In.take()) {
+        std::fprintf(stderr, "railnfs: closing a client handed to a thread that has stopped\n");
+        Late.close();
+      }
+      co_return Result<void>{};
+    }
     reapFinished(Running);
     for (auto &Conn : In.take()) startSession(Opts, Running, std::move(Conn));
   }
@@ -1414,7 +1422,15 @@ Coro<Result<void>> acceptInTurn(const ExportOptions &Opts, std::vector<std::uniq
   for (size_t Next = 0;; Next = (Next + 1) % Boxes.size()) {
     auto Conn = co_await Listener->accept();
     if (!Conn) co_return std::unexpected(Conn.error());
-    Boxes[Next]->post(std::move(*Conn));
+
+    // As in the file service: a stopped thread refuses, so the client moves
+    // on to the next rather than being swallowed.
+    bool Handed = false;
+    for (size_t Tried = 0; Tried < Boxes.size() && !Handed; Tried++) {
+      Handed = Boxes[Next]->post(std::move(*Conn));
+      Next = (Next + 1) % Boxes.size();
+    }
+    if (!Handed) co_return failMessage("every serving thread has stopped");
   }
 }
 

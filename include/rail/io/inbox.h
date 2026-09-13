@@ -27,16 +27,25 @@ public:
   int wakeFd() const { return Wake; }
   bool stopped() const { return Stopping.load(); }
 
-  void post(Stream Conn) {
+  // False when the thread has stopped: taking it then would strand it, since
+  // nobody is left to take(). Checked under the lock so it cannot race the
+  // stop, and by reference so a refusal leaves Conn with the caller rather
+  // than consuming and closing it.
+  bool post(Stream &&Conn) {
     {
       const std::lock_guard<std::mutex> Held(Lock);
+      if (Stopping.load()) return false;
       Handed.push_back(std::move(Conn));
     }
     ring();
+    return true;
   }
 
   void stop() {
-    Stopping.store(true);
+    {
+      const std::lock_guard<std::mutex> Held(Lock);
+      Stopping.store(true);
+    }
     ring();
   }
 
