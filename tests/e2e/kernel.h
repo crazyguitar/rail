@@ -165,8 +165,12 @@ protected:
   }
 
   // The shell joins the group first, so everything it reads is charged there.
-  void readCharged(const std::string &Script) {
-    [[maybe_unused]] auto Ran = runLocal({"sh", "-c", "echo $$ > " + std::string(kCacheGroup) + "/cgroup.procs; " + Script});
+  // False when the join or the read failed: the cache is unmoved then, and a
+  // measurement of it would pass without measuring anything.
+  bool readCharged(const std::string &Script) {
+    auto Ran = runLocal({"sh", "-c", "echo $$ > " + std::string(kCacheGroup) + "/cgroup.procs; " + Script});
+
+    return Ran && Ran->ExitStatus == 0;
   }
 
   void forgetCounters() { [[maybe_unused]] auto R = writeWholeFile("/sys/kernel/debug/railfs/stats", "reset"); }

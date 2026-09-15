@@ -1428,7 +1428,9 @@ Coro<Result<void>> acceptInTurn(const ExportOptions &Opts, std::vector<std::uniq
     bool Handed = false;
     for (size_t Tried = 0; Tried < Boxes.size() && !Handed; Tried++) {
       Handed = Boxes[Next]->post(std::move(*Conn));
-      Next = (Next + 1) % Boxes.size();
+      // The outer increment rotates after a handover; advancing here too
+      // would skip every other thread.
+      if (!Handed) Next = (Next + 1) % Boxes.size();
     }
     if (!Handed) co_return failMessage("every serving thread has stopped");
   }

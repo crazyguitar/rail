@@ -355,6 +355,8 @@ static int railfs_call_begin(struct railfs_conn *conn, struct railfs_call *call,
 }
 
 // Off the list, and not before the data reader has finished with the buffer.
+// A caller that left mid-frame waits for the rest of it, but only so long: the
+// socket is live, so nothing but a kill would wake a reader whose peer stalled.
 static void railfs_call_end(struct railfs_conn *conn, struct railfs_call *call)
 {
 	bool busy;
@@ -364,7 +366,8 @@ static void railfs_call_end(struct railfs_conn *conn, struct railfs_call *call)
 	busy = call->busy;
 	spin_unlock(&conn->calls_lock);
 
-	if (busy) {
+	if (busy && !wait_for_completion_timeout(&call->released, msecs_to_jiffies(RAILFS_REPLY_WAIT_MS))) {
+		railfs_conn_kill(conn, -ETIMEDOUT);
 		wait_for_completion(&call->released);
 	}
 
@@ -2061,22 +2064,24 @@ out:
 	mutex_unlock(&pool->revive_lock);
 }
 
-// Under the pool lock. The slot asked for, unless it is dead and another is
-// not: a slot inside its revive interval stays dead for seconds, and a caller
-// sent there would fail while the rest of the pool answers.
-static struct railfs_conn *railfs_pool_pick(struct railfs_pool *pool, unsigned int at)
+// Under the pool lock. The slot asked for, unless it is dead and another in
+// the window is not: a slot inside its revive interval stays dead for seconds,
+// and a caller sent there would fail while the rest answer. The search keeps
+// to the window, so a file's writeback never reaches past its span.
+static struct railfs_conn *railfs_pool_pick(struct railfs_pool *pool, unsigned int base, unsigned int span,
+					    unsigned int step)
 {
 	unsigned int i;
 
-	for (i = 0; i < pool->count; i++) {
-		struct railfs_conn *conn = pool->conns[(at + i) % pool->count];
+	for (i = 0; i < span; i++) {
+		struct railfs_conn *conn = pool->conns[(base + (step + i) % span) % pool->count];
 
 		if (!railfs_conn_unusable(conn)) {
 			return conn;
 		}
 	}
 
-	return pool->conns[at];
+	return pool->conns[(base + step) % pool->count];
 }
 
 static void railfs_conn_used(struct railfs_conn *conn)
@@ -2109,13 +2114,15 @@ struct railfs_conn *railfs_pool_take_near(struct railfs_pool *pool, unsigned int
 {
 	unsigned int turn = (unsigned int)atomic_inc_return(&pool->next);
 	struct railfs_conn *conn;
-	unsigned int at;
+	unsigned int base, step, at;
 
 	if (span < 1 || span >= pool->count) {
 		span = pool->count;
 		hint = 0;
 	}
-	at = (hint + turn % span) % pool->count;
+	base = hint % pool->count;
+	step = turn % span;
+	at = (base + step) % pool->count;
 
 	spin_lock(&pool->lock);
 	if (railfs_conn_unusable(pool->conns[at])) {
@@ -2123,7 +2130,7 @@ struct railfs_conn *railfs_pool_take_near(struct railfs_pool *pool, unsigned int
 		railfs_pool_revive(pool, at);
 		spin_lock(&pool->lock);
 	}
-	conn = railfs_pool_pick(pool, at);
+	conn = railfs_pool_pick(pool, base, span, step);
 	kref_get(&conn->ref);
 	spin_unlock(&pool->lock);
 

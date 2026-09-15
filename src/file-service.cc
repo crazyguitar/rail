@@ -26,6 +26,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sys/eventfd.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -1257,16 +1258,19 @@ Coro<Result<void>> serveInbox(const std::filesystem::path &Root, const ServiceOp
 
   for (;;) {
     Sessions.reap();
-    for (auto &Client : In.take()) Sessions.admit(std::move(Client));
+    auto Arrived = In.take();
     if (In.stopped()) {
       // Posted in the moment before the stop, so nobody is coming for it.
-      // Closing says so at once rather than leaving the client to time out.
-      for (auto &Late : In.take()) {
+      // Closing says so at once rather than admitting a session this
+      // coroutine is about to destroy, or leaving the client to time out.
+      for (auto &Late : In.take()) Arrived.push_back(std::move(Late));
+      for (auto &Late : Arrived) {
         std::fprintf(stderr, "raild: closing a client handed to a thread that has stopped\n");
         Late.close();
       }
       co_return Result<void>{};
     }
+    for (auto &Client : Arrived) Sessions.admit(std::move(Client));
 
     co_await ReapWait{In.wakeFd(), Sessions.doorbell()};
     In.drain();
@@ -1290,7 +1294,9 @@ Coro<Result<void>> acceptInTurn(uint16_t Port, std::vector<std::unique_ptr<Inbox
     bool Handed = false;
     for (size_t Tried = 0; Tried < Boxes.size() && !Handed; Tried++) {
       Handed = Boxes[Next]->post(std::move(*Conn));
-      Next = (Next + 1) % Boxes.size();
+      // The outer increment rotates after a handover; advancing here too
+      // would skip every other thread.
+      if (!Handed) Next = (Next + 1) % Boxes.size();
     }
     if (!Handed) co_return failMessage("every serving thread has stopped");
   }
@@ -1346,9 +1352,14 @@ Result<void> serveFilesThreaded(const std::filesystem::path &Root, const Service
     if (!Boxes.back()->usable()) return failErrno("eventfd");
   }
 
+  // The first thread to fail, so a daemon that lost one does not exit as a
+  // success on the acceptor's word alone.
+  std::mutex FailedLock;
+  std::optional<Result<void>> Failed;
+
   std::vector<std::thread> Answering;
   for (size_t I = 0; I < Wanted; I++)
-    Answering.emplace_back([&Root, &Opts, &In = *Boxes[I], Allowed] {
+    Answering.emplace_back([&Root, &Opts, &In = *Boxes[I], Allowed, &FailedLock, &Failed] {
       auto Outcome = runToResult(serveInbox(Root, Opts, In, Allowed));
       if (Outcome) return;
 
@@ -1356,11 +1367,14 @@ Result<void> serveFilesThreaded(const std::filesystem::path &Root, const Service
       // so a thread that stopped would otherwise leave the daemon quietly
       // running with fewer than it was asked for.
       std::fprintf(stderr, "raild: a serving thread stopped: %s\n", Outcome.error().message().c_str());
+      const std::lock_guard<std::mutex> Held(FailedLock);
+      if (!Failed) Failed = std::move(Outcome);
     });
 
   auto Outcome = run(acceptInTurn(Opts.Port, Boxes));
   for (auto &Box : Boxes) Box->stop();
   for (auto &One : Answering) One.join();
+  if (Outcome && Failed) return std::move(*Failed);
   return Outcome;
 }
 

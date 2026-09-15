@@ -1122,12 +1122,14 @@ TEST_F(Kernel, DoesNotGiveASmallFileAFolioTheSizeOfTheFloor) {
   ASSERT_TRUE(ran({"ssh", peerHost(), "for i in $(seq 1 500); do head -c 1024 /dev/zero > " + Many + "/f$i; done"}));
 
   ASSERT_TRUE(mountIt("host=" + Host + ",export=many,port=" + std::to_string(kPort) + ",minfolio=262144"));
-  ASSERT_TRUE(openCacheGroup()) << "no cgroup to charge the page cache to";
+  // A host without a writable cgroup-v2 memory controller cannot take this
+  // measurement; that is not a failing kernel.
+  if (!openCacheGroup()) GTEST_SKIP() << "no cgroup to charge the page cache to";
   ASSERT_TRUE(dropCaches().has_value());
 
   const long Before = groupCacheMiB();
   ASSERT_GE(Before, 0);
-  readCharged("cat " + Mountpoint + "/* > /dev/null");
+  ASSERT_TRUE(readCharged("cat " + Mountpoint + "/* > /dev/null")) << "the charged read did not run";
   const long Grew = groupCacheMiB() - Before;
 
   // 500 KiB of data. Bounded it costs a few MiB; a floor per file would cost

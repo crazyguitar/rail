@@ -130,6 +130,8 @@ struct railfs_rdma {
 	struct list_head pushes;
 	// One gpu transfer at a time: the gpu region is per rail, not per slot.
 	struct mutex gds_lock;
+	// One breaker at a time: every transfer on the connection can time out.
+	struct mutex break_lock;
 	bool broken;
 	// The peer notices a record by its sequence changing, so this counts
 	// across the whole connection rather than per slot.
@@ -443,6 +445,14 @@ void railfs_rdma_close(struct railfs_rdma *rail)
 		return;
 	}
 
+	// Every queue pair goes quiet before the ring does: a peer write to it can
+	// still be in flight, and would land in freed memory.
+	for (i = 0; i < rail->lines; i++) {
+		if (rail->line[i].qp) {
+			ib_drain_qp(rail->line[i].qp);
+		}
+	}
+
 	// The ring belongs to the first rail's protection domain, so it goes back
 	// before that rail does.
 	if (rail->ring_mr) {
@@ -600,6 +610,7 @@ struct railfs_rdma *railfs_rdma_open(struct railfs_wire *wire)
 	spin_lock_init(&rail->pushes_lock);
 	INIT_LIST_HEAD(&rail->pushes);
 	mutex_init(&rail->gds_lock);
+	mutex_init(&rail->break_lock);
 
 	for (i = 0; i < lines; i++) {
 		rail->line[i].device = found[i].device;
@@ -1051,6 +1062,15 @@ static void railfs_rail_break(struct railfs_rdma *rail)
 	struct ib_qp_attr attr = {};
 	u32 i;
 
+	// Once, and one caller at a time: concurrent timeouts would otherwise
+	// race the same queue pairs through the transition. A late caller still
+	// wakes the sleepers, since its own timeout sent it here.
+	mutex_lock(&rail->break_lock);
+	if (READ_ONCE(rail->broken)) {
+		mutex_unlock(&rail->break_lock);
+		goto wake;
+	}
+
 	WRITE_ONCE(rail->broken, true);
 	attr.qp_state = IB_QPS_ERR;
 
@@ -1059,7 +1079,9 @@ static void railfs_rail_break(struct railfs_rdma *rail)
 			pr_err("railfs: could not flush rail %u after a timeout\n", i);
 		}
 	}
+	mutex_unlock(&rail->break_lock);
 
+wake:
 	// The timeout paths reach here without railfs_strand_all, so this is the
 	// only wake anyone parked for a slot gets.
 	wake_up(&rail->slot_room);
