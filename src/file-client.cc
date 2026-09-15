@@ -7,6 +7,7 @@
 #include "rail/io/stream.h"
 #include "rail/io/trace.h"
 #include "rail/io/turn.h"
+#include "rail/proto/codec.h"
 #include "rail/proto/control-channel.h"
 #include "rail/stream/page-stream.h"
 #include "rail/stream/sink.h"
@@ -38,6 +39,7 @@ struct FileClient::Impl {
   uint64_t NextId = 1;
 
   struct Waiting {
+    proto::Type Want = proto::Type::End;
     std::optional<proto::Message> Reply;
     std::coroutine_handle<> Caller;
     bool Done = false;
@@ -54,14 +56,20 @@ struct FileClient::Impl {
     uint64_t Id = 0;
     Waiting Slot;
 
-    Exchange(Impl *Self, uint64_t Id) : Self(Self), Id(Id) { Self->Waiters[Id].push_back(&Slot); }
+    Exchange(Impl *Self, uint64_t Id, proto::Type Want) : Self(Self), Id(Id) {
+      Slot.Want = Want;
+      Self->Waiters[Id].push_back(&Slot);
+    }
     Exchange(const Exchange &) = delete;
     Exchange &operator=(const Exchange &) = delete;
     ~Exchange() {
       auto It = Self->Waiters.find(Id);
       if (It == Self->Waiters.end()) return;
       std::erase(It->second, &Slot);
-      if (It->second.empty()) Self->Waiters.erase(It);
+      if (!It->second.empty()) return;
+      Self->Waiters.erase(It);
+      // Every reply is in, so the ring slots this id held may be reused.
+      Self->Control.release(Id);
     }
 
     auto wait() {
@@ -99,11 +107,15 @@ struct FileClient::Impl {
         co_return;
       }
 
+      // By id and type, never arrival order: two replies can cross on the fabric.
       auto It = Waiters.find(proto::idOf(*M));
-      if (It == Waiters.end() || It->second.empty()) continue;
+      if (It == Waiters.end()) continue;
+      const auto Kind = proto::typeOf(*M);
+      auto Found = std::find_if(It->second.begin(), It->second.end(), [Kind](Waiting *W) { return W->Want == Kind; });
+      if (Found == It->second.end()) continue;
 
-      Waiting *Slot = It->second.front();
-      It->second.pop_front();
+      Waiting *Slot = *Found;
+      It->second.erase(Found);
       Slot->Reply = std::move(*M);
       Slot->Done = true;
       if (auto Caller = std::exchange(Slot->Caller, {})) Loop::get().schedule(Caller);
@@ -177,6 +189,8 @@ size_t FileClient::maxTransfer() const { return P->Channel->pool().pageSize(); }
 
 bool FileClient::alive() const { return !P->Closed; }
 
+int FileClient::controlFd() const { return P->Control.readFd(); }
+
 size_t FileClient::maxOutstanding() const {
   const size_t Pages = P->Channel->pool().pageCount();
   const size_t ByPool = Pages > 2 ? Pages - 2 : 1;
@@ -232,6 +246,12 @@ Coro<Result<std::unique_ptr<FileClient>>> FileClient::connect(const std::string 
   Mine.Blob = *Local;
   if (auto R = co_await P->Control.send(Mine); !R) co_return std::unexpected(R.error());
 
+  // Nothing goes into the ring until the daemon's queue pairs are ready.
+  if (auto *Link = P->Channel->controlLink()) {
+    if (auto Go = co_await P->Control.expect<proto::Ready>(); !Go) co_return std::unexpected(Go.error());
+    P->Control.useRing(*Link);
+  }
+
   P->Reader = P->pump();
   P->Reader.start();
 
@@ -249,7 +269,7 @@ Coro<Result<proto::StatReply>> FileClient::stat(const std::string &Path) {
   S.Id = P->NextId++;
   S.Path = Path;
 
-  Impl::Exchange Ex(P.get(), S.Id);
+  Impl::Exchange Ex(P.get(), S.Id, proto::Type::StatReply);
   if (auto R = co_await P->Control.send(S); !R) co_return std::unexpected(R.error());
   co_return asReply<proto::StatReply>(co_await Ex.wait());
 }
@@ -260,7 +280,7 @@ Coro<Result<proto::OpenReply>> FileClient::openFile(const std::string &Path, boo
   O.Path = Path;
   O.Writable = Writable;
 
-  Impl::Exchange Ex(P.get(), O.Id);
+  Impl::Exchange Ex(P.get(), O.Id, proto::Type::OpenReply);
   if (auto R = co_await P->Control.send(O); !R) co_return std::unexpected(R.error());
   co_return asReply<proto::OpenReply>(co_await Ex.wait());
 }
@@ -270,7 +290,7 @@ Coro<Result<void>> FileClient::closeFile(uint64_t Handle) {
   C.Id = P->NextId++;
   C.Handle = Handle;
 
-  Impl::Exchange Ex(P.get(), C.Id);
+  Impl::Exchange Ex(P.get(), C.Id, proto::Type::MetaReply);
   if (auto R = co_await P->Control.send(C); !R) co_return std::unexpected(R.error());
   auto Reply = asReply<proto::MetaReply>(co_await Ex.wait());
   if (!Reply) co_return std::unexpected(Reply.error());
@@ -283,9 +303,42 @@ Coro<Result<proto::ListReply>> FileClient::list(const std::string &Path) {
   L.Id = P->NextId++;
   L.Path = Path;
 
-  Impl::Exchange Ex(P.get(), L.Id);
+  if (P->Control.onRing()) co_return co_await listThroughPage(L);
+
+  Impl::Exchange Ex(P.get(), L.Id, proto::Type::ListReply);
   if (auto R = co_await P->Control.send(L); !R) co_return std::unexpected(R.error());
   co_return asReply<proto::ListReply>(co_await Ex.wait());
+}
+
+// A listing over the fabric arrives like a read: the encoded reply lands in a
+// page this side offered, and a TransferReply carries its length and digest.
+// The landing is joined on every path, since the receive owns the page.
+Coro<Result<proto::ListReply>> FileClient::listThroughPage(const proto::ListRequest &L) {
+  Page Buf = co_await P->Channel->pool().acquire();
+  if (!Buf.valid()) co_return failMessage("out of registered memory for a transfer page");
+  const size_t Room = Buf.capacity();
+
+  Impl::Exchange Ex(P.get(), L.Id, proto::Type::TransferReply);
+  auto Landing = P->Channel->recv(Buf, L.Id, Room);
+  Landing.start();
+
+  if (auto R = co_await P->Control.send(L); !R) {
+    [[maybe_unused]] auto Dropped = co_await Landing.join();
+    co_return std::unexpected(R.error());
+  }
+
+  auto Record = asReply<proto::TransferReply>(co_await Ex.wait());
+  auto Landed = co_await Landing.join();
+  if (!Record) co_return std::unexpected(Record.error());
+  if (!Landed) co_return std::unexpected(Landed.error());
+  if (!Record->Ok) co_return failMessage(Record->Error);
+  if (Record->Length > Room) co_return failMessage("listing longer than the page it landed in");
+
+  Verifier PageHash(P->Verify, P->Agreed);
+  PageHash.update({Buf.bytes(), Record->Length});
+  if (!PageHash.matches(Record->Payload)) co_return failMessage("page hash mismatch");
+
+  co_return asReply<proto::ListReply>(proto::decode(proto::Type::ListReply, std::span<const std::byte>{Buf.bytes(), Record->Length}));
 }
 
 Coro<Result<uint64_t>> FileClient::submitRead(const std::string &Path, uint64_t Offset, std::span<std::byte> Into, uint64_t Handle) {
@@ -322,7 +375,7 @@ FileClient::submitPosted(const std::string &Path, uint64_t Offset, std::span<std
   Impl::Posted *Mine = P->Reads.back().get();
   Mine->Id = Rd.Id;
   Mine->Into = Into;
-  Mine->Wait = std::make_unique<Impl::Exchange>(P.get(), Rd.Id);
+  Mine->Wait = std::make_unique<Impl::Exchange>(P.get(), Rd.Id, proto::Type::TransferReply);
 
   if (auto R = co_await P->Control.send(Rd); !R) {
     P->forget(Mine);
@@ -410,7 +463,7 @@ Coro<Result<void>> FileClient::write(const std::string &Path, uint64_t Offset, s
   PageHash.update(From);
   Wr.Payload = PageHash.digest();
 
-  Impl::Exchange Ex(P.get(), Wr.Id);
+  Impl::Exchange Ex(P.get(), Wr.Id, proto::Type::TransferReply);
   if (auto R = co_await P->Control.send(Wr); !R) co_return std::unexpected(R.error());
 
   // Past the request, the daemon has a receive posted, so every way out of
@@ -457,7 +510,7 @@ Coro<Result<proto::FileAttrs>> FileClient::sendMeta(const proto::MetaRequest &Gi
   proto::MetaRequest Meta = Given;
   Meta.Id = P->NextId++;
 
-  Impl::Exchange Ex(P.get(), Meta.Id);
+  Impl::Exchange Ex(P.get(), Meta.Id, proto::Type::MetaReply);
   if (auto R = co_await P->Control.send(Meta); !R) co_return std::unexpected(R.error());
 
   auto Reply = asReply<proto::MetaReply>(co_await Ex.wait());
@@ -501,7 +554,7 @@ Coro<Result<std::string>> FileClient::readLink(const std::string &Path) {
   proto::MetaRequest Meta = metaOf(proto::MetaOp::ReadLink, Path);
   Meta.Id = P->NextId++;
 
-  Impl::Exchange Ex(P.get(), Meta.Id);
+  Impl::Exchange Ex(P.get(), Meta.Id, proto::Type::MetaReply);
   if (auto R = co_await P->Control.send(Meta); !R) co_return std::unexpected(R.error());
 
   auto Reply = asReply<proto::MetaReply>(co_await Ex.wait());
@@ -553,7 +606,7 @@ Coro<Result<proto::StatFsReply>> FileClient::statFs(const std::string &Path) {
   Fs.Id = P->NextId++;
   Fs.Path = Path;
 
-  Impl::Exchange Ex(P.get(), Fs.Id);
+  Impl::Exchange Ex(P.get(), Fs.Id, proto::Type::StatFsReply);
   if (auto R = co_await P->Control.send(Fs); !R) co_return std::unexpected(R.error());
 
   auto Reply = asReply<proto::StatFsReply>(co_await Ex.wait());
@@ -575,8 +628,8 @@ Coro<Result<uint64_t>> FileClient::fetch(const std::string &Path, const std::fil
   F.Offset = 0;
   F.Length = ~uint64_t{0};
 
-  Impl::Exchange Opened(P.get(), F.Id);
-  Impl::Exchange Finished(P.get(), F.Id);
+  Impl::Exchange Opened(P.get(), F.Id, proto::Type::StreamReply);
+  Impl::Exchange Finished(P.get(), F.Id, proto::Type::StreamDigest);
   if (auto R = co_await P->Control.send(F); !R) co_return std::unexpected(R.error());
 
   auto Reply = asReply<proto::StreamReply>(co_await Opened.wait());
@@ -625,8 +678,8 @@ Coro<Result<uint64_t>> FileClient::store(const std::filesystem::path &Local, con
   St.Length = Size;
   St.Truncate = true;
 
-  Impl::Exchange Ready(P.get(), St.Id);
-  Impl::Exchange Done(P.get(), St.Id);
+  Impl::Exchange Ready(P.get(), St.Id, proto::Type::StreamReply);
+  Impl::Exchange Done(P.get(), St.Id, proto::Type::StreamReply);
 
   // Held until the digest goes out. The daemon reads the frames that follow a
   // store straight off this channel, so a request another writer sends in
@@ -696,8 +749,8 @@ Coro<Result<uint64_t>> FileClient::fetchThrough(const std::string &Path, uint64_
   F.Length = Want;
   F.Handle = Handle;
 
-  Impl::Exchange Opened(P.get(), F.Id);
-  Impl::Exchange Finished(P.get(), F.Id);
+  Impl::Exchange Opened(P.get(), F.Id, proto::Type::StreamReply);
+  Impl::Exchange Finished(P.get(), F.Id, proto::Type::StreamDigest);
   if (auto R = co_await P->Control.send(F); !R) co_return std::unexpected(R.error());
 
   auto Reply = asReply<proto::StreamReply>(co_await Opened.wait());
@@ -748,8 +801,8 @@ FileClient::storeThrough(const std::string &Path, uint64_t Offset, uint64_t Leng
   St.Truncate = Truncate;
   St.Handle = Handle;
 
-  Impl::Exchange Ready(P.get(), St.Id);
-  Impl::Exchange Done(P.get(), St.Id);
+  Impl::Exchange Ready(P.get(), St.Id, proto::Type::StreamReply);
+  Impl::Exchange Done(P.get(), St.Id, proto::Type::StreamReply);
 
   // Held until the digest goes out. The daemon reads the frames that follow a
   // store straight off this channel, so a request another writer sends in

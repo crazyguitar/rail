@@ -42,6 +42,14 @@
 #define RAILFS_CONN_DEPTH 16
 #define RAILFS_PAGE_COUNT RAILFS_CONN_DEPTH
 
+/* Control ring geometry per rail, mirroring kCtrlSlots and friends in
+ * src/transport/rdma-data-channel.cc. Two reply sub-slots per request slot.
+ */
+#define RAILFS_CTRL_SLOTS 16
+#define RAILFS_REQ_BYTES (16u << 10)
+#define RAILFS_REPLY_BYTES (8u << 10)
+#define RAILFS_CTRL_BYTES (RAILFS_CTRL_SLOTS * RAILFS_REQ_BYTES)
+
 #define RAILFS_META_MKDIR 1
 #define RAILFS_META_UNLINK 2
 #define RAILFS_META_RMDIR 3
@@ -67,6 +75,7 @@ enum railfs_msg_type {
 	RAILFS_MSG_TRANSFER_REPLY = 18,
 	RAILFS_MSG_STATFS = 26,
 	RAILFS_MSG_STATFS_REPLY = 27,
+	RAILFS_MSG_READY = 31,
 	RAILFS_MSG_STAT = 12,
 	RAILFS_MSG_STAT_REPLY = 13,
 	RAILFS_MSG_LIST = 14,

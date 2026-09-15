@@ -27,6 +27,8 @@
  * kIsCts in src/transport/rdma-data-channel.cc.
  */
 #define RAILFS_IS_CTS (1u << 31)
+/* Marks immediate data as a control frame; a payload carries neither bit. */
+#define RAILFS_IS_CTRL (1u << 30)
 #define RAILFS_RING_BYTES (RAILFS_CTS_SLOTS * RAILFS_CTS_BYTES)
 
 /* Pages one connection can have on the wire at once, each a landing page on
@@ -39,6 +41,12 @@ struct railfs_rail_wire {
 	u8 gid[16];
 	u32 qpn;
 	u32 cts_rkey;
+	/* This side's reply ring, per rail: the same memory has a different DMA
+	 * address on every device.
+	 */
+	u64 ctrl_addr;
+	u32 ctrl_rkey;
+	u32 pad;
 } __packed;
 
 struct railfs_wire {
@@ -47,6 +55,10 @@ struct railfs_wire {
 	u64 cts_addr;
 	u32 mtu;
 	u32 pad;
+	u32 ctrl_slots;
+	u32 req_bytes;
+	u32 reply_bytes;
+	u32 pad2;
 	struct railfs_rail_wire line[RAILFS_MAX_RAILS];
 } __packed;
 
@@ -119,5 +131,22 @@ void railfs_rdma_forget(struct railfs_rdma *rdma, struct railfs_push *push);
 int railfs_rdma_push(struct railfs_rdma *rdma, struct railfs_push *push, const void *buf, u32 len);
 int railfs_rdma_push_folios(struct railfs_rdma *rdma, struct railfs_push *push, struct folio **folios, unsigned int nr, u32 len);
 int railfs_rdma_push_sg(struct railfs_rdma *rdma, struct railfs_push *push, struct sg_table *pages, u32 len);
+
+/* Control frames over the fabric: a request slot per call on one rail, the
+ * reply at twice that index in this side's ring. The rail moves bytes and
+ * reports arrivals and failed sends in softirq; a callback returning nonzero
+ * is a protocol error that strands the rail.
+ */
+typedef int (*railfs_ctrl_fn)(void *ctx, u32 line, u32 slot, int err);
+void railfs_rdma_ctrl_watch(struct railfs_rdma *rdma, railfs_ctrl_fn on_reply, railfs_ctrl_fn on_sent, void *ctx);
+
+/* The next rail in turn and a free slot on it; waits killably. */
+int railfs_rdma_ctrl_take(struct railfs_rdma *rdma, u32 *line, u32 *slot);
+void railfs_rdma_ctrl_give(struct railfs_rdma *rdma, u32 line, u32 slot);
+
+int railfs_rdma_ctrl_send(struct railfs_rdma *rdma, u32 line, u32 slot, const void *frame, u32 len);
+
+/* The reply in a slot, header checked; valid until the slot is given back. */
+int railfs_rdma_ctrl_reply(struct railfs_rdma *rdma, u32 line, u32 slot, u16 *type, u8 **payload, u32 *len);
 
 #endif

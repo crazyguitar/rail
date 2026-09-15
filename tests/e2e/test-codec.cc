@@ -74,3 +74,16 @@ TEST(Codec, AListReplyCutShortIsRefused) {
 
   EXPECT_FALSE(proto::decode(proto::Type::ListReply, Payload).has_value());
 }
+
+TEST(Codec, ReadyRoundTripsWithNoPayload) {
+  std::vector<std::byte> Payload;
+  proto::encode(proto::Message{proto::Ready{}}, Payload);
+  EXPECT_TRUE(Payload.empty()) << "Ready carries no fields";
+
+  auto M = proto::decode(proto::Type::Ready, Payload);
+  ASSERT_TRUE(M.has_value()) << M.error().message();
+  EXPECT_NE(std::get_if<proto::Ready>(&*M), nullptr);
+  EXPECT_EQ(proto::typeOf(*M), proto::Type::Ready);
+  EXPECT_STREQ(proto::typeName(proto::Type::Ready), "Ready");
+  EXPECT_EQ(proto::idOf(*M), 0u);
+}

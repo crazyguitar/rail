@@ -110,6 +110,9 @@ public:
 
   bool alive() const;
 
+  // Test-only: the control socket, so TCP_INFO can prove it stayed silent.
+  int controlFd() const;
+
   Coro<Result<uint64_t>> fetch(const std::string &Path, const std::filesystem::path &Local);
   Coro<Result<uint64_t>> store(const std::filesystem::path &Local, const std::string &Path);
   // Every path here is taken by reference and read when the coroutine runs, so
@@ -127,6 +130,7 @@ private:
   struct Impl;
 
   Coro<Result<proto::FileAttrs>> sendMeta(const proto::MetaRequest &Meta);
+  Coro<Result<proto::ListReply>> listThroughPage(const proto::ListRequest &L);
   Coro<Result<uint64_t>>
   submitPosted(const std::string &Path, uint64_t Offset, std::span<std::byte> Into, Page *Landing, size_t Want, uint64_t Handle);
   Coro<Result<uint64_t>> fetchThrough(const std::string &Path, uint64_t Offset, uint64_t Want, PageSink &Landing, uint64_t Handle);

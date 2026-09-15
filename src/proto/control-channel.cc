@@ -18,6 +18,8 @@ Coro<Result<void>> ControlChannel::send(const Message &M) {
 }
 
 Coro<Result<void>> ControlChannel::sendClaimed(const Message &M) {
+  if (Ring) co_return co_await Ring->send(M);
+
   OutBuf.clear();
   OutBuf.reserve(kHeaderSize);
   OutBuf.resize(kHeaderSize);
@@ -36,6 +38,8 @@ Coro<Result<void>> ControlChannel::sendClaimed(const Message &M) {
 }
 
 Coro<Result<Message>> ControlChannel::receive() {
+  if (Ring) co_return co_await Ring->receive();
+
   std::byte Header[kHeaderSize];
   if (auto R = co_await S.readExact(Header); !R) co_return std::unexpected(R.error());
 
@@ -58,6 +62,7 @@ Coro<Result<Message>> ControlChannel::receive() {
 }
 
 void ControlChannel::close() {
+  if (Ring) Ring->close();
   S.close();
   if (Split) W.close();
 }

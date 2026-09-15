@@ -1,4 +1,5 @@
 #include "harness.h"
+#include "tcp-bytes.h"
 
 #include "rail/app/checksum.h"
 #include "rail/file-service.h"
@@ -22,6 +23,32 @@ namespace rail::e2e {
 namespace {
 
 uint16_t portFor(const std::string &Backend) { return Backend == "tcp" ? 18711 : 18712; }
+
+// A function, not a lambda: a lambda coroutine's captures die before it runs.
+Coro<Result<void>> joinAll(std::vector<Coro<Result<proto::StatReply>>> &Asks) {
+  for (auto &A : Asks) {
+    auto R = co_await A.join();
+    if (!R) co_return std::unexpected(R.error());
+    if (!R->Found) co_return failMessage("a stat under load lost its file");
+  }
+  co_return Result<void>{};
+}
+
+// One command on the peer, waited for.
+bool onPeer(const std::string &Script) {
+  auto Ran = peer().run({"bash", "-c", Script + " && echo done"});
+  if (!Ran) return false;
+  auto Line = Ran->readLine();
+  return Line && *Line == "done";
+}
+
+// Makes Count empty files on the peer in one command.
+bool seedManyRemote(const std::string &Dir, int Count) {
+  return onPeer("mkdir -p '" + Dir + "' && cd '" + Dir + "' && touch $(seq -f 'entry-%04g' 1 " + std::to_string(Count) + ")");
+}
+
+// The fixture removes its root over sftp one entry at a time; this does not.
+bool removeManyRemote(const std::string &Dir) { return onPeer("rm -rf '" + Dir + "'"); }
 
 } // namespace
 
@@ -1084,6 +1111,12 @@ TEST_P(Service, AnOversizeWriteEndsTheSession) {
   Mine.Blob = *Local;
   ASSERT_TRUE(run(Control.send(Mine)));
 
+  // Over the fabric the daemon says when its rings may be written.
+  if (auto *Link = Channel->controlLink()) {
+    ASSERT_TRUE(run(Control.expect<proto::Ready>()));
+    Control.useRing(*Link);
+  }
+
   proto::WriteRequest Wr;
   Wr.Id = 1;
   Wr.Path = "lie.bin";
@@ -1416,6 +1449,71 @@ TEST_P(Service, HarnessSurvivesADroppedSession) {
   auto Info = peer().stat(Root + "/drop.bin");
   EXPECT_TRUE(Info) << "stat did not recover from a dropped session";
   EXPECT_EQ(Info.value_or(RemoteStat{}).Size, 4096u);
+}
+
+TEST_P(Service, TheControlSocketIsSilentAfterTheHandshake) {
+  if (GetParam() != "rdma") GTEST_SKIP() << "only the fabric carries control off the socket";
+
+  const auto Local = makeFile("service-silent.bin", 256 << 10, 33);
+  seedRemote(Local, Root + "/silent.bin");
+
+  auto C = client();
+  ASSERT_TRUE(C) << C.error().message();
+  const SocketBytes Before = bytesOn((*C)->controlFd());
+
+  ASSERT_TRUE(run((*C)->stat("silent.bin")));
+  ASSERT_TRUE(run((*C)->list(".")));
+  std::vector<std::byte> Into(64 << 10);
+  ASSERT_TRUE(run((*C)->read("silent.bin", 0, Into)));
+  std::vector<std::byte> Out(4096, std::byte{7});
+  ASSERT_TRUE(run((*C)->write("silent-out.bin", 0, Out, true)));
+  ASSERT_TRUE(run((*C)->makeDirectory("silent-dir")));
+  ASSERT_TRUE(run((*C)->statFs(".")));
+  std::vector<std::byte> Streamed(128 << 10);
+  ASSERT_TRUE(run((*C)->fetchInto("silent.bin", 0, Streamed)));
+  ASSERT_TRUE(run((*C)->storeFrom(Streamed, "silent-stored.bin", 0, true)));
+
+  const SocketBytes After = bytesOn((*C)->controlFd());
+  EXPECT_EQ(Before, After) << "the socket carried " << (After.Sent - Before.Sent) << " bytes out and " << (After.Received - Before.Received)
+                           << " in after the handshake";
+  run((*C)->close());
+}
+
+TEST_P(Service, AListingOfThousandsOfEntriesArrivesWhole) {
+  ASSERT_TRUE(seedManyRemote(Root + "/many", 3000)) << "could not seed the directory on the peer";
+
+  auto C = client();
+  ASSERT_TRUE(C) << C.error().message();
+
+  auto Listed = run((*C)->list("many"));
+  ASSERT_TRUE(Listed) << Listed.error().message();
+  ASSERT_TRUE(Listed->Found);
+  EXPECT_EQ(Listed->Entries.size(), 3000u);
+
+  std::vector<std::string> Names;
+  for (const auto &E : Listed->Entries) Names.push_back(E.Name);
+  std::sort(Names.begin(), Names.end());
+  EXPECT_EQ(Names.front(), "entry-0001");
+  EXPECT_EQ(Names.back(), "entry-3000");
+  run((*C)->close());
+  EXPECT_TRUE(removeManyRemote(Root + "/many"));
+}
+
+TEST_P(Service, SixtyFourStatsAtOnceOnOneClientAllAnswer) {
+  const auto Local = makeFile("service-storm-stat.bin", 4096, 34);
+  seedRemote(Local, Root + "/storm-stat.bin");
+
+  auto C = client();
+  ASSERT_TRUE(C) << C.error().message();
+
+  std::vector<Coro<Result<proto::StatReply>>> Asks;
+  for (int I = 0; I < 64; I++) {
+    Asks.push_back((*C)->stat("storm-stat.bin"));
+    Asks.back().start();
+  }
+  auto All = run(joinAll(Asks));
+  EXPECT_TRUE(All) << All.error().message();
+  run((*C)->close());
 }
 
 INSTANTIATE_TEST_SUITE_P(Backends, Service, ::testing::ValuesIn(kBackends), [](const auto &I) { return I.param; });

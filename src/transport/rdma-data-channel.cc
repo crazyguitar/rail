@@ -2,6 +2,8 @@
 
 #include "rail/io/loop.h"
 #include "rail/io/stream.h" // WaitFor
+#include "rail/proto/codec.h"
+#include "rail/proto/control-link.h"
 #include "rail/transport/rdma-device.h"
 #include "rail/transport/rdma-devices.h"
 
@@ -13,6 +15,7 @@
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
+#include <format>
 #include <infiniband/verbs.h>
 #include <memory>
 #include <poll.h>
@@ -58,6 +61,19 @@ constexpr uint32_t kQueueDepth = kReceives + 64;
 // its timer instead of being woken.
 constexpr uint32_t kIsCts = 1u << 31;
 
+// Marks immediate data as a control frame; a payload carries neither bit.
+constexpr uint32_t kIsCtrl = 1u << 30;
+
+// Control ring geometry per rail. A request slot holds two 4 KiB paths; a
+// reply slot a readlink target and an error. Two reply sub-slots because a
+// streamed transfer answers twice. Both regions come to 256 KiB.
+constexpr uint32_t kCtrlSlots = 16;
+constexpr uint32_t kReqBytes = 16u << 10;
+constexpr uint32_t kReplyBytes = 8u << 10;
+constexpr size_t kCtrlBytes = kCtrlSlots * kReqBytes;
+static_assert(kCtrlBytes == 2 * kCtrlSlots * kReplyBytes, "the ring and the staging area share one size");
+constexpr size_t kFrameHeader = 10; // magic(4) + type(2) + length(4)
+
 // Both ports of this adapter, used together. Two queue pairs have no order
 // between them, so a page goes to one rail whole and the slot in the immediate
 // puts them back in order.
@@ -85,13 +101,19 @@ struct Cts {
 };
 static_assert(sizeof(Cts) == 48, "the ring is written by rdma, so its layout is wire format");
 
-// Sent once each way, inside the endpoint blob the control channel already
-// carries for UCX.
+// Sent once each way in the endpoint blob. Wire layout: the kernel declares
+// these __packed, so every field sits naturally aligned with padding spelled out.
 struct RailWire {
   uint8_t Gid[16];
   uint32_t Qpn;
   uint32_t CtsRkey;
+  // The ring the peer writes control frames into on this rail. Per rail: a
+  // kernel client has a different DMA address on every device.
+  uint64_t CtrlAddr;
+  uint32_t CtrlRkey;
+  uint32_t Pad;
 };
+static_assert(sizeof(RailWire) == 40, "wire layout");
 
 struct Wire {
   uint32_t Rails;
@@ -99,8 +121,13 @@ struct Wire {
   uint64_t CtsAddr;
   uint32_t Mtu;
   uint32_t Pad;
+  uint32_t CtrlSlots;
+  uint32_t ReqBytes;
+  uint32_t ReplyBytes;
+  uint32_t Pad2;
   RailWire Line[kMaxRails];
 };
+static_assert(sizeof(Wire) == 120, "wire layout");
 
 std::string pack(const Wire &W) { return std::string(reinterpret_cast<const char *>(&W), sizeof(W)); }
 
@@ -115,7 +142,7 @@ bool unpack(const std::string &Blob, Wire &W) {
 // ring it writes clear-to-send records into.
 class Rail {
 public:
-  Result<void> open(const RdmaPort &Port, std::span<std::byte> Ring) {
+  Result<void> open(const RdmaPort &Port, std::span<std::byte> Ring, size_t CtrlBytes) {
     auto Shared = RdmaDevice::open(Port.Device);
     if (!Shared) return std::unexpected(Shared.error());
     Owner = *Shared;
@@ -140,6 +167,12 @@ public:
     RingRegion = ibv_reg_mr(Domain, Ring.data(), Ring.size(), Access);
     if (!RingRegion) return failErrno("ibv_reg_mr for the ring");
 
+    // Inbound half for the peer to write, outbound half to send from.
+    Ctrl.assign(CtrlBytes * 2, std::byte{0});
+    CtrlRegion = ibv_reg_mr(Domain, Ctrl.data(), Ctrl.size(), Access);
+    if (!CtrlRegion) return failErrno("ibv_reg_mr for the control ring");
+    Inbound = CtrlBytes;
+
     ibv_qp_init_attr Init{};
     Init.send_cq = Queue;
     Init.recv_cq = Queue;
@@ -159,6 +192,7 @@ public:
 
   ~Rail() {
     if (Pair) ibv_destroy_qp(Pair);
+    if (CtrlRegion) ibv_dereg_mr(CtrlRegion);
     if (RingRegion) ibv_dereg_mr(RingRegion);
     if (Queue) ibv_destroy_cq(Queue);
     if (Comp) ibv_destroy_comp_channel(Comp);
@@ -172,7 +206,13 @@ public:
     std::memcpy(W.Gid, &Gid, sizeof(W.Gid));
     W.Qpn = Pair->qp_num;
     W.CtsRkey = RingRegion->rkey;
+    W.CtrlAddr = reinterpret_cast<uint64_t>(Ctrl.data());
+    W.CtrlRkey = CtrlRegion->rkey;
   }
+
+  std::byte *inbound(size_t Index, size_t Bytes) { return Ctrl.data() + Index * Bytes; }
+  std::byte *outbound(size_t Index, size_t Bytes) { return Ctrl.data() + Inbound + Index * Bytes; }
+  uint32_t ctrlLkey() const { return CtrlRegion->lkey; }
 
   Result<void> join(const RailWire &Peer, uint32_t Mtu) {
     Remote = Peer;
@@ -247,6 +287,9 @@ private:
   ibv_comp_channel *Comp = nullptr;
   ibv_cq *Queue = nullptr;
   ibv_mr *RingRegion = nullptr;
+  std::vector<std::byte> Ctrl;
+  ibv_mr *CtrlRegion = nullptr;
+  size_t Inbound = 0;
   uint32_t Stocked = 0;
   ibv_qp *Pair = nullptr;
   ibv_port_attr Attr{};
@@ -271,11 +314,13 @@ public:
   bool wantsPeerEndpoint() const override { return true; }
 
   Coro<Result<std::string>> listen() override {
+    Side = Role::Daemon;
     if (auto R = start(); !R) co_return std::unexpected(R.error());
     co_return blob();
   }
 
   Coro<Result<void>> connect(const std::string &Endpoint) override {
+    Side = Role::Client;
     if (auto R = start(); !R) co_return std::unexpected(R.error());
     co_return meet(Endpoint);
   }
@@ -288,6 +333,8 @@ public:
   }
 
   Coro<Result<void>> attachPeer(const std::string &Endpoint) override { co_return meet(Endpoint); }
+
+  proto::ControlLink *controlLink() override { return &Control; }
 
   // Says where the page for this key should land, then waits for it. The peer
   // writes straight into the page, so nothing is copied and nothing is matched.
@@ -392,13 +439,18 @@ private:
 
     for (const auto &Port : Ports) {
       auto One = std::make_unique<Rail>();
-      if (auto R = One->open(Port, Records); !R) return R;
+      if (auto R = One->open(Port, Records, kCtrlBytes); !R) return R;
       Lines.push_back(std::move(One));
     }
 
     Free.clear();
     for (uint32_t I = kSlots; I-- > 0;) Free.push_back(I);
     Landing.assign(kSlots, {});
+
+    for (size_t I = 0; I < kMaxRails; I++) {
+      FreeCtrl[I].clear();
+      for (uint32_t S = kCtrlSlots; S-- > 0;) FreeCtrl[I].push_back(S);
+    }
 
     Pump = Loop::get().drive([this] { return pump(); });
     Started = true;
@@ -411,6 +463,9 @@ private:
     W.Slots = kSlots;
     W.CtsAddr = reinterpret_cast<uint64_t>(Ring.data());
     W.Mtu = static_cast<uint32_t>(IBV_MTU_1024);
+    W.CtrlSlots = kCtrlSlots;
+    W.ReqBytes = kReqBytes;
+    W.ReplyBytes = kReplyBytes;
     for (size_t I = 0; I < Lines.size(); I++) Lines[I]->describe(W.Line[I]);
     return pack(W);
   }
@@ -425,8 +480,15 @@ private:
     if (Peer.Rails < Lines.size()) Lines.resize(Peer.Rails);
     PeerRing = Peer.CtsAddr;
 
+    if (Peer.CtrlSlots == 0 || Peer.ReqBytes < kFrameHeader || Peer.ReplyBytes < kFrameHeader) return failMessage("peer offered no control ring");
+    CtrlSlots = std::min(Peer.CtrlSlots, kCtrlSlots);
+    ReqBytes = std::min(Peer.ReqBytes, kReqBytes);
+    ReplyBytes = std::min(Peer.ReplyBytes, kReplyBytes);
+
     for (size_t I = 0; I < Lines.size(); I++) {
       PeerRingKey[I] = Peer.Line[I].CtsRkey;
+      PeerCtrlAddr[I] = Peer.Line[I].CtrlAddr;
+      PeerCtrlKey[I] = Peer.Line[I].CtrlRkey;
       if (auto R = Lines[I]->join(Peer.Line[I], Peer.Mtu); !R) return R;
     }
 
@@ -561,10 +623,13 @@ private:
       co_await Either{this};
       absorb();
 
-      // The peer only has to be there while we are waiting on it. If its end
-      // of the control channel has gone, no completion is ever coming and
-      // waiting for one is waiting forever.
-      if (Alive >= 0 && gone(Alive)) co_return failMessage("peer closed while waiting for it");
+      // A peer that has gone sends no completion, so this would wait forever.
+      // Once control rides the ring, a frame on the socket is a protocol error.
+      if (Alive >= 0) {
+        const Socket State = socketState(Alive);
+        if (State == Socket::Gone) co_return failMessage("peer closed while waiting for it");
+        if (State == Socket::Data && Strict) co_return failMessage("a control frame arrived on tcp after the handshake");
+      }
     }
   }
 
@@ -592,8 +657,8 @@ private:
 
   bool drive() {
     bool Found = false;
-    for (auto &One : Lines)
-      if (driveOne(*One)) Found = true;
+    for (size_t I = 0; I < Lines.size(); I++)
+      if (driveOne(I)) Found = true;
     if (Found) Woke = std::chrono::steady_clock::now();
     return Found;
   }
@@ -606,7 +671,8 @@ private:
     return Found || (Pending > 0 && std::chrono::steady_clock::now() - Woke < kPollWindow);
   }
 
-  bool driveOne(Rail &On) {
+  bool driveOne(size_t Which) {
+    Rail &On = *Lines[Which];
     bool Any = false;
     ibv_wc Done[16];
     for (;;) {
@@ -622,10 +688,14 @@ private:
 
         if (Done[I].opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
           const uint32_t Immediate = ntohl(Done[I].imm_data);
-          const uint32_t Slot = Immediate & ~kIsCts;
-
           On.spent();
 
+          if (Immediate & kIsCtrl) {
+            Arrived.emplace_back(Which, Immediate & ~(kIsCtrl | kIsCts));
+            continue;
+          }
+
+          const uint32_t Slot = Immediate & ~kIsCts;
           if (Immediate & kIsCts) offered(Slot);
           else if (Slot < kSlots) Landing[Slot].Done = true;
           continue;
@@ -660,15 +730,18 @@ private:
     }
   };
 
-  static bool gone(int Fd) {
+  enum class Socket { Quiet, Data, Gone };
+
+  static Socket socketState(int Fd) {
     ::pollfd Watch{Fd, POLLIN | POLLRDHUP, 0};
-    if (::poll(&Watch, 1, 0) <= 0) return false;
-    if (Watch.revents & (POLLHUP | POLLERR | POLLRDHUP)) return true;
+    if (::poll(&Watch, 1, 0) <= 0) return Socket::Quiet;
+    if (Watch.revents & (POLLHUP | POLLERR | POLLRDHUP)) return Socket::Gone;
 
     char Peek = 0;
     const ssize_t Saw = ::recv(Fd, &Peek, 1, MSG_PEEK | MSG_DONTWAIT);
-    if (Saw == 0) return true;
-    return Saw < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOTSOCK;
+    if (Saw == 0) return Socket::Gone;
+    if (Saw > 0) return Socket::Data;
+    return errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOTSOCK ? Socket::Quiet : Socket::Gone;
   }
 
   void wake() {
@@ -680,6 +753,180 @@ private:
     RdmaDataChannel *C;
     ~Leave() { C->Pending--; }
   };
+
+  // Frames in and out of the control rings: the daemon answers a request in
+  // slot n at sub-slot 2n or 2n+1 of the client's ring. Nothing is matched by
+  // arrival order; the frame says what it is.
+  class RingControl final : public proto::ControlLink {
+  public:
+    explicit RingControl(RdmaDataChannel &C) : C(C) {}
+
+    Coro<Result<void>> send(const proto::Message &M) override {
+      C.Strict = true;
+      std::vector<std::byte> Frame;
+      frame(M, Frame);
+      if (C.Side == Role::Client) co_return co_await request(M, Frame);
+      co_return co_await reply(M, Frame);
+    }
+
+    Coro<Result<proto::Message>> receive() override {
+      C.Strict = true;
+      if (auto R = co_await C.until([&] { return !C.Arrived.empty(); }); !R) co_return std::unexpected(R.error());
+      const auto [Which, Index] = C.Arrived.front();
+      C.Arrived.pop_front();
+
+      const bool Daemon = C.Side == Role::Daemon;
+      const uint32_t Bytes = Daemon ? C.ReqBytes : C.ReplyBytes;
+      const uint32_t Count = Daemon ? C.CtrlSlots : 2 * C.CtrlSlots;
+      if (Which >= C.Lines.size() || Index >= Count)
+        co_return failMessage(std::format("control frame for slot {} on rail {}, which does not exist", Index, Which));
+
+      auto M = decodeAt(C.Lines[Which]->inbound(Index, Bytes), Bytes);
+      if (!M) co_return M;
+
+      if (Daemon) remember(*M, Which, Index);
+      co_return M;
+    }
+
+    void release(uint64_t Id) override {
+      auto It = Held.find(Id);
+      if (It == Held.end()) return;
+      for (const auto &[Which, Slot] : It->second) C.FreeCtrl[Which].push_back(Slot);
+      Held.erase(It);
+      C.wake();
+    }
+
+    void close() override { C.close(); }
+
+  private:
+    struct Open {
+      size_t Which;
+      uint32_t Slot;
+      uint32_t Sent;
+      uint32_t Expected;
+    };
+
+    static void frame(const proto::Message &M, std::vector<std::byte> &Out) {
+      Out.assign(kFrameHeader, std::byte{0});
+      proto::encode(M, Out);
+      const uint32_t Magic = proto::kMagic;
+      const uint16_t T = static_cast<uint16_t>(proto::typeOf(M));
+      const uint32_t Length = static_cast<uint32_t>(Out.size() - kFrameHeader);
+      std::memcpy(Out.data(), &Magic, 4);
+      std::memcpy(Out.data() + 4, &T, 2);
+      std::memcpy(Out.data() + 6, &Length, 4);
+    }
+
+    static Result<proto::Message> decodeAt(const std::byte *At, uint32_t Bytes) {
+      uint32_t Magic = 0;
+      uint16_t T = 0;
+      uint32_t Length = 0;
+      std::memcpy(&Magic, At, 4);
+      std::memcpy(&T, At + 4, 2);
+      std::memcpy(&Length, At + 6, 4);
+      if (Magic != proto::kMagic) return failMessage("bad frame magic in a control ring slot");
+      if (Length > Bytes - kFrameHeader) return failMessage("control frame longer than its ring slot");
+      return proto::decode(static_cast<proto::Type>(T), std::span<const std::byte>{At + kFrameHeader, Length});
+    }
+
+    // Fetch and Store answer twice; a StreamDigest reuses its Store's id.
+    void remember(const proto::Message &M, size_t Which, uint32_t Slot) {
+      const uint64_t Id = proto::idOf(M);
+      if (Id == 0 || Opened.contains(Id)) return;
+      const auto T = proto::typeOf(M);
+      const uint32_t Expected = T == proto::Type::Fetch || T == proto::Type::Store ? 2 : 1;
+      Opened[Id] = Open{Which, Slot, 0, Expected};
+    }
+
+    Coro<Result<void>> request(const proto::Message &M, const std::vector<std::byte> &Frame) {
+      if (Frame.size() > C.ReqBytes)
+        co_return failMessage(std::format("control frame of {} bytes exceeds the {} byte request slot", Frame.size(), C.ReqBytes));
+      if (C.Lines.empty()) co_return failMessage("rdma channel is not connected");
+
+      const size_t Which = C.CtrlTurn++ % C.Lines.size();
+      if (auto R = co_await C.until([&] { return !C.FreeCtrl[Which].empty(); }); !R) co_return R;
+      const uint32_t Slot = C.FreeCtrl[Which].back();
+      C.FreeCtrl[Which].pop_back();
+      Held[proto::idOf(M)].emplace_back(Which, Slot);
+
+      std::byte *Staged = C.Lines[Which]->outbound(Slot, C.ReqBytes);
+      std::memcpy(Staged, Frame.data(), Frame.size());
+      co_return post(Which, Staged, Frame.size(), C.PeerCtrlAddr[Which] + uint64_t{Slot} * C.ReqBytes, Slot);
+    }
+
+    Coro<Result<void>> reply(const proto::Message &M, const std::vector<std::byte> &Frame) {
+      if (Frame.size() > C.ReplyBytes)
+        co_return failMessage(std::format("control frame of {} bytes exceeds the {} byte reply slot", Frame.size(), C.ReplyBytes));
+
+      auto It = Opened.find(proto::idOf(M));
+      if (It == Opened.end()) co_return failMessage(std::format("a reply to request {}, which this session never received", proto::idOf(M)));
+      Open &Ex = It->second;
+      if (Ex.Sent >= 2) co_return failMessage(std::format("a third reply to request {}", proto::idOf(M)));
+
+      const uint32_t Sub = 2 * Ex.Slot + Ex.Sent;
+      std::byte *Staged = C.Lines[Ex.Which]->outbound(Sub, C.ReplyBytes);
+      std::memcpy(Staged, Frame.data(), Frame.size());
+      auto Posted = post(Ex.Which, Staged, Frame.size(), C.PeerCtrlAddr[Ex.Which] + uint64_t{Sub} * C.ReplyBytes, Sub);
+      if (!Posted) co_return Posted;
+
+      if (++Ex.Sent >= Ex.Expected || endsExchange(M)) Opened.erase(It);
+      co_return Result<void>{};
+    }
+
+    // A refused streamed transfer answers once, so its entry must not linger.
+    static bool endsExchange(const proto::Message &M) {
+      if (const auto *R = std::get_if<proto::StreamReply>(&M)) return !R->Ok;
+      return std::holds_alternative<proto::StreamDigest>(M);
+    }
+
+    // Signalled but not waited on: the staging bytes belong to the slot, and a
+    // failure surfaces on the completion queue.
+    Result<void> post(size_t Which, std::byte *From, size_t Length, uint64_t To, uint32_t Index) {
+      Rail &On = *C.Lines[Which];
+
+      ibv_sge Piece{};
+      Piece.addr = reinterpret_cast<uint64_t>(From);
+      Piece.length = static_cast<uint32_t>(Length);
+      Piece.lkey = On.ctrlLkey();
+
+      ibv_send_wr Work{};
+      Work.wr_id = 0;
+      Work.sg_list = &Piece;
+      Work.num_sge = 1;
+      Work.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+      Work.imm_data = htonl(kIsCtrl | Index);
+      Work.send_flags = IBV_SEND_SIGNALED;
+      Work.wr.rdma.remote_addr = To;
+      Work.wr.rdma.rkey = C.PeerCtrlKey[Which];
+
+      ibv_send_wr *Bad = nullptr;
+      if (ibv_post_send(On.pair(), &Work, &Bad) != 0) return failErrno("ibv_post_send for a control frame");
+      return {};
+    }
+
+    RdmaDataChannel &C;
+    std::unordered_map<uint64_t, Open> Opened;
+    std::unordered_map<uint64_t, std::vector<std::pair<size_t, uint32_t>>> Held;
+  };
+
+  enum class Role { Unset, Daemon, Client };
+  Role Side = Role::Unset;
+
+  // Control geometry both ends agreed: the smaller of each.
+  uint32_t CtrlSlots = kCtrlSlots;
+  uint32_t ReqBytes = kReqBytes;
+  uint32_t ReplyBytes = kReplyBytes;
+  uint64_t PeerCtrlAddr[kMaxRails]{};
+  uint32_t PeerCtrlKey[kMaxRails]{};
+
+  // Landed control frames not yet read: rail, and slot or sub-slot.
+  std::deque<std::pair<size_t, uint32_t>> Arrived;
+  // Request slots this side may write into, per rail. Client only.
+  std::vector<uint32_t> FreeCtrl[kMaxRails];
+  size_t CtrlTurn = 0;
+  // After the first ring frame, a frame on the socket is a protocol error.
+  bool Strict = false;
+  RingControl Control{*this};
 
   PagePool Pool;
   std::vector<Cts> Ring;

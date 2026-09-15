@@ -50,6 +50,10 @@ struct railfs_conn {
 	bool verify;
 	bool dead;
 	int why;
+	/* Which call holds each request slot, under calls_lock, for softirq. */
+	struct railfs_call *owner[RAILFS_MAX_RAILS][RAILFS_CTRL_SLOTS];
+	/* A bad reply seen in softirq; the waiting caller kills the connection. */
+	int ring_fault;
 };
 
 #include "railfs-proto.h"

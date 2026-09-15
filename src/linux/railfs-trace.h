@@ -51,6 +51,12 @@ void railfs_trace_busy(int delta);
  */
 void railfs_trace_calls(int delta);
 
+/* Control frames on tcp after the handshake; zero on an rdma mount. */
+void railfs_trace_tcp_frames(int delta);
+
+/* Control requests per rail. */
+void railfs_trace_ctrl_rail(u32 line);
+
 static inline u64 railfs_now(void) { return ktime_get_ns(); }
 
 #endif

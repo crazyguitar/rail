@@ -31,6 +31,9 @@ static atomic_t railfs_busy_max = ATOMIC_INIT(0);
 static atomic_t railfs_calls = ATOMIC_INIT(0);
 static atomic_t railfs_calls_max = ATOMIC_INIT(0);
 
+static atomic_t railfs_tcp_frames = ATOMIC_INIT(0);
+static atomic_t railfs_ctrl_rail[2] = { ATOMIC_INIT(0), ATOMIC_INIT(0) };
+
 static void railfs_watermark(atomic_t *now_at, atomic_t *high, int delta)
 {
 	int now = atomic_add_return(delta, now_at);
@@ -46,6 +49,15 @@ void railfs_trace_inflight(int delta) { railfs_watermark(&railfs_inflight, &rail
 void railfs_trace_busy(int delta) { railfs_watermark(&railfs_busy, &railfs_busy_max, delta); }
 
 void railfs_trace_calls(int delta) { railfs_watermark(&railfs_calls, &railfs_calls_max, delta); }
+
+void railfs_trace_tcp_frames(int delta) { atomic_add(delta, &railfs_tcp_frames); }
+
+void railfs_trace_ctrl_rail(u32 line)
+{
+	if (line < ARRAY_SIZE(railfs_ctrl_rail)) {
+		atomic_inc(&railfs_ctrl_rail[line]);
+	}
+}
 
 static const char *const railfs_phase_names[RAILFS_PHASE_MAX] = {
 	[RAILFS_PHASE_READ_TOTAL] = "read.total",     [RAILFS_PHASE_READ_ALLOC] = "read.alloc",
@@ -82,6 +94,9 @@ static void railfs_trace_reset(void)
 	atomic_set(&railfs_inflight_max, atomic_read(&railfs_inflight));
 	atomic_set(&railfs_busy_max, atomic_read(&railfs_busy));
 	atomic_set(&railfs_calls_max, atomic_read(&railfs_calls));
+	atomic_set(&railfs_tcp_frames, 0);
+	atomic_set(&railfs_ctrl_rail[0], 0);
+	atomic_set(&railfs_ctrl_rail[1], 0);
 
 	for_each_possible_cpu(cpu) {
 		memset(per_cpu_ptr(&railfs_counters, cpu), 0, sizeof(struct railfs_counters));
@@ -95,6 +110,8 @@ static int railfs_stats_show(struct seq_file *m, void *unused)
 	seq_printf(m, "inflight now %d, most %d\n", atomic_read(&railfs_inflight), atomic_read(&railfs_inflight_max));
 	seq_printf(m, "conns busy now %d, most %d\n", atomic_read(&railfs_busy), atomic_read(&railfs_busy_max));
 	seq_printf(m, "calls now %d, most %d\n", atomic_read(&railfs_calls), atomic_read(&railfs_calls_max));
+	seq_printf(m, "tcp control frames %d\n", atomic_read(&railfs_tcp_frames));
+	seq_printf(m, "ctrl rail0 %d rail1 %d\n", atomic_read(&railfs_ctrl_rail[0]), atomic_read(&railfs_ctrl_rail[1]));
 	seq_printf(m, "%-14s %10s %14s %12s %10s\n", "phase", "calls", "ns", "MB", "us/call");
 
 	for (phase = 0; phase < RAILFS_PHASE_MAX; phase++) {

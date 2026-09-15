@@ -71,6 +71,13 @@ struct railfs_landing {
 	dma_addr_t dma;
 };
 
+// Per request slot, so a failed send completion can name the call it owned.
+struct railfs_ctrl_slot {
+	struct ib_cqe cqe;
+	struct railfs_line *line;
+	u32 index;
+};
+
 // One port. Everything that belongs to a device rather than to the connection:
 // its own protection domain, queue pair and landing memory, because two ports
 // on this hardware are two separate ib_devices and memory registered with one
@@ -92,6 +99,15 @@ struct railfs_line {
 	// peer writes its own requests into: sharing them races.
 	void *offers;
 	dma_addr_t offers_dma;
+	// Where replies land (remote write) and where requests are staged.
+	void *replies;
+	dma_addr_t replies_dma;
+	struct ib_mr *replies_mr;
+	void *requests;
+	dma_addr_t requests_dma;
+	struct railfs_ctrl_slot ctrl_slot[RAILFS_CTRL_SLOTS];
+	DECLARE_BITMAP(ctrl_free, RAILFS_CTRL_SLOTS);
+	wait_queue_head_t ctrl_room;
 	// A managed completion queue dispatches through wr_cqe->done, not wr_id.
 	// Leaving these unset is a null dereference in softirq context.
 	struct ib_cqe recv_cqe;
@@ -138,6 +154,14 @@ struct railfs_rdma {
 	atomic_t seq;
 	// Which rail the next push writes over.
 	atomic_t turn;
+	// Control geometry both ends agreed, and who hears about replies.
+	u32 ctrl_slots;
+	u32 req_bytes;
+	u32 reply_bytes;
+	atomic_t ctrl_turn;
+	railfs_ctrl_fn on_reply;
+	railfs_ctrl_fn on_sent;
+	void *ctrl_ctx;
 };
 
 static void *railfs_landing_at(struct railfs_line *line, u32 slot)
@@ -412,6 +436,16 @@ static void railfs_line_close(struct railfs_line *line)
 		sg_free_table(&line->gpu_table);
 	}
 
+	if (line->replies_mr) {
+		ib_dereg_mr(line->replies_mr);
+	}
+	if (line->replies) {
+		dma_free_coherent(line->device->dma_device, RAILFS_CTRL_BYTES, line->replies, line->replies_dma);
+	}
+	if (line->requests) {
+		dma_free_coherent(line->device->dma_device, RAILFS_CTRL_BYTES, line->requests, line->requests_dma);
+	}
+
 	if (line->landing_mr) {
 		ib_dereg_mr(line->landing_mr);
 	}
@@ -493,6 +527,8 @@ static u32 railfs_next_vector(struct ib_device *device)
 	return (u32)atomic_fetch_inc(&railfs_vector) % vectors;
 }
 
+static int railfs_ctrl_open(struct railfs_line *line);
+
 static int railfs_line_open(struct railfs_line *line)
 {
 	struct ib_qp_init_attr init = {};
@@ -539,42 +575,83 @@ static int railfs_line_open(struct railfs_line *line)
 		goto out;
 	}
 
+	err = railfs_ctrl_open(line);
+	if (err) {
+		goto out;
+	}
+
 	init_completion(&line->armed);
 	err = railfs_qp_to_init(line->qp, line->port);
 out:
 	return err;
 }
 
-// The ring the peer writes its requests into. One for the connection, on the
-// first rail, because the wire carries a single ring address.
-static int railfs_ring_open(struct railfs_rdma *rail)
+// Maps a coherent buffer for the peer to write into; live once armed.
+static int railfs_region_open(struct railfs_line *line, dma_addr_t dma, size_t bytes, struct ib_mr **out)
 {
-	struct railfs_line *line = &rail->line[0];
 	struct scatterlist sg;
 	struct ib_mr *mr;
 	int mapped;
+
+	mr = ib_alloc_mr(line->pd, IB_MR_TYPE_MEM_REG, 1);
+	if (IS_ERR(mr)) {
+		return PTR_ERR(mr);
+	}
+	*out = mr;
+
+	sg_init_table(&sg, 1);
+	sg_dma_address(&sg) = dma;
+	sg_dma_len(&sg) = bytes;
+
+	mapped = ib_map_mr_sg(mr, &sg, 1, NULL, bytes);
+	if (mapped != 1) {
+		return mapped < 0 ? mapped : -EINVAL;
+	}
+
+	return 0;
+}
+
+// The ring the peer writes its clear-to-sends into. One for the connection, on
+// the first rail, because the wire carries a single ring address.
+static int railfs_ring_open(struct railfs_rdma *rail)
+{
+	struct railfs_line *line = &rail->line[0];
 
 	rail->ring = dma_alloc_coherent(line->device->dma_device, RAILFS_RING_BYTES, &rail->ring_dma, GFP_KERNEL);
 	if (!rail->ring) {
 		return -ENOMEM;
 	}
 
-	mr = ib_alloc_mr(line->pd, IB_MR_TYPE_MEM_REG, 1);
-	if (IS_ERR(mr)) {
-		return PTR_ERR(mr);
+	return railfs_region_open(line, rail->ring_dma, RAILFS_RING_BYTES, &rail->ring_mr);
+}
+
+// One rail's control rings. Requests leave under the local dma key, like offers.
+static int railfs_ctrl_open(struct railfs_line *line)
+{
+	u32 i;
+	int err;
+
+	line->replies = dma_alloc_coherent(line->device->dma_device, RAILFS_CTRL_BYTES, &line->replies_dma, GFP_KERNEL);
+	if (!line->replies) {
+		return -ENOMEM;
 	}
 
-	rail->ring_mr = mr;
-
-	sg_init_table(&sg, 1);
-	sg_dma_address(&sg) = rail->ring_dma;
-	sg_dma_len(&sg) = RAILFS_RING_BYTES;
-
-	mapped = ib_map_mr_sg(mr, &sg, 1, NULL, RAILFS_RING_BYTES);
-	if (mapped != 1) {
-		return mapped < 0 ? mapped : -EINVAL;
+	line->requests = dma_alloc_coherent(line->device->dma_device, RAILFS_CTRL_BYTES, &line->requests_dma, GFP_KERNEL);
+	if (!line->requests) {
+		return -ENOMEM;
 	}
 
+	err = railfs_region_open(line, line->replies_dma, RAILFS_CTRL_BYTES, &line->replies_mr);
+	if (err) {
+		return err;
+	}
+
+	for (i = 0; i < RAILFS_CTRL_SLOTS; i++) {
+		line->ctrl_slot[i].line = line;
+		line->ctrl_slot[i].index = i;
+	}
+	bitmap_fill(line->ctrl_free, RAILFS_CTRL_SLOTS);
+	init_waitqueue_head(&line->ctrl_room);
 	return 0;
 }
 
@@ -587,6 +664,13 @@ struct railfs_rdma *railfs_rdma_open(struct railfs_wire *wire)
 	u32 slot;
 	u32 i;
 	int err;
+
+	BUILD_BUG_ON(sizeof(struct railfs_rail_wire) != 40);
+	BUILD_BUG_ON(sizeof(struct railfs_wire) != 120);
+	// Landings, clear-to-sends and replies each consume a posted receive.
+	BUILD_BUG_ON(RAILFS_RECV_DEPTH < 2 * RAILFS_STREAM_SLOTS + RAILFS_CTRL_SLOTS);
+	// Requests, offers and pushes in flight each hold a send, plus one fence.
+	BUILD_BUG_ON(RAILFS_CQ_DEPTH < 2 * RAILFS_STREAM_SLOTS + RAILFS_CTRL_SLOTS + 1);
 
 	lines = railfs_active_lines(found, RAILFS_MAX_RAILS);
 	if (!lines) {
@@ -641,6 +725,9 @@ struct railfs_rdma *railfs_rdma_open(struct railfs_wire *wire)
 	wire->slots = RAILFS_CTS_SLOTS;
 	wire->cts_addr = (u64)rail->ring_dma;
 	wire->mtu = IB_MTU_1024;
+	wire->ctrl_slots = RAILFS_CTRL_SLOTS;
+	wire->req_bytes = RAILFS_REQ_BYTES;
+	wire->reply_bytes = RAILFS_REPLY_BYTES;
 
 	for (i = 0; i < lines; i++) {
 		err = rdma_query_gid(rail->line[i].device, rail->line[i].port, 0, &gid);
@@ -654,6 +741,8 @@ struct railfs_rdma *railfs_rdma_open(struct railfs_wire *wire)
 		// can hold it. A later rail advertises no key rather than one that
 		// would mean nothing there.
 		wire->line[i].cts_rkey = i == 0 ? rail->ring_mr->rkey : 0;
+		wire->line[i].ctrl_addr = (u64)rail->line[i].replies_dma;
+		wire->line[i].ctrl_rkey = rail->line[i].replies_mr->rkey;
 
 		pr_info("railfs: rdma rail %u on %s port %u, qp %u\n", i, rail->line[i].device->name, rail->line[i].port,
 			rail->line[i].qp->qp_num);
@@ -887,6 +976,14 @@ int railfs_rdma_meet(struct railfs_rdma *rail, const struct railfs_wire *wire)
 	rail->peer = *wire;
 	shared = wire->rails < rail->lines ? wire->rails : rail->lines;
 
+	// A daemon without rings still carries control on the socket; not spoken here.
+	if (wire->ctrl_slots == 0 || wire->req_bytes < RAILFS_HEADER_SIZE || wire->reply_bytes < RAILFS_HEADER_SIZE) {
+		return -EPROTO;
+	}
+	rail->ctrl_slots = min_t(u32, wire->ctrl_slots, RAILFS_CTRL_SLOTS);
+	rail->req_bytes = min_t(u32, wire->req_bytes, RAILFS_REQ_BYTES);
+	rail->reply_bytes = min_t(u32, wire->reply_bytes, RAILFS_REPLY_BYTES);
+
 	for (i = 0; i < shared; i++) {
 		struct railfs_line *line = &rail->line[i];
 
@@ -915,6 +1012,12 @@ int railfs_rdma_meet(struct railfs_rdma *rail, const struct railfs_wire *wire)
 				pr_err("railfs: could not arm the ring: %d\n", err);
 				return err;
 			}
+		}
+
+		err = railfs_arm_region(line, line->replies_mr);
+		if (err) {
+			pr_err("railfs: could not arm the reply ring on rail %u: %d\n", i, err);
+			return err;
 		}
 
 		err = railfs_stock(line, RAILFS_RECV_DEPTH);
@@ -950,6 +1053,7 @@ static void railfs_strand_all(struct railfs_rdma *rail, int err)
 	struct railfs_push *push;
 	struct railfs_push *next;
 	u32 slot;
+	u32 i;
 
 	WRITE_ONCE(rail->broken, true);
 
@@ -965,6 +1069,9 @@ static void railfs_strand_all(struct railfs_rdma *rail, int err)
 	spin_unlock_bh(&rail->pushes_lock);
 
 	wake_up(&rail->slot_room);
+	for (i = 0; i < rail->lines; i++) {
+		wake_up(&rail->line[i].ctrl_room);
+	}
 }
 
 // The peer said where it wants the bytes for some key. Whoever registered that
@@ -1000,6 +1107,40 @@ static void railfs_on_cts(struct railfs_rdma *rail, u32 slot)
 	pr_warn_ratelimited("railfs: dropping a stale clear to send for key %llu\n", record.key);
 }
 
+// A reply landed in sub-slot 2n for request slot n. Odd sub-slots serve the
+// userspace client's streamed transfers and never carry anything here.
+static void railfs_on_ctrl(struct railfs_line *line, u32 sub)
+{
+	struct railfs_rdma *rail = line->rail;
+
+	if (sub >= 2 * rail->ctrl_slots || (sub & 1) || !rail->on_reply) {
+		pr_err_ratelimited("railfs: control reply for sub-slot %u, which this rail does not have\n", sub);
+		railfs_strand_all(rail, -EPROTO);
+		return;
+	}
+
+	if (rail->on_reply(rail->ctrl_ctx, line->index, sub / 2, 0)) {
+		railfs_strand_all(rail, -EPROTO);
+	}
+}
+
+// Only a failed request write matters: the staging bytes belong to the slot.
+static void railfs_on_ctrl_sent(struct ib_cq *cq, struct ib_wc *wc)
+{
+	struct railfs_ctrl_slot *mine = container_of(wc->wr_cqe, struct railfs_ctrl_slot, cqe);
+	struct railfs_rdma *rail = mine->line->rail;
+
+	if (wc->status == IB_WC_SUCCESS) {
+		return;
+	}
+	if (wc->status != IB_WC_WR_FLUSH_ERR) {
+		pr_err_ratelimited("railfs: control frame failed on rail %u: %s\n", mine->line->index, ib_wc_status_msg(wc->status));
+	}
+	if (rail->on_sent) {
+		rail->on_sent(rail->ctrl_ctx, mine->line->index, mine->index, -EIO);
+	}
+}
+
 // Every receive on any rail arrives here, and the immediate says what it is: a
 // clear-to-send the peer wants answered, or the payload for a slot this side
 // offered. Runs in softirq, so it may not sleep and may not modify a queue
@@ -1030,6 +1171,11 @@ static void railfs_on_landed(struct ib_cq *cq, struct ib_wc *wc)
 
 	if (imm & RAILFS_IS_CTS) {
 		railfs_on_cts(rail, imm & ~RAILFS_IS_CTS);
+		return;
+	}
+
+	if (imm & RAILFS_IS_CTRL) {
+		railfs_on_ctrl(line, imm & ~(RAILFS_IS_CTRL | RAILFS_IS_CTS));
 		return;
 	}
 
@@ -1085,6 +1231,9 @@ wake:
 	// The timeout paths reach here without railfs_strand_all, so this is the
 	// only wake anyone parked for a slot gets.
 	wake_up(&rail->slot_room);
+	for (i = 0; i < rail->lines; i++) {
+		wake_up(&rail->line[i].ctrl_room);
+	}
 }
 
 void railfs_rdma_break(struct railfs_rdma *rail)
@@ -1250,6 +1399,128 @@ void railfs_rdma_slot_orphan(struct railfs_rdma *rail, u32 slot)
 	if (atomic_cmpxchg(&rail->slot[slot].state, RAILFS_SLOT_LIVE, RAILFS_SLOT_ORPHAN) != RAILFS_SLOT_LIVE) {
 		railfs_rdma_slot_release(rail, slot);
 	}
+}
+
+void railfs_rdma_ctrl_watch(struct railfs_rdma *rail, railfs_ctrl_fn on_reply, railfs_ctrl_fn on_sent, void *ctx)
+{
+	rail->on_reply = on_reply;
+	rail->on_sent = on_sent;
+	rail->ctrl_ctx = ctx;
+}
+
+static bool railfs_ctrl_free(const struct railfs_line *line, u32 slots)
+{
+	return find_first_bit(line->ctrl_free, slots) < slots;
+}
+
+// Rails in turn, then a slot on the one chosen. Waits when full: a slot comes
+// back with every reply, and the caller has nowhere else to go.
+int railfs_rdma_ctrl_take(struct railfs_rdma *rail, u32 *which, u32 *slot)
+{
+	struct railfs_line *line;
+	u32 live = READ_ONCE(rail->live);
+
+	if (!live || READ_ONCE(rail->broken)) {
+		return -ENOTCONN;
+	}
+
+	*which = (u32)atomic_inc_return(&rail->ctrl_turn) % live;
+	line = &rail->line[*which];
+
+	for (;;) {
+		u32 at;
+
+		if (READ_ONCE(rail->broken)) {
+			return -ENOTCONN;
+		}
+
+		at = find_first_bit(line->ctrl_free, rail->ctrl_slots);
+		if (at < rail->ctrl_slots && test_and_clear_bit(at, line->ctrl_free)) {
+			*slot = at;
+			return 0;
+		}
+
+		if (wait_event_killable(line->ctrl_room, READ_ONCE(rail->broken) || railfs_ctrl_free(line, rail->ctrl_slots))) {
+			return -ERESTARTSYS;
+		}
+	}
+}
+
+void railfs_rdma_ctrl_give(struct railfs_rdma *rail, u32 which, u32 slot)
+{
+	struct railfs_line *line;
+
+	if (which >= rail->lines || slot >= RAILFS_CTRL_SLOTS) {
+		return;
+	}
+
+	line = &rail->line[which];
+	set_bit(slot, line->ctrl_free);
+	wake_up(&line->ctrl_room);
+}
+
+int railfs_rdma_ctrl_send(struct railfs_rdma *rail, u32 which, u32 slot, const void *frame, u32 len)
+{
+	const struct ib_send_wr *bad;
+	struct railfs_line *post;
+	struct ib_rdma_wr wr = {};
+	struct ib_sge sge = {};
+
+	if (which >= READ_ONCE(rail->live) || slot >= rail->ctrl_slots) {
+		return -EINVAL;
+	}
+	if (len > rail->req_bytes) {
+		return -EMSGSIZE;
+	}
+	if (READ_ONCE(rail->broken)) {
+		return -ENOTCONN;
+	}
+
+	post = &rail->line[which];
+	memcpy((u8 *)post->requests + (size_t)slot * rail->req_bytes, frame, len);
+
+	sge.addr = post->requests_dma + (dma_addr_t)slot * rail->req_bytes;
+	sge.length = len;
+	sge.lkey = post->pd->local_dma_lkey;
+
+	post->ctrl_slot[slot].cqe.done = railfs_on_ctrl_sent;
+
+	wr.wr.wr_cqe = &post->ctrl_slot[slot].cqe;
+	wr.wr.sg_list = &sge;
+	wr.wr.num_sge = 1;
+	wr.wr.opcode = IB_WR_RDMA_WRITE_WITH_IMM;
+	wr.wr.ex.imm_data = cpu_to_be32(RAILFS_IS_CTRL | slot);
+	wr.wr.send_flags = IB_SEND_SIGNALED;
+	wr.remote_addr = rail->peer.line[which].ctrl_addr + (u64)slot * rail->req_bytes;
+	wr.rkey = rail->peer.line[which].ctrl_rkey;
+
+	return ib_post_send(post->qp, &wr.wr, &bad);
+}
+
+int railfs_rdma_ctrl_reply(struct railfs_rdma *rail, u32 which, u32 slot, u16 *type, u8 **payload, u32 *len)
+{
+	u8 *at;
+	u32 magic;
+
+	if (which >= rail->lines || slot >= rail->ctrl_slots) {
+		return -EINVAL;
+	}
+
+	at = (u8 *)rail->line[which].replies + (size_t)(2 * slot) * rail->reply_bytes;
+	memcpy(&magic, at, 4);
+	memcpy(type, at + 4, 2);
+	memcpy(len, at + 6, 4);
+
+	if (magic != RAILFS_WIRE_MAGIC) {
+		pr_err_ratelimited("railfs: bad frame magic %08x in a reply slot\n", magic);
+		return -EPROTO;
+	}
+	if (*len > rail->reply_bytes - RAILFS_HEADER_SIZE) {
+		return -EPROTO;
+	}
+
+	*payload = at + RAILFS_HEADER_SIZE;
+	return 0;
 }
 
 static void railfs_gpu_unbind_all(struct railfs_rdma *rail, u32 bound)

@@ -45,6 +45,7 @@ Type typeOf(const Message &M) {
         else if constexpr (std::is_same_v<T, OpenRequest>) return Type::Open;
         else if constexpr (std::is_same_v<T, OpenReply>) return Type::OpenReply;
         else if constexpr (std::is_same_v<T, CloseRequest>) return Type::Close;
+        else if constexpr (std::is_same_v<T, Ready>) return Type::Ready;
         else return Type::TransferReply;
       },
       M);
@@ -104,6 +105,8 @@ const char *typeName(Type T) {
     return "OpenReply";
   case Type::Close:
     return "Close";
+  case Type::Ready:
+    return "Ready";
   case Type::StatFs:
     return "StatFs";
   case Type::StatFsReply:
@@ -162,6 +165,8 @@ void encode(const Message &M, std::vector<std::byte> &Payload) {
           W.str(V.Backend);
           W.str(V.ChannelEndpoint);
         } else if constexpr (std::is_same_v<T, End>) {
+          // no fields
+        } else if constexpr (std::is_same_v<T, Ready>) {
           // no fields
         } else if constexpr (std::is_same_v<T, FileHeader>) {
           W.str(V.Name);
@@ -387,6 +392,9 @@ Result<Message> decode(Type T, std::span<const std::byte> Payload) {
   }
   case Type::End:
     M = End{};
+    break;
+  case Type::Ready:
+    M = Ready{};
     break;
   case Type::Done: {
     Done V;

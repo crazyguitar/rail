@@ -2,6 +2,7 @@
 
 #include "rail/io/coro.h"
 #include "rail/page-pool.h"
+#include "rail/proto/control-link.h"
 #include "rail/result.h"
 
 #include <memory>
@@ -64,6 +65,9 @@ public:
   // already bidirectional once accepted does not, and asking for one it never
   // sends leaves the listener waiting for a message that is not coming.
   virtual bool wantsPeerEndpoint() const { return false; }
+
+  // Null for a byte-stream transport, whose control stays on the socket.
+  virtual proto::ControlLink *controlLink() { return nullptr; }
 
   virtual Coro<Result<void>> send(Page &Buf, uint64_t Key) = 0;
   virtual Coro<Result<void>> recv(Page &Buf, uint64_t Key, size_t Length) = 0;

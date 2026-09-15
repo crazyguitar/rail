@@ -3,6 +3,7 @@
 #include "rail/io/coro.h"
 #include "rail/io/stream.h"
 #include "rail/io/turn.h"
+#include "rail/proto/control-link.h"
 #include "rail/proto/message.h"
 #include "rail/result.h"
 
@@ -26,6 +27,13 @@ public:
 
   // Separate read and write fds, for the ssh pipe where they differ.
   ControlChannel(Stream ReadSide, Stream WriteSide) : S(std::move(ReadSide)), W(std::move(WriteSide)), Split(true) {}
+
+  // Frames go over Link from here on; the stream stays for liveness and close.
+  void useRing(ControlLink &Link) { Ring = &Link; }
+  bool onRing() const { return Ring != nullptr; }
+  void release(uint64_t Id) {
+    if (Ring) Ring->release(Id);
+  }
 
   Coro<Result<void>> send(const Message &M);
   Coro<Result<Message>> receive();
@@ -81,6 +89,7 @@ private:
   Stream S;
   Stream W;
   bool Split = false;
+  ControlLink *Ring = nullptr;
   Turn Order;
   std::vector<std::byte> OutBuf;
   std::vector<std::byte> InBuf;

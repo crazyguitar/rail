@@ -46,6 +46,10 @@ enum class Type : uint16_t {
   Open = 28,
   OpenReply = 29,
   Close = 30,
+  // The daemon's last frame on the socket: its queue pairs are ready, so the
+  // client may write into the rings. Earlier, a request could hit a queue pair
+  // still being driven to ready.
+  Ready = 31,
 };
 
 struct BlockSum {
@@ -332,6 +336,8 @@ struct PeerEndpoint {
   std::string Blob;
 };
 
+struct Ready {};
+
 struct TransferReply {
   uint64_t Id = 0;
   uint32_t Length = 0;
@@ -368,7 +374,8 @@ using Message = std::variant<Hello,
                              StatFsReply,
                              OpenRequest,
                              OpenReply,
-                             CloseRequest>;
+                             CloseRequest,
+                             Ready>;
 
 inline uint64_t tagSpan(uint64_t Size, uint64_t PageSize) { return ((Size + PageSize - 1) / PageSize + 1) * PageSize; }
 

@@ -1234,4 +1234,54 @@ TEST_F(Kernel, LeavesNoKernelComplaintBehind) {
   EXPECT_EQ(Log.find("BUG"), std::string::npos) << Log;
 }
 
+TEST_F(Kernel, ControlNeverTouchesTcpOnAnRdmaMount) {
+  restartDaemonOnRdma();
+  ASSERT_TRUE(mountIt(defaultOptions() + ",rdma,conns=2"));
+  forgetCounters();
+
+  EXPECT_NE(listing(Mountpoint).find("a.txt"), std::string::npos);
+  EXPECT_FALSE(digestThrough("a.txt").empty());
+  EXPECT_TRUE(writeWholeFile(Mountpoint + "/ctl.txt", "over the fabric\n"));
+  std::error_code Ec;
+  std::filesystem::create_directory(Mountpoint + "/ctl-dir", Ec);
+  EXPECT_FALSE(Ec) << Ec.message();
+  EXPECT_TRUE(ran({"df", Mountpoint}));
+  EXPECT_TRUE(ran({"sync", "-f", Mountpoint}));
+
+  EXPECT_EQ(counter("tcp control frames "), 0) << "the socket carried control on an rdma mount";
+  EXPECT_GT(counter("ctrl rail0 ") + counter(" rail1 "), 0) << "no request went over the rings";
+}
+
+TEST_F(Kernel, ListsThousandsOfEntriesOverTheFabric) {
+  auto Made = peer().run({"bash", "-c", "mkdir -p '" + Export + "/many' && cd '" + Export + "/many' && touch $(seq -f 'entry-%04g' 1 3000) && echo done"});
+  ASSERT_TRUE(Made) << "could not seed the directory on the peer";
+  auto Line = Made->readLine();
+  ASSERT_TRUE(Line && *Line == "done");
+
+  restartDaemonOnRdma();
+  ASSERT_TRUE(mountIt(defaultOptions() + ",rdma,conns=1"));
+
+  const auto Names = listNames(Mountpoint + "/many");
+  EXPECT_EQ(Names.size(), 3000u);
+  EXPECT_EQ(kernelLog().find("did not match its digest"), std::string::npos);
+
+  // The fixture removes the export over sftp one entry at a time; this does not.
+  auto Gone = peer().run({"bash", "-c", "rm -rf '" + Export + "/many' && echo done"});
+  ASSERT_TRUE(Gone);
+  auto Removed = Gone->readLine();
+  EXPECT_TRUE(Removed && *Removed == "done");
+}
+
+TEST_F(Kernel, BothRailsCarryControl) {
+  restartDaemonOnRdma();
+  ASSERT_TRUE(mountIt(defaultOptions() + ",rdma,conns=1,actimeo=0"));
+  if (kernelLog().find("rdma rail 1 up") == std::string::npos) GTEST_SKIP() << "one rail on this machine";
+  forgetCounters();
+
+  for (int I = 0; I < 100; I++) EXPECT_TRUE(ran({"stat", Mountpoint + "/a.txt"}));
+
+  EXPECT_GT(counter("ctrl rail0 "), 0);
+  EXPECT_GT(counter(" rail1 "), 0) << "requests all went out on one rail";
+}
+
 } // namespace rail::e2e

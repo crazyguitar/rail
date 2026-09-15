@@ -131,6 +131,14 @@ protected:
     return std::atoi(Stats.c_str() + Most + 5);
   }
 
+  // The integer after Label in debugfs stats.
+  int counter(const std::string &Label) {
+    const std::string Stats = readWholeFile("/sys/kernel/debug/railfs/stats");
+    const auto At = Stats.find(Label);
+    if (At == std::string::npos) return -1;
+    return std::atoi(Stats.c_str() + At + Label.size());
+  }
+
   long cachedMiB() {
     const std::string Meminfo = readWholeFile("/proc/meminfo");
     const auto Line = Meminfo.find("\nCached:");

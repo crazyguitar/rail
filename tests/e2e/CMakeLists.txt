@@ -20,6 +20,7 @@ add_executable(rail-e2e
   test-naming.cc
   test-filter.cc
   test-service.cc
+  tcp-bytes.cc
   test-nfs.cc
   test-fuse.cc
   test-loop.cc

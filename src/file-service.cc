@@ -10,6 +10,7 @@
 #include "rail/io/stream.h"
 #include "rail/io/trace.h"
 #include "rail/io/uring.h"
+#include "rail/proto/codec.h"
 #include "rail/proto/control-channel.h"
 #include "rail/stream/page-stream.h"
 #include "rail/stream/sink.h"
@@ -363,7 +364,15 @@ public:
     if (!Peer) co_return std::unexpected(Peer.error());
     if (auto R = co_await Channel->attachPeer(Peer->Blob); !R) co_return std::unexpected(R.error());
 
-    co_return co_await Channel->acceptPeer();
+    if (auto R = co_await Channel->acceptPeer(); !R) co_return R;
+
+    // Sent last: a request written before the queue pairs are ready only
+    // burns the fabric's retries.
+    if (auto *Link = Channel->controlLink()) {
+      if (auto R = co_await Control.send(proto::Ready{}); !R) co_return std::unexpected(R.error());
+      Control.useRing(*Link);
+    }
+    co_return Result<void>{};
   }
 
   Coro<Result<void>> onOpen(const proto::OpenRequest &O) {
@@ -490,7 +499,39 @@ public:
         }
       }
     }
-    co_return co_await Control.send(Reply);
+    if (!Control.onRing()) co_return co_await Control.send(Reply);
+    co_return co_await sendListAsPage(L.Id, Reply);
+  }
+
+  // A listing over the fabric rides in a page like a read. The page always
+  // goes, even when the listing did not fit: the client is waiting for it.
+  Coro<Result<void>> sendListAsPage(uint64_t Id, const proto::ListReply &Listing) {
+    proto::TransferReply Record;
+    Record.Id = Id;
+
+    std::vector<std::byte> Body;
+    proto::encode(proto::Message{Listing}, Body);
+
+    Page Buf = co_await Channel->pool().acquire();
+    if (!Buf.valid()) {
+      Record.Error = "out of registered memory for a transfer page";
+      co_return co_await refuseTransfer(Record);
+    }
+
+    const size_t Want = std::min(Body.size(), Buf.capacity());
+    Buf.resize(Want);
+    std::memcpy(Buf.bytes(), Body.data(), Want);
+    Record.Length = static_cast<uint32_t>(Want);
+    Record.Ok = Body.size() == Want;
+    if (!Record.Ok) Record.Error = std::format("listing of {} bytes exceeds the {} byte page", Body.size(), Buf.capacity());
+
+    Verifier PageHash(Verify, Agreed);
+    PageHash.update({Buf.bytes(), Want});
+    Record.Payload = PageHash.digest();
+
+    if (auto R = co_await Control.send(Record); !R) co_return std::unexpected(R.error());
+    if (auto R = co_await Channel->send(Buf, Id); !R) co_return endSession(R.error().message());
+    co_return Result<void>{};
   }
 
   Coro<Result<void>> onRead(const proto::ReadRequest &Rd) {
@@ -1077,11 +1118,12 @@ constexpr size_t kDescriptorsPerSession = 4;
 constexpr size_t kDescriptorsKeptBack = 64;
 
 // What one client actually costs, measured rather than reasoned about: the
-// daemon's resident size over one to sixteen connections under load grows by
-// this much per connection. Nearly all of it is the transfer pool a channel
-// builds for itself - twelve pages of eight megabytes - so a smaller page
-// geometry buys proportionally more clients.
-constexpr size_t kBytesPerSession = 65u << 20;
+// daemon's resident size over one to sixteen connections under load grew by
+// 65 MiB per connection, plus a mebibyte of control rings since. Nearly all
+// of it is the transfer pool a channel builds for itself - twelve pages of
+// eight megabytes - so a smaller page geometry buys proportionally more
+// clients.
+constexpr size_t kBytesPerSession = 66u << 20;
 
 // What of the machine's free memory a file server may plan to use. The rest is
 // the page cache it is reading through, which is what makes it quick.

@@ -51,6 +51,13 @@ struct railfs_call {
 	 */
 	bool answered;
 	bool delivered;
+	/* Over the fabric: the rail and slot this call holds, and whether payload
+	 * points into the reply ring, which lives until the slot is given back.
+	 */
+	u32 line;
+	u32 slot;
+	bool on_ring;
+	bool borrowed;
 	/* Where a tcp read's bytes land, when the call expects some. */
 	void *buf;
 	u32 room;
@@ -340,14 +347,28 @@ static int railfs_call_begin(struct railfs_conn *conn, struct railfs_call *call,
 	init_completion(&call->landed);
 	init_completion(&call->released);
 
-	spin_lock(&conn->calls_lock);
+	if (conn->rail) {
+		err = railfs_rdma_ctrl_take(conn->rail, &call->line, &call->slot);
+		if (err) {
+			return err;
+		}
+		call->on_ring = true;
+	}
+
+	spin_lock_bh(&conn->calls_lock);
 	if (READ_ONCE(conn->dead)) {
 		err = -ENOTCONN;
 	} else {
 		list_add_tail(&call->link, &conn->calls);
+		if (call->on_ring) {
+			conn->owner[call->line][call->slot] = call;
+		}
 	}
-	spin_unlock(&conn->calls_lock);
+	spin_unlock_bh(&conn->calls_lock);
 
+	if (err && call->on_ring) {
+		railfs_rdma_ctrl_give(conn->rail, call->line, call->slot);
+	}
 	if (!err) {
 		railfs_trace_calls(1);
 	}
@@ -361,10 +382,13 @@ static void railfs_call_end(struct railfs_conn *conn, struct railfs_call *call)
 {
 	bool busy;
 
-	spin_lock(&conn->calls_lock);
+	spin_lock_bh(&conn->calls_lock);
 	list_del_init(&call->link);
+	if (call->on_ring) {
+		conn->owner[call->line][call->slot] = NULL;
+	}
 	busy = call->busy;
-	spin_unlock(&conn->calls_lock);
+	spin_unlock_bh(&conn->calls_lock);
 
 	if (busy && !wait_for_completion_timeout(&call->released, msecs_to_jiffies(RAILFS_REPLY_WAIT_MS))) {
 		railfs_conn_kill(conn, -ETIMEDOUT);
@@ -372,8 +396,13 @@ static void railfs_call_end(struct railfs_conn *conn, struct railfs_call *call)
 	}
 
 	railfs_trace_calls(-1);
-	kfree(call->payload);
+	if (!call->borrowed) {
+		kfree(call->payload);
+	}
 	call->payload = NULL;
+	if (call->on_ring) {
+		railfs_rdma_ctrl_give(conn->rail, call->line, call->slot);
+	}
 }
 
 // A reply that is late is a peer that has stopped, which kills the connection
@@ -403,6 +432,11 @@ static int railfs_call_wait(struct railfs_conn *conn, struct railfs_call *call)
 		return err;
 	}
 
+	// A bad reply was noticed in softirq, which cannot kill the connection.
+	if (READ_ONCE(conn->ring_fault)) {
+		railfs_conn_kill(conn, READ_ONCE(conn->ring_fault));
+	}
+
 	return call->err;
 }
 
@@ -417,15 +451,25 @@ static int railfs_call_wait_data(struct railfs_conn *conn, struct railfs_call *c
 	return call->data_err;
 }
 
-// A frame reaches the wire whole. A send that fails leaves the peer's view of
-// the stream unknowable, so the connection goes with it.
-static int railfs_send(struct railfs_conn *conn, const void *frame, size_t len)
+// A frame reaches the wire whole: into the daemon's ring at this call's slot,
+// or under the send lock on tcp. A failed send takes the connection with it.
+static int railfs_send(struct railfs_conn *conn, struct railfs_call *call, const void *frame, size_t len)
 {
 	int err;
 
-	mutex_lock(&conn->send_lock);
-	err = READ_ONCE(conn->dead) ? -ENOTCONN : send_all(conn->sock, frame, len);
-	mutex_unlock(&conn->send_lock);
+	if (call && call->on_ring) {
+		err = READ_ONCE(conn->dead) ? -ENOTCONN : railfs_rdma_ctrl_send(conn->rail, call->line, call->slot, frame, (u32)len);
+		if (!err) {
+			railfs_trace_ctrl_rail(call->line);
+		}
+	} else {
+		mutex_lock(&conn->send_lock);
+		err = READ_ONCE(conn->dead) ? -ENOTCONN : send_all(conn->sock, frame, len);
+		mutex_unlock(&conn->send_lock);
+		if (!err) {
+			railfs_trace_tcp_frames(1);
+		}
+	}
 
 	if (err) {
 		railfs_conn_kill(conn, err);
@@ -459,16 +503,16 @@ static int railfs_deliver(struct railfs_conn *conn, u16 type, u8 *payload, u32 l
 
 	memcpy(&id, payload, 8);
 
-	spin_lock(&conn->calls_lock);
+	spin_lock_bh(&conn->calls_lock);
 	call = railfs_call_for(conn, id);
 	if (!call) {
-		spin_unlock(&conn->calls_lock);
+		spin_unlock_bh(&conn->calls_lock);
 		kfree(payload);
 		return 0;
 	}
 
 	if (call->want != type) {
-		spin_unlock(&conn->calls_lock);
+		spin_unlock_bh(&conn->calls_lock);
 		pr_err("railfs: wanted message %u, got %u\n", call->want, type);
 		kfree(payload);
 		return -EPROTO;
@@ -478,7 +522,7 @@ static int railfs_deliver(struct railfs_conn *conn, u16 type, u8 *payload, u32 l
 	 * already be reading, and leak the first payload.
 	 */
 	if (call->answered) {
-		spin_unlock(&conn->calls_lock);
+		spin_unlock_bh(&conn->calls_lock);
 		pr_err("railfs: a second reply for request %llu\n", id);
 		kfree(payload);
 		return -EPROTO;
@@ -489,6 +533,75 @@ static int railfs_deliver(struct railfs_conn *conn, u16 type, u8 *payload, u32 l
 	call->err = 0;
 	call->answered = true;
 	complete(&call->replied);
+	spin_unlock_bh(&conn->calls_lock);
+	return 0;
+}
+
+// A reply landed in this call's slot. Checked here so the caller only reads a
+// frame that is whole and its own; nonzero means the rail strands and the
+// waiter kills the connection.
+static int railfs_on_ring_reply(void *ctx, u32 line, u32 slot, int err)
+{
+	struct railfs_conn *conn = ctx;
+	struct railfs_call *call;
+	u8 *payload = NULL;
+	u32 len = 0;
+	u64 id = 0;
+	u16 type = 0;
+
+	spin_lock(&conn->calls_lock);
+	call = conn->owner[line][slot];
+	if (!call || call->answered) {
+		spin_unlock(&conn->calls_lock);
+		return 0;
+	}
+
+	if (!err) {
+		err = railfs_rdma_ctrl_reply(conn->rail, line, slot, &type, &payload, &len);
+	}
+	if (!err && len < 8) {
+		err = -EBADMSG;
+	}
+	if (!err) {
+		memcpy(&id, payload, 8);
+		if (id != call->id) {
+			pr_err_ratelimited("railfs: reply for request %llu landed in the slot of %llu\n", id, call->id);
+			err = -EPROTO;
+		}
+	}
+	if (!err && call->want != type) {
+		pr_err_ratelimited("railfs: wanted message %u, got %u\n", call->want, type);
+		err = -EPROTO;
+	}
+
+	if (err) {
+		call->err = err;
+		WRITE_ONCE(conn->ring_fault, err);
+	} else {
+		call->payload = payload;
+		call->payload_len = len;
+		call->borrowed = true;
+		call->err = 0;
+	}
+	call->answered = true;
+	complete(&call->replied);
+	spin_unlock(&conn->calls_lock);
+	return err;
+}
+
+// The request never reached the daemon, so no reply is coming.
+static int railfs_on_ring_sent(void *ctx, u32 line, u32 slot, int err)
+{
+	struct railfs_conn *conn = ctx;
+	struct railfs_call *call;
+
+	spin_lock(&conn->calls_lock);
+	call = conn->owner[line][slot];
+	if (call && !call->answered) {
+		call->err = err;
+		call->answered = true;
+		complete(&call->replied);
+	}
 	spin_unlock(&conn->calls_lock);
 	return 0;
 }
@@ -515,6 +628,14 @@ static int railfs_reader(void *arg)
 			break;
 		}
 
+		// After the handshake the socket carries nothing over the fabric.
+		if (conn->rail) {
+			pr_err("railfs: a control frame arrived on tcp after the handshake\n");
+			railfs_trace_tcp_frames(1);
+			err = -EPROTO;
+			break;
+		}
+
 		payload = kmalloc(len ? len : 1, GFP_NOFS);
 		if (!payload) {
 			err = -ENOMEM;
@@ -527,6 +648,7 @@ static int railfs_reader(void *arg)
 			break;
 		}
 
+		railfs_trace_tcp_frames(1);
 		err = railfs_deliver(conn, type, payload, len);
 		if (err) {
 			break;
@@ -574,31 +696,31 @@ static int railfs_take_frame(struct railfs_conn *conn)
 		return -EMSGSIZE;
 	}
 
-	spin_lock(&conn->calls_lock);
+	spin_lock_bh(&conn->calls_lock);
 	call = railfs_call_for(conn, key);
 	if (!call || !call->wants_data) {
-		spin_unlock(&conn->calls_lock);
+		spin_unlock_bh(&conn->calls_lock);
 		return railfs_drain_frame(conn, frame_len);
 	}
 
 	if (frame_len > call->room) {
-		spin_unlock(&conn->calls_lock);
+		spin_unlock_bh(&conn->calls_lock);
 		return -EMSGSIZE;
 	}
 
 	call->busy = true;
-	spin_unlock(&conn->calls_lock);
+	spin_unlock_bh(&conn->calls_lock);
 
 	err = recv_all(conn, conn->data, call->buf, frame_len);
 
-	spin_lock(&conn->calls_lock);
+	spin_lock_bh(&conn->calls_lock);
 	call->busy = false;
 	call->got = frame_len;
 	call->data_err = err;
 	call->delivered = !err;
 	complete(&call->landed);
 	complete(&call->released);
-	spin_unlock(&conn->calls_lock);
+	spin_unlock_bh(&conn->calls_lock);
 	return err;
 }
 
@@ -627,9 +749,9 @@ static void railfs_conn_kill(struct railfs_conn *conn, int why)
 {
 	struct railfs_call *call;
 
-	spin_lock(&conn->calls_lock);
+	spin_lock_bh(&conn->calls_lock);
 	if (READ_ONCE(conn->dead)) {
-		spin_unlock(&conn->calls_lock);
+		spin_unlock_bh(&conn->calls_lock);
 		return;
 	}
 
@@ -650,7 +772,7 @@ static void railfs_conn_kill(struct railfs_conn *conn, int why)
 		complete(&call->replied);
 		complete(&call->landed);
 	}
-	spin_unlock(&conn->calls_lock);
+	spin_unlock_bh(&conn->calls_lock);
 
 	if (conn->sock) {
 		kernel_sock_shutdown(conn->sock, SHUT_RDWR);
@@ -754,12 +876,19 @@ static int exchange(struct railfs_conn *conn, u8 *frame, size_t frame_len, u64 i
 		return err;
 	}
 
-	err = railfs_send(conn, frame, frame_len);
+	err = railfs_send(conn, &call, frame, frame_len);
 	if (!err) {
 		err = railfs_call_wait(conn, &call);
 	}
 
-	if (!err) {
+	if (!err && call.borrowed) {
+		// The ring bytes go with the call; the caller keeps them longer.
+		*payload = kmemdup(call.payload, call.payload_len ? call.payload_len : 1, GFP_NOFS);
+		*payload_len = call.payload_len;
+		if (!*payload) {
+			err = -ENOMEM;
+		}
+	} else if (!err) {
 		*payload = call.payload;
 		*payload_len = call.payload_len;
 		call.payload = NULL;
@@ -908,99 +1037,6 @@ int railfs_stat(struct railfs_conn *conn, const char *path, struct railfs_attrs 
 	*found = true;
 out:
 	railfs_trace_add(RAILFS_PHASE_STAT, asked, 0);
-	kfree(payload);
-	kfree(frame);
-	return err;
-}
-
-int railfs_list(struct railfs_conn *conn, const char *path, struct railfs_dirent **out, u32 *count)
-{
-	struct railfs_dirent *entries = NULL;
-	struct railfs_cursor c;
-	u8 *payload = NULL;
-	u8 *frame = NULL;
-	u32 payload_len = 0;
-	u32 n = 0;
-	u32 i;
-	size_t cap;
-	u64 id;
-	u8 found = 0;
-	int err;
-
-	cap = RAILFS_HEADER_SIZE + 8 + 4 + strlen(path);
-
-	frame = railfs_request(conn, cap, &c, &id);
-	if (!frame) {
-		err = -ENOMEM;
-		goto out;
-	}
-	railfs_put_str(&c, path);
-
-	if (!railfs_cursor_ok(&c)) {
-		err = -EOVERFLOW;
-		goto out;
-	}
-
-	railfs_frame(frame, RAILFS_MSG_LIST, (u32)(c.at - RAILFS_HEADER_SIZE));
-
-	err = exchange(conn, frame, c.at, id, RAILFS_MSG_LIST_REPLY, &payload, &payload_len);
-	if (err) {
-		goto out;
-	}
-
-	c.buf = payload;
-	c.len = payload_len;
-	c.at = 0;
-
-	err = railfs_reply_for(conn, &c, id);
-	if (!err) {
-		err = railfs_get_u8(&c, &found);
-	}
-
-	if (!err) {
-		err = railfs_get_u32(&c, &n);
-	}
-
-	if (err) {
-		goto out;
-	}
-
-	if (!found) {
-		err = -ENOENT;
-		goto out;
-	}
-
-	// Smallest an entry can be: a four byte name length and the attributes,
-	// and the directory and its parent follow them. Without this a count off
-	// the wire asks for an allocation of any size.
-	if ((u64)n * 54 > payload_len) {
-		err = -EBADMSG;
-		goto out;
-	}
-
-	entries = kcalloc(n ? n : 1, sizeof(*entries), GFP_NOFS);
-	if (!entries) {
-		err = -ENOMEM;
-		goto out;
-	}
-
-	for (i = 0; i < n; i++) {
-		err = railfs_get_str(&c, &entries[i].name);
-		if (!err) {
-			err = railfs_get_attrs(&c, &entries[i].attrs);
-		}
-		if (err) {
-			railfs_free_dirents(entries, n);
-			entries = NULL;
-			goto out;
-		}
-	}
-
-	*out = entries;
-	*count = n;
-	entries = NULL;
-out:
-	railfs_free_dirents(entries, n);
 	kfree(payload);
 	kfree(frame);
 	return err;
@@ -1206,7 +1242,7 @@ static int railfs_read_core(struct railfs_conn *conn, const char *path, u64 offs
 
 	ctl = railfs_now();
 
-	err = railfs_send(conn, frame, c.at);
+	err = railfs_send(conn, &call, frame, c.at);
 	if (err) {
 		goto out;
 	}
@@ -1335,6 +1371,206 @@ int railfs_read_sg(struct railfs_conn *conn, const char *path, u64 offset, struc
 	void *into = NULL;
 
 	return railfs_read_core(conn, path, offset, &into, pages, len, NULL);
+}
+
+// The body of a listing, wherever it landed.
+static int railfs_parse_listing(struct railfs_conn *conn, struct railfs_cursor *c, u64 id, u32 payload_len, struct railfs_dirent **out,
+				u32 *count)
+{
+	struct railfs_dirent *entries = NULL;
+	u32 n = 0;
+	u32 i;
+	u8 found = 0;
+	int err;
+
+	err = railfs_reply_for(conn, c, id);
+	if (!err) {
+		err = railfs_get_u8(c, &found);
+	}
+	if (!err) {
+		err = railfs_get_u32(c, &n);
+	}
+	if (err) {
+		return err;
+	}
+
+	if (!found) {
+		return -ENOENT;
+	}
+
+	// Smallest an entry can be: a four byte name length and the attributes,
+	// and the directory and its parent follow them. Without this a count off
+	// the wire asks for an allocation of any size.
+	if ((u64)n * 54 > payload_len) {
+		return -EBADMSG;
+	}
+
+	entries = kcalloc(n ? n : 1, sizeof(*entries), GFP_NOFS);
+	if (!entries) {
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < n; i++) {
+		err = railfs_get_str(c, &entries[i].name);
+		if (!err) {
+			err = railfs_get_attrs(c, &entries[i].attrs);
+		}
+		if (err) {
+			railfs_free_dirents(entries, n);
+			return err;
+		}
+	}
+
+	*out = entries;
+	*count = n;
+	return 0;
+}
+
+// A listing over the fabric arrives like a read: the encoded reply lands in
+// an offered page and a TransferReply carries its length and digest. Follows
+// railfs_read_core, including its care over a page still coming.
+static int railfs_list_through_page(struct railfs_conn *conn, u8 *frame, size_t frame_len, u64 id, const char *path, struct railfs_dirent **out,
+				    u32 *count)
+{
+	struct railfs_call call;
+	struct railfs_cursor c;
+	const void *at = NULL;
+	u32 slot = 0;
+	u32 reply_len = 0;
+	u64 file_size = 0;
+	u8 ok = 0;
+	bool began = false;
+	bool offered = false;
+	bool ended = false;
+	int err;
+
+	err = railfs_admit(conn);
+	if (err) {
+		return err;
+	}
+
+	err = railfs_rdma_fetch_begin(conn->rail, id, RAILFS_PAGE_SIZE, NULL, &slot);
+	if (err) {
+		railfs_abandon_or_kill(conn, err, false);
+		goto leave;
+	}
+	offered = true;
+
+	err = railfs_call_begin(conn, &call, id, RAILFS_MSG_TRANSFER_REPLY, NULL, 0);
+	if (err) {
+		goto out;
+	}
+	began = true;
+
+	err = railfs_send(conn, &call, frame, frame_len);
+	if (err) {
+		goto out;
+	}
+
+	err = railfs_call_wait(conn, &call);
+	if (err) {
+		railfs_abandon_or_kill(conn, err, false);
+		goto out;
+	}
+
+	c.buf = call.payload;
+	c.len = call.payload_len;
+	c.at = 0;
+
+	err = railfs_read_reply(conn, &c, id, &reply_len, &file_size, &ok);
+	if (err) {
+		goto out;
+	}
+
+	err = railfs_rdma_fetch_end(conn->rail, slot, &at);
+	ended = true;
+	if (err) {
+		railfs_abandon_or_kill(conn, err, false);
+		goto out;
+	}
+
+	if (!ok) {
+		err = -EIO;
+		goto out;
+	}
+	if (reply_len > RAILFS_PAGE_SIZE) {
+		err = -EMSGSIZE;
+		goto out;
+	}
+
+	if (conn->verify && railfs_matches_digest(&c, call.payload, at, reply_len, path, 0)) {
+		err = -EBADMSG;
+		goto out;
+	}
+
+	c.buf = (u8 *)at;
+	c.len = reply_len;
+	c.at = 0;
+	err = railfs_parse_listing(conn, &c, id, reply_len, out, count);
+out:
+	if (offered && !ended) {
+		if (err == -ERESTARTSYS) {
+			railfs_rdma_slot_orphan(conn->rail, slot);
+			offered = false;
+		} else {
+			railfs_rdma_fetch_end(conn->rail, slot, &at);
+		}
+	}
+	if (began) {
+		railfs_call_end(conn, &call);
+	}
+	if (offered) {
+		railfs_rdma_slot_release(conn->rail, slot);
+	}
+leave:
+	railfs_leave(conn);
+	return err;
+}
+
+int railfs_list(struct railfs_conn *conn, const char *path, struct railfs_dirent **out, u32 *count)
+{
+	struct railfs_cursor c;
+	u8 *payload = NULL;
+	u8 *frame = NULL;
+	u32 payload_len = 0;
+	size_t cap;
+	u64 id;
+	int err;
+
+	cap = RAILFS_HEADER_SIZE + 8 + 4 + strlen(path);
+
+	frame = railfs_request(conn, cap, &c, &id);
+	if (!frame) {
+		err = -ENOMEM;
+		goto out;
+	}
+	railfs_put_str(&c, path);
+
+	if (!railfs_cursor_ok(&c)) {
+		err = -EOVERFLOW;
+		goto out;
+	}
+
+	railfs_frame(frame, RAILFS_MSG_LIST, (u32)(c.at - RAILFS_HEADER_SIZE));
+
+	if (conn->rail) {
+		err = railfs_list_through_page(conn, frame, c.at, id, path, out, count);
+		goto out;
+	}
+
+	err = exchange(conn, frame, c.at, id, RAILFS_MSG_LIST_REPLY, &payload, &payload_len);
+	if (err) {
+		goto out;
+	}
+
+	c.buf = payload;
+	c.len = payload_len;
+	c.at = 0;
+	err = railfs_parse_listing(conn, &c, id, payload_len, out, count);
+out:
+	kfree(payload);
+	kfree(frame);
+	return err;
 }
 
 // The bytes out on the tcp data socket, header and payload as one frame. A
@@ -1611,7 +1847,7 @@ static int railfs_write_from(struct railfs_conn *conn, const char *path, u64 off
 
 	wire = railfs_now();
 
-	err = railfs_send(conn, frame, c.at);
+	err = railfs_send(conn, &call, frame, c.at);
 	if (err) {
 		goto out;
 	}
@@ -1846,6 +2082,32 @@ void railfs_conn_put(struct railfs_conn *conn)
 	}
 }
 
+// The daemon's last frame on the socket: its queue pairs are ready. Before it
+// a request could hit a queue pair still being driven to ready.
+static int await_ready(struct socket *sock)
+{
+	u8 header[RAILFS_HEADER_SIZE];
+	u32 len;
+	u16 type;
+	int err;
+
+	err = recv_now(sock, header, sizeof(header));
+	if (err) {
+		return err;
+	}
+
+	err = railfs_read_header(header, &type, &len);
+	if (err) {
+		return err;
+	}
+
+	if (type != RAILFS_MSG_READY || len != 0) {
+		pr_err("railfs: expected Ready, got message type %u\n", type);
+		return -EPROTO;
+	}
+	return 0;
+}
+
 struct railfs_conn *railfs_connect(const struct railfs_peer *peer)
 {
 	struct sockaddr_in addr = {};
@@ -1911,6 +2173,7 @@ struct railfs_conn *railfs_connect(const struct railfs_peer *peer)
 			conn->rail = NULL;
 			goto fail;
 		}
+		railfs_rdma_ctrl_watch(conn->rail, railfs_on_ring_reply, railfs_on_ring_sent, conn);
 	}
 
 	conn->verify = peer->verify;
@@ -1923,6 +2186,13 @@ struct railfs_conn *railfs_connect(const struct railfs_peer *peer)
 	err = peer->rdma ? join_fabric(conn, endpoint, endpoint_len, &mine) : join_data_channel(conn, endpoint);
 	if (err) {
 		goto fail;
+	}
+
+	if (peer->rdma) {
+		err = await_ready(conn->sock);
+		if (err) {
+			goto fail;
+		}
 	}
 
 	task = railfs_start_reader(railfs_reader, conn, "railfs-rx");
@@ -2088,9 +2358,9 @@ static void railfs_conn_used(struct railfs_conn *conn)
 {
 	bool first;
 
-	spin_lock(&conn->calls_lock);
+	spin_lock_bh(&conn->calls_lock);
 	first = conn->users++ == 0;
-	spin_unlock(&conn->calls_lock);
+	spin_unlock_bh(&conn->calls_lock);
 
 	if (first) {
 		railfs_trace_busy(1);
@@ -2101,9 +2371,9 @@ static void railfs_conn_unused(struct railfs_conn *conn)
 {
 	bool last;
 
-	spin_lock(&conn->calls_lock);
+	spin_lock_bh(&conn->calls_lock);
 	last = --conn->users == 0;
-	spin_unlock(&conn->calls_lock);
+	spin_unlock_bh(&conn->calls_lock);
 
 	if (last) {
 		railfs_trace_busy(-1);
