@@ -59,19 +59,22 @@ and the spec becomes a `HOST:EXPORT` pair, which is what `mount(8)` and
 sudo cp build/tools/mount.railfs/mount.railfs /sbin/   # or: make install PREFIX=/usr
 
 sudo mount -t railfs <peer>:/ /mnt -o rdma,uid=$(id -u),gid=$(id -g)
-sudo mount -t railfs <peer>:/ /mnt -o rdma,port=18600,conns=64,fetch=524288
+sudo mount -t railfs <peer>:/ /mnt -o rdma,port=18600,conns=8,fetch=524288
 ```
 
 The helper folds the spec into the option string and puts it last, so an
 `-o host=` cannot send the mount somewhere the spec did not name. In `fstab`:
 
 ```
-<peer>:/ /mnt railfs rdma,conns=32,uid=1000,gid=1000,noauto 0 0
+<peer>:/ /mnt railfs rdma,uid=1000,gid=1000,noauto 0 0
 ```
 
-The workqueue every fetch and flush runs on belongs to the module rather than
-to a mount, so its depth is a module parameter and can be changed on a live
-mount:
+Every connection is shared: requests go out as they come and each reply names
+the request it answers, so one connection carries up to sixteen at once and
+`conns=` only decides how many of the daemon's serving threads a mount spreads
+over. The workqueue every fetch and flush runs on belongs to the module rather
+than to a mount, so its depth is a module parameter and can be changed on a
+live mount:
 
 ```bash
 sudo insmod build/src/linux/railfs.ko inflight=128
@@ -86,12 +89,12 @@ echo 96 | sudo tee /sys/module/railfs/parameters/inflight
 | `noverify` | off | trust the fabric's crc, stop hashing pages |
 | `uid=` `gid=` | root | who everything belongs to; the wire carries no ownership, so without these nothing else can write |
 | `actimeo=` | `30` | seconds a name or a stat may be believed |
-| `conns=` | `32` | connections in the pool |
+| `conns=` | `8` | connections in the pool; each carries up to 16 requests at once |
 | `fetch=` | `1048576` | bytes a readahead window is cut into |
 | `readahead=` | `268435456` | bytes the kernel reads ahead |
 | `block=` | `262144` | bytes a short fetch is widened to |
 | `flush_span=` | `4` | connections one file's writeback spreads over |
-| `flush_limit=` | `16` | flushes in flight across the mount |
+| `flush_limit=` | `128` | flushes in flight across the mount |
 
 The five tuning values are powers of two and are refused rather than clamped, so
 `/proc/mounts` reports what the mount is actually running. `fetch=` cannot

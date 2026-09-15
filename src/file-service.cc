@@ -5,6 +5,7 @@
 
 #include "rail/app/checksum.h"
 #include "rail/fs/safe-path.h"
+#include "rail/io/inbox.h"
 #include "rail/io/offload.h"
 #include "rail/io/stream.h"
 #include "rail/io/trace.h"
@@ -25,6 +26,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sys/eventfd.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -1055,9 +1057,13 @@ public:
   // spare; the pool the payloads come from is what bounds the memory, so this
   // only has to stop the queue growing without limit.
   static constexpr size_t kMaxInFlight = 64;
-  std::vector<Coro<Result<void>>> Running;
+
+  // Running goes last so it dies first. Stopping a serving thread destroys
+  // handler frames mid-flight, and their locals reach back into the page pool
+  // and both turnstiles as they unwind.
   proto::ControlChannel Control;
   std::unique_ptr<DataChannel> Channel;
+  std::vector<Coro<Result<void>>> Running;
 };
 
 } // namespace
@@ -1156,18 +1162,18 @@ size_t sessionsAffordable(const ServiceOptions &Opts, bool Explain) {
 
 namespace {
 
-// Sleeps until either a client is waiting to be accepted or a session has ended
-// and rung the doorbell. Both are registered for one handle and cancelled on
-// resume; the loop is single threaded, so nothing fires in between.
+// Sleeps until either a connection is waiting or a session has ended and rung
+// the doorbell. Both are registered for one handle and cancelled on resume;
+// the loop is single threaded, so nothing fires in between.
 struct ReapWait {
-  int Listener;
+  int Arrivals;
   int Doorbell;
   std::coroutine_handle<> H{};
 
   bool await_ready() const noexcept { return false; }
   void await_suspend(std::coroutine_handle<> Handle) {
     H = Handle;
-    Loop::get().wait(Listener, EPOLLIN, H);
+    Loop::get().wait(Arrivals, EPOLLIN, H);
     Loop::get().wait(Doorbell, EPOLLIN, H);
   }
   void await_resume() {
@@ -1175,114 +1181,201 @@ struct ReapWait {
   }
 };
 
-} // namespace
+// The sessions one thread is serving, and the bell each rings as it ends so
+// the loop reaps it at once instead of holding its registered pages, queue
+// pairs and descriptors until the next client happens to connect.
+class Serving {
+public:
+  Serving(std::filesystem::path Root, const ServiceOptions &Opts, size_t Allowed)
+      : Root(std::move(Root)), Opts(Opts), Allowed(Allowed), Doorbell(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)) {}
 
-Coro<Result<void>> serveFiles(const std::filesystem::path &Root, const ServiceOptions &Opts) {
-  const size_t Threads = std::max<size_t>(1, Opts.Threads);
-  const bool Sharing = Threads > 1;
-  auto Listener = Stream::listenOn(Opts.Port, false, Sharing);
-  if (!Listener) co_return std::unexpected(Listener.error());
+  Serving(const Serving &) = delete;
+  Serving &operator=(const Serving &) = delete;
+  ~Serving() {
+    if (Doorbell >= 0) {
+      Loop::get().forget(Doorbell);
+      ::close(Doorbell);
+    }
+  }
 
-  // Split, not repeated. The ceiling is what this machine can hold at once, so
-  // giving every thread the whole of it would let the daemon accept as many
-  // times over as it has threads - which is the memory bound this exists to
-  // enforce. Only the first thread explains it; the rest would print the same
-  // three lines again.
-  const size_t Total = sessionsAffordable(Opts, !Sharing);
-  const size_t Allowed = std::max<size_t>(1, Total / Threads);
-  sizePinnedBudget(Total);
+  bool usable() const { return Doorbell >= 0; }
+  int doorbell() const { return Doorbell; }
 
-  // A session that ends rings this, so the accept loop reaps it at once instead
-  // of holding its registered pages, queue pairs and descriptors until the next
-  // client happens to connect.
-  const int Doorbell = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-  if (Doorbell < 0) co_return failErrno("eventfd for session reaping");
-
-  std::vector<Coro<Result<void>>> Running;
-
-  auto reap = [&Running] {
+  void reap() {
     for (size_t I = Running.size(); I-- > 0;)
       if (Running[I].done()) {
         if (auto R = Running[I].result(); !R) std::fprintf(stderr, "raild: %s\n", R.error().message().c_str());
         Running.erase(Running.begin() + static_cast<long>(I));
       }
-  };
+  }
 
+  void admit(Stream Client) {
+    if (Running.size() >= Allowed) {
+      std::fprintf(stderr, "raild: refusing a client, %zu sessions already open\n", Running.size());
+      return;
+    }
+    auto Owner = std::make_unique<Service>(Root, Opts.FlipOneBit);
+    Running.push_back(serve(std::move(Owner), std::move(Client), Doorbell));
+    Running.back().start();
+  }
+
+  void silence() {
+    uint64_t Ticks = 0;
+    while (::read(Doorbell, &Ticks, sizeof(Ticks)) == static_cast<ssize_t>(sizeof(Ticks))) {}
+  }
+
+private:
   // Bell is a parameter, not a capture: a coroutine lambda keeps its captures
   // in the closure object, not in the frame, so a capture would dangle if the
   // closure died before the session did.
-  auto serve = [](std::unique_ptr<Service> Owner, Stream Client, int Bell) -> Coro<Result<void>> {
+  static Coro<Result<void>> serve(std::unique_ptr<Service> Owner, Stream Client, int Bell) {
     auto Outcome = co_await Owner->serveAndClose(std::move(Client));
     const uint64_t One = 1;
     [[maybe_unused]] auto Wrote = ::write(Bell, &One, sizeof(One));
     co_return Outcome;
-  };
+  }
 
-  const auto stop = [Doorbell](Error Why) {
-    Loop::get().forget(Doorbell);
-    ::close(Doorbell);
-    return std::unexpected(std::move(Why));
-  };
+  std::filesystem::path Root;
+  const ServiceOptions &Opts;
+  size_t Allowed;
+  int Doorbell;
+  std::vector<Coro<Result<void>>> Running;
+};
+
+// One thread's share of the clients, handed to it in turn by the acceptor.
+// Says so on the way out, however it leaves, so the acceptor stops handing
+// this thread clients nobody would serve.
+struct Leaving {
+  Inbox &In;
+  ~Leaving() { In.stop(); }
+};
+
+Coro<Result<void>> serveInbox(const std::filesystem::path &Root, const ServiceOptions &Opts, Inbox &In, size_t Allowed) {
+  const Attending Mine(In);
+  const Leaving Gone{In};
+  Serving Sessions(Root, Opts, Allowed);
+  if (!Sessions.usable()) co_return failErrno("eventfd for session reaping");
 
   for (;;) {
-    reap();
+    Sessions.reap();
+    auto Arrived = In.take();
+    if (In.stopped()) {
+      // Posted in the moment before the stop, so nobody is coming for it.
+      // Closing says so at once rather than admitting a session this
+      // coroutine is about to destroy, or leaving the client to time out.
+      for (auto &Late : In.take()) Arrived.push_back(std::move(Late));
+      for (auto &Late : Arrived) {
+        std::fprintf(stderr, "raild: closing a client handed to a thread that has stopped\n");
+        Late.close();
+      }
+      co_return Result<void>{};
+    }
+    for (auto &Client : Arrived) Sessions.admit(std::move(Client));
+
+    co_await ReapWait{In.wakeFd(), Sessions.doorbell()};
+    In.drain();
+    Sessions.silence();
+  }
+}
+
+// Round robin, not SO_REUSEPORT: its hash put five of a mount's eight
+// connections on one thread and none on four, and a mount is only as quick as
+// its busiest thread.
+Coro<Result<void>> acceptInTurn(uint16_t Port, std::vector<std::unique_ptr<Inbox>> &Boxes) {
+  auto Listener = Stream::listenOn(Port);
+  if (!Listener) co_return std::unexpected(Listener.error());
+
+  for (size_t Next = 0;; Next = (Next + 1) % Boxes.size()) {
+    auto Conn = co_await Listener->accept();
+    if (!Conn) co_return std::unexpected(Conn.error());
+
+    // Offered around the ring until one takes it: a thread that stops between
+    // the check and the handover refuses rather than swallowing the client.
+    bool Handed = false;
+    for (size_t Tried = 0; Tried < Boxes.size() && !Handed; Tried++) {
+      Handed = Boxes[Next]->post(std::move(*Conn));
+      // The outer increment rotates after a handover; advancing here too
+      // would skip every other thread.
+      if (!Handed) Next = (Next + 1) % Boxes.size();
+    }
+    if (!Handed) co_return failMessage("every serving thread has stopped");
+  }
+}
+
+} // namespace
+
+Coro<Result<void>> serveFiles(const std::filesystem::path &Root, const ServiceOptions &Opts) {
+  auto Listener = Stream::listenOn(Opts.Port);
+  if (!Listener) co_return std::unexpected(Listener.error());
+
+  const size_t Total = sessionsAffordable(Opts, true);
+  sizePinnedBudget(Total);
+
+  Serving Sessions(Root, Opts, Total);
+  if (!Sessions.usable()) co_return failErrno("eventfd for session reaping");
+
+  for (;;) {
+    Sessions.reap();
 
     auto Client = Listener->tryAccept();
-    if (!Client) co_return stop(Client.error());
+    if (!Client) co_return std::unexpected(Client.error());
 
     if (Client->valid()) {
-      if (Running.size() >= Allowed) {
-        std::fprintf(stderr, "raild: refusing a client, %zu sessions already open\n", Running.size());
-        continue;
-      }
-      auto Owner = std::make_unique<Service>(Root, Opts.FlipOneBit);
-      Running.push_back(serve(std::move(Owner), std::move(*Client), Doorbell));
-      Running.back().start();
+      Sessions.admit(std::move(*Client));
       continue;
     }
 
     // Nothing waiting; sleep until a client arrives or a session ends, then
     // drain the doorbell so a stale ring cannot spin the loop.
-    co_await ReapWait{Listener->fd(), Doorbell};
-    uint64_t Ticks = 0;
-    while (::read(Doorbell, &Ticks, sizeof(Ticks)) == static_cast<ssize_t>(sizeof(Ticks))) {}
+    co_await ReapWait{Listener->fd(), Sessions.doorbell()};
+    Sessions.silence();
   }
 }
 
-// One loop per thread is what makes this safe: Loop::get() and Uring::get() are
-// both thread_local, a Service belongs to the thread that accepted it, and the
-// only shared state left - the page allocator and the rdma device registry -
-// already holds a mutex.
+// One loop per thread: Loop::get() and Uring::get() are thread_local, a
+// Service belongs to the thread handed it, and what is shared holds a mutex.
 Result<void> serveFilesThreaded(const std::filesystem::path &Root, const ServiceOptions &Opts) {
   const size_t Wanted = std::max<size_t>(1, Opts.Threads);
 
   if (Wanted == 1) return run(serveFiles(Root, Opts));
 
-  // Explained once here rather than once per thread, and with the split shown,
-  // because "serving up to 288 clients" on eight threads means thirty-six each.
-  const size_t Held = sessionsAffordable(Opts, true);
-  std::fprintf(stderr, "raild: answering on %zu threads, %zu clients each\n", Wanted, std::max<size_t>(1, Held / Wanted));
+  // Split, not repeated: the ceiling is what the machine can hold at once, and
+  // every thread taking the whole of it would multiply the memory bound.
+  const size_t Total = sessionsAffordable(Opts, true);
+  const size_t Allowed = std::max<size_t>(1, Total / Wanted);
+  sizePinnedBudget(Total);
+  std::fprintf(stderr, "raild: answering on %zu threads, %zu clients each\n", Wanted, Allowed);
 
-  std::mutex Telling;
-  Result<void> First{};
+  std::vector<std::unique_ptr<Inbox>> Boxes;
+  for (size_t I = 0; I < Wanted; I++) {
+    Boxes.push_back(std::make_unique<Inbox>());
+    if (!Boxes.back()->usable()) return failErrno("eventfd");
+  }
+
+  // The first thread to fail, so a daemon that lost one does not exit as a
+  // success on the acceptor's word alone.
+  std::mutex FailedLock;
+  std::optional<Result<void>> Failed;
+
   std::vector<std::thread> Answering;
-
   for (size_t I = 0; I < Wanted; I++)
-    Answering.emplace_back([&] {
-      auto Outcome = runToResult(serveFiles(Root, Opts));
+    Answering.emplace_back([&Root, &Opts, &In = *Boxes[I], Allowed, &FailedLock, &Failed] {
+      auto Outcome = runToResult(serveInbox(Root, Opts, In, Allowed));
       if (Outcome) return;
 
       // Said now rather than at the join: the healthy threads serve forever,
-      // so a thread that could not bind would otherwise leave the daemon
-      // quietly running with fewer than it was asked for.
+      // so a thread that stopped would otherwise leave the daemon quietly
+      // running with fewer than it was asked for.
       std::fprintf(stderr, "raild: a serving thread stopped: %s\n", Outcome.error().message().c_str());
-
-      const std::lock_guard<std::mutex> Held(Telling);
-      if (First) First = std::unexpected(Outcome.error());
+      const std::lock_guard<std::mutex> Held(FailedLock);
+      if (!Failed) Failed = std::move(Outcome);
     });
 
+  auto Outcome = run(acceptInTurn(Opts.Port, Boxes));
+  for (auto &Box : Boxes) Box->stop();
   for (auto &One : Answering) One.join();
-  return First;
+  if (Outcome && Failed) return std::move(*Failed);
+  return Outcome;
 }
 
 } // namespace rail

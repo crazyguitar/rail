@@ -30,7 +30,7 @@
  * link itself is conventionally left wide open.
  */
 #define RAILFS_LINK_MODE 0777
-#define RAILFS_DEFAULT_CONNS 32
+#define RAILFS_DEFAULT_CONNS 8
 #define RAILFS_FETCH_BYTES (1u << 20)
 #define RAILFS_READAHEAD_BYTES (256u << 20)
 #define RAILFS_BLOCK_BYTES (1u << 18)
@@ -47,12 +47,9 @@
 
 #define RAILFS_FLUSH_LIMIT 128
 
-// How many connections one file's writeback may spread over. Measured on a
-// single writer: four connections give 1.58 GiB/s where sixteen give 1.37,
-// because every extra connection is another daemon thread contending for the
-// one inode. Spreading files is still worth it - eight writers over eight
-// files want sixteen connections, not four - so this bounds one file rather
-// than the mount.
+// Connections one file's writeback may spread over: each is another daemon
+// thread contending for that inode, 1.58 GiB/s over four against 1.37 over
+// sixteen for a single writer.
 #define RAILFS_FLUSH_SPAN 4
 
 // The largest folio the page cache may hand out here, so one always fits in a

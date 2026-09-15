@@ -35,7 +35,12 @@
  * per-connection dma landing region affordable at high connection counts.
  */
 #define RAILFS_PAGE_SIZE (1u << 20)
-#define RAILFS_PAGE_COUNT 4
+
+/* Transfers one connection may have on the wire at once, and so the pages the
+ * Hello asks the daemon to pool: each transfer holds one there.
+ */
+#define RAILFS_CONN_DEPTH 16
+#define RAILFS_PAGE_COUNT RAILFS_CONN_DEPTH
 
 #define RAILFS_META_MKDIR 1
 #define RAILFS_META_UNLINK 2

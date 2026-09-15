@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-// Kernel RDMA. The fabric is found through an ib_client, and a mount builds a
-// rail on every port that is up, to the two the wire carries: each with a
-// protection domain, a completion queue, a queue pair and its own landing
-// memory, plus one ring the peer may write its requests into. Two ports on this
-// hardware are two separate ib_devices, so memory registered with one means
-// nothing to the other - which is why a clear-to-send names an address per rail
-// rather than one for all of them.
+// Kernel RDMA: a rail per active port, each its own device with its own
+// landing memory, so a clear-to-send names an address per rail. A read holds
+// a slot on every rail; a write is matched to its clear-to-send by key.
 
 #include <linux/dma-mapping.h>
 #include <linux/completion.h>
 #include <linux/module.h>
 #include <linux/scatterlist.h>
+#include <linux/sched/signal.h>
 
 #include <rdma/ib_cache.h>
 #include <rdma/ib_verbs.h>
@@ -21,7 +18,9 @@
 #include "railfs-proto.h"
 #include "rdma-link-rate.h"
 
-#define RAILFS_CQ_DEPTH 64
+// Work requests a queue pair may hold each way. Offers and pushes together
+// never exceed the slots, and fences are one at a time, so this is generous.
+#define RAILFS_CQ_DEPTH 128
 
 // The landing region has to hold whatever page size the session negotiated, so
 // this is that number rather than one of its own. They were separate constants
@@ -33,6 +32,25 @@
 // report thirty; a page-sized flush of megabyte folios needs four.
 #define RAILFS_MAX_SGE 8
 
+// Receives each rail keeps posted. Payloads and clear-to-sends both consume
+// one, and a rail with none left stalls the peer rather than report anything.
+#define RAILFS_RECV_DEPTH (RAILFS_CQ_DEPTH / 2)
+
+/* How long an exchange waits before deciding the peer is not coming back. The
+ * fabric answers in microseconds, so anything approaching this is a rail that
+ * has stopped rather than one that is busy; arming a region is quicker because
+ * it is local work, not a round trip.
+ */
+#define RAILFS_WAIT_MS 30000
+#define RAILFS_ARM_WAIT_MS 5000
+
+// Whether anyone still waits for the page a slot was offered for. The landing
+// and the caller's departure race, and exactly one of them gives the slot
+// back, so they meet on a cmpxchg rather than on a plain flag.
+#define RAILFS_SLOT_LIVE 0
+#define RAILFS_SLOT_ORPHAN 1
+#define RAILFS_SLOT_LANDED 2
+
 // One page offered to the peer and not yet collected. Every slot has its own
 // completion because the peer answers them in whatever order its reader
 // reaches them, and a single completion cannot say which one arrived.
@@ -42,30 +60,16 @@ struct railfs_slot {
 	// Which rail carried it. The peer picks one per page, so where the bytes
 	// are is not known until the completion says.
 	u32 line;
+	bool gpu;
+	atomic_t state;
 };
 
-// The landing region holds one page per stream slot and one more for a push to
-// stage its bytes in, so a write never lands on a page a stream is waiting for.
-#define RAILFS_LANDING_PAGES (RAILFS_STREAM_SLOTS + 1)
-#define RAILFS_PUSH_SLOT RAILFS_STREAM_SLOTS
-
-// How many receives each rail keeps posted. A payload write consumes one, and a
-// rail with none left makes the peer wait on a receiver-not-ready retry rather
-// than report anything.
-#define RAILFS_RECV_DEPTH (RAILFS_CQ_DEPTH / 2)
-
-// How many clear-to-sends a push will skip past before giving up. Only a
-// request that already timed out leaves one behind, so more than a handful
-// means the peer is answering something this side is no longer asking.
-#define RAILFS_STALE_LIMIT 4
-
-/* How long an exchange waits before deciding the peer is not coming back. The
- * fabric answers in microseconds, so anything approaching this is a rail that
- * has stopped rather than one that is busy; arming a region is quicker because
- * it is local work, not a round trip.
- */
-#define RAILFS_WAIT_MS 30000
-#define RAILFS_ARM_WAIT_MS 5000
+// One slot's page on one rail: its own allocation, so the pages need not be
+// contiguous, under one region per rail that maps them in slot order.
+struct railfs_landing {
+	void *cpu;
+	dma_addr_t dma;
+};
 
 // One port. Everything that belongs to a device rather than to the connection:
 // its own protection domain, queue pair and landing memory, because two ports
@@ -80,11 +84,9 @@ struct railfs_line {
 	struct ib_pd *pd;
 	struct ib_cq *cq;
 	struct ib_qp *qp;
-	// Where a fetched page lands. Registered once and copied out of, rather
-	// than registering the caller's page for every read: a registration is a
-	// verb round trip, and one per read would cost more than the copy.
-	void *landing;
-	dma_addr_t landing_dma;
+	// Where a fetched page lands, one per slot. Registered once and copied
+	// out of: a registration per read would cost more than the copy.
+	struct railfs_landing landing[RAILFS_STREAM_SLOTS];
 	struct ib_mr *landing_mr;
 	// Where an outgoing clear-to-send is staged, kept apart from the ring the
 	// peer writes its own requests into: sharing them races.
@@ -93,7 +95,6 @@ struct railfs_line {
 	// A managed completion queue dispatches through wr_cqe->done, not wr_id.
 	// Leaving these unset is a null dereference in softirq context.
 	struct ib_cqe recv_cqe;
-	struct ib_cqe send_cqe;
 	struct ib_cqe cts_cqe;
 	struct ib_cqe arm_cqe;
 	struct completion armed;
@@ -122,27 +123,33 @@ struct railfs_rdma {
 	struct ib_mr *ring_mr;
 	struct railfs_wire peer;
 	struct railfs_slot slot[RAILFS_STREAM_SLOTS];
-	// An incoming clear-to-send, which is what a push waits for. Told apart
-	// from a payload by the RAILFS_IS_CTS bit in the immediate.
-	struct completion asked;
-	struct completion sent;
-	int asked_err;
-	int sent_err;
-	u32 asked_imm;
+	DECLARE_BITMAP(free, RAILFS_STREAM_SLOTS);
+	wait_queue_head_t slot_room;
+	// Writes waiting for the peer to name a landing, by key.
+	spinlock_t pushes_lock;
+	struct list_head pushes;
+	// One gpu transfer at a time: the gpu region is per rail, not per slot.
+	struct mutex gds_lock;
+	// One breaker at a time: every transfer on the connection can time out.
+	struct mutex break_lock;
 	bool broken;
-	u32 seq;
+	// The peer notices a record by its sequence changing, so this counts
+	// across the whole connection rather than per slot.
+	atomic_t seq;
 	// Which rail the next push writes over.
-	u32 turn;
+	atomic_t turn;
 };
 
 static void *railfs_landing_at(struct railfs_line *line, u32 slot)
 {
-	return (u8 *)line->landing + (size_t)slot * RAILFS_PAGE_BYTES;
+	return line->landing[slot].cpu;
 }
 
-static dma_addr_t railfs_landing_dma_at(struct railfs_line *line, u32 slot)
+// Where the peer writes a slot's page: the region is one span of slots, so a
+// slot is its offset from the base.
+static u64 railfs_landing_remote_at(struct railfs_line *line, u32 slot)
 {
-	return line->landing_dma + (dma_addr_t)slot * RAILFS_PAGE_BYTES;
+	return line->landing_mr->iova + (u64)slot * RAILFS_PAGE_BYTES;
 }
 
 // How many rails both ends have. The peer resizes to whatever this side
@@ -162,12 +169,12 @@ static DEFINE_MUTEX(railfs_known_lock);
 
 static int railfs_rdma_probe(struct ib_device *device);
 static int railfs_arm_region(struct railfs_line *line, struct ib_mr *mr);
-static void railfs_rdma_forget(struct ib_device *device, void *data);
+static void railfs_rdma_forget_device(struct ib_device *device, void *data);
 
 static struct ib_client railfs_ib_client = {
 	.name = "railfs",
 	.add = railfs_rdma_probe,
-	.remove = railfs_rdma_forget,
+	.remove = railfs_rdma_forget_device,
 };
 
 static int railfs_rdma_probe(struct ib_device *device)
@@ -186,7 +193,7 @@ static int railfs_rdma_probe(struct ib_device *device)
 	return 0;
 }
 
-static void railfs_rdma_forget(struct ib_device *device, void *data)
+static void railfs_rdma_forget_device(struct ib_device *device, void *data)
 {
 	struct railfs_device *known = data;
 
@@ -196,7 +203,15 @@ static void railfs_rdma_forget(struct ib_device *device, void *data)
 	kfree(known);
 }
 
-static bool railfs_line_precedes(const struct railfs_line *a, const struct railfs_line *b)
+// A port worth building a rail on, as found: the line itself is far bigger
+// than what choosing between ports needs.
+struct railfs_port {
+	struct ib_device *device;
+	u32 port;
+	u32 rate_mbps;
+};
+
+static bool railfs_line_precedes(const struct railfs_port *a, const struct railfs_port *b)
 {
 	int names;
 
@@ -208,7 +223,7 @@ static bool railfs_line_precedes(const struct railfs_line *a, const struct railf
 }
 
 // Match userspace rail ordering.
-static u32 railfs_active_lines(struct railfs_line *out, u32 room)
+static u32 railfs_active_lines(struct railfs_port *out, u32 room)
 {
 	struct railfs_device *known;
 	u32 found = 0;
@@ -221,7 +236,7 @@ static u32 railfs_active_lines(struct railfs_line *out, u32 room)
 
 		rdma_for_each_port(device, port) {
 			struct ib_port_attr attr;
-			struct railfs_line candidate = { .device = device, .port = port };
+			struct railfs_port candidate = { .device = device, .port = port };
 			u32 position;
 			u32 shift;
 
@@ -331,34 +346,46 @@ static int railfs_qp_to_rts(struct ib_qp *qp)
 	return ib_modify_qp(qp, &attr, mask);
 }
 
-// A region the peer may write into. ib_alloc_mr plus a mapping is what the
-// kernel offers in place of the userspace ibv_reg_mr over an arbitrary buffer.
-// Both regions the peer may reach: the ring it drops requests into, and the
-// buffer it writes payloads to.
-static int railfs_region(struct railfs_line *line, size_t bytes, void **cpu, dma_addr_t *dma, struct ib_mr **out)
+// One page per slot and one region over all of them. A page is an order-8
+// allocation the allocator can usually find; the span would need them
+// physically contiguous, which a busy machine cannot promise.
+static int railfs_landing_open(struct railfs_line *line)
 {
-	struct scatterlist sg;
+	struct sg_table table;
+	struct scatterlist *sg;
 	struct ib_mr *mr;
+	u32 slot;
 	int mapped;
+	int err;
 
-	*cpu = dma_alloc_coherent(line->device->dma_device, bytes, dma, GFP_KERNEL);
-	if (!*cpu) {
-		return -ENOMEM;
+	for (slot = 0; slot < RAILFS_STREAM_SLOTS; slot++) {
+		struct railfs_landing *landing = &line->landing[slot];
+
+		landing->cpu = dma_alloc_coherent(line->device->dma_device, RAILFS_PAGE_BYTES, &landing->dma, GFP_KERNEL);
+		if (!landing->cpu) {
+			return -ENOMEM;
+		}
 	}
 
-	mr = ib_alloc_mr(line->pd, IB_MR_TYPE_MEM_REG, 1);
+	mr = ib_alloc_mr(line->pd, IB_MR_TYPE_MEM_REG, RAILFS_STREAM_SLOTS);
 	if (IS_ERR(mr)) {
 		return PTR_ERR(mr);
 	}
+	line->landing_mr = mr;
 
-	*out = mr;
+	err = sg_alloc_table(&table, RAILFS_STREAM_SLOTS, GFP_KERNEL);
+	if (err) {
+		return err;
+	}
 
-	sg_init_table(&sg, 1);
-	sg_dma_address(&sg) = *dma;
-	sg_dma_len(&sg) = bytes;
+	for_each_sg(table.sgl, sg, RAILFS_STREAM_SLOTS, slot) {
+		sg_dma_address(sg) = line->landing[slot].dma;
+		sg_dma_len(sg) = RAILFS_PAGE_BYTES;
+	}
 
-	mapped = ib_map_mr_sg(mr, &sg, 1, NULL, bytes);
-	if (mapped != 1) {
+	mapped = ib_map_mr_sg(mr, table.sgl, RAILFS_STREAM_SLOTS, NULL, RAILFS_PAGE_BYTES);
+	sg_free_table(&table);
+	if (mapped != RAILFS_STREAM_SLOTS) {
 		return mapped < 0 ? mapped : -EINVAL;
 	}
 
@@ -369,6 +396,8 @@ static int railfs_region(struct railfs_line *line, size_t bytes, void **cpu, dma
 // railfs_on_landed after the queue pair is gone and repost a receive on it.
 static void railfs_line_close(struct railfs_line *line)
 {
+	u32 slot;
+
 	if (line->qp) {
 		ib_drain_qp(line->qp);
 		ib_destroy_qp(line->qp);
@@ -387,8 +416,12 @@ static void railfs_line_close(struct railfs_line *line)
 		ib_dereg_mr(line->landing_mr);
 	}
 
-	if (line->landing) {
-		dma_free_coherent(line->device->dma_device, RAILFS_LANDING_PAGES * RAILFS_PAGE_BYTES, line->landing, line->landing_dma);
+	for (slot = 0; slot < RAILFS_STREAM_SLOTS; slot++) {
+		struct railfs_landing *landing = &line->landing[slot];
+
+		if (landing->cpu) {
+			dma_free_coherent(line->device->dma_device, RAILFS_PAGE_BYTES, landing->cpu, landing->dma);
+		}
 	}
 
 	if (line->offers) {
@@ -410,6 +443,14 @@ void railfs_rdma_close(struct railfs_rdma *rail)
 
 	if (!rail) {
 		return;
+	}
+
+	// Every queue pair goes quiet before the ring does: a peer write to it can
+	// still be in flight, and would land in freed memory.
+	for (i = 0; i < rail->lines; i++) {
+		if (rail->line[i].qp) {
+			ib_drain_qp(rail->line[i].qp);
+		}
 	}
 
 	// The ring belongs to the first rail's protection domain, so it goes back
@@ -436,7 +477,6 @@ void railfs_rdma_close(struct railfs_rdma *rail)
 //   conn1 - line0 - cq --> vector 2    |##|   |##|   |##|       |##|
 //   conn1 - line1 - cq --> vector 3    +--+   +--+   +--+       +--+
 //    ...                               comp0  comp1  comp2      comp19
-//   conn63 - line1 - cq -> vector n
 //
 // Counted per module rather than per mount, so a second mount carries on from
 // where the first left off instead of piling onto the vectors it already used.
@@ -465,9 +505,8 @@ static int railfs_line_open(struct railfs_line *line)
 		goto out;
 	}
 
-	// Measured neutral, 15.69 against 15.79 GiB/s. Here because one vector for
-	// a mount's hundred and twenty-eight queues is wrong on its face.
-	line->cq = ib_alloc_cq(line->device, NULL, RAILFS_CQ_DEPTH, railfs_next_vector(line->device), IB_POLL_SOFTIRQ);
+	// Sends and receives complete on the same queue, so it holds both.
+	line->cq = ib_alloc_cq(line->device, NULL, 2 * RAILFS_CQ_DEPTH, railfs_next_vector(line->device), IB_POLL_SOFTIRQ);
 	if (IS_ERR(line->cq)) {
 		err = PTR_ERR(line->cq);
 		line->cq = NULL;
@@ -489,7 +528,7 @@ static int railfs_line_open(struct railfs_line *line)
 		goto out;
 	}
 
-	err = railfs_region(line, RAILFS_LANDING_PAGES * RAILFS_PAGE_BYTES, &line->landing, &line->landing_dma, &line->landing_mr);
+	err = railfs_landing_open(line);
 	if (err) {
 		goto out;
 	}
@@ -541,7 +580,7 @@ static int railfs_ring_open(struct railfs_rdma *rail)
 
 struct railfs_rdma *railfs_rdma_open(struct railfs_wire *wire)
 {
-	struct railfs_line found[RAILFS_MAX_RAILS] = {};
+	struct railfs_port found[RAILFS_MAX_RAILS] = {};
 	struct railfs_rdma *rail;
 	union ib_gid gid;
 	u32 lines;
@@ -559,8 +598,24 @@ struct railfs_rdma *railfs_rdma_open(struct railfs_wire *wire)
 		return ERR_PTR(-ENOMEM);
 	}
 
+	// Usable from the first failure on: close and break walk these whatever
+	// was built.
+	for (slot = 0; slot < RAILFS_STREAM_SLOTS; slot++) {
+		init_completion(&rail->slot[slot].done);
+		atomic_set(&rail->slot[slot].state, RAILFS_SLOT_LIVE);
+	}
+
+	bitmap_fill(rail->free, RAILFS_STREAM_SLOTS);
+	init_waitqueue_head(&rail->slot_room);
+	spin_lock_init(&rail->pushes_lock);
+	INIT_LIST_HEAD(&rail->pushes);
+	mutex_init(&rail->gds_lock);
+	mutex_init(&rail->break_lock);
+
 	for (i = 0; i < lines; i++) {
-		rail->line[i] = found[i];
+		rail->line[i].device = found[i].device;
+		rail->line[i].port = found[i].port;
+		rail->line[i].rate_mbps = found[i].rate_mbps;
 		rail->line[i].rail = rail;
 		rail->line[i].index = i;
 	}
@@ -580,13 +635,6 @@ struct railfs_rdma *railfs_rdma_open(struct railfs_wire *wire)
 	if (err) {
 		goto fail;
 	}
-
-	for (slot = 0; slot < RAILFS_STREAM_SLOTS; slot++) {
-		init_completion(&rail->slot[slot].done);
-	}
-
-	init_completion(&rail->asked);
-	init_completion(&rail->sent);
 
 	memset(wire, 0, sizeof(*wire));
 	wire->rails = lines;
@@ -629,8 +677,8 @@ static void railfs_on_armed(struct ib_cq *cq, struct ib_wc *wc)
 	complete(&line->armed);
 }
 
-// A send work request, so the queue pair has to be sending already: this runs
-// after the transition to ready, not while the region is being allocated.
+// A send work request, so the queue pair has to be ready. Fences share one
+// completion per rail and run one at a time: at meet, then under the gds lock.
 static int railfs_fence(struct railfs_line *line, struct ib_send_wr *wr)
 {
 	const struct ib_send_wr *bad;
@@ -762,7 +810,7 @@ static int railfs_gpu_bind(struct railfs_line *line, struct sg_table *pages, enu
 
 	err = railfs_arm(line, mr, access);
 	if (err) {
-		line->rail->broken = true;
+		WRITE_ONCE(line->rail->broken, true);
 		ib_drain_qp(line->qp);
 		goto unmap;
 	}
@@ -781,8 +829,8 @@ static void railfs_gpu_unbind(struct railfs_line *line)
 		return;
 	}
 
-	if (line->rail->broken || railfs_disarm(line, line->gpu_mr)) {
-		line->rail->broken = true;
+	if (READ_ONCE(line->rail->broken) || railfs_disarm(line, line->gpu_mr)) {
+		WRITE_ONCE(line->rail->broken, true);
 		ib_drain_qp(line->qp);
 	}
 
@@ -791,6 +839,16 @@ static void railfs_gpu_unbind(struct railfs_line *line)
 }
 
 static void railfs_on_landed(struct ib_cq *cq, struct ib_wc *wc);
+
+static void railfs_push_free(struct kref *ref)
+{
+	kfree(container_of(ref, struct railfs_push, ref));
+}
+
+static void railfs_push_put(struct railfs_push *push)
+{
+	kref_put(&push->ref, railfs_push_free);
+}
 
 // A payload write consumes a receive, so every rail keeps a stock of them. A
 // rail that runs out does not fail: the peer retries until it is told to stop,
@@ -875,22 +933,71 @@ int railfs_rdma_meet(struct railfs_rdma *rail, const struct railfs_wire *wire)
 	return 0;
 }
 
+// A push that will never be answered, released with the error rather than left
+// to time out. Under the pushes lock.
+static void railfs_push_fail(struct railfs_push *push, int err)
+{
+	list_del_init(&push->link);
+	push->asked_err = err;
+	complete(&push->asked);
+}
+
 // A failure carries no usable immediate, so there is no way to tell which slot
 // it belonged to. Everyone waiting is released with the error rather than left
 // to time out one after another, thirty seconds apart.
 static void railfs_strand_all(struct railfs_rdma *rail, int err)
 {
+	struct railfs_push *push;
+	struct railfs_push *next;
 	u32 slot;
 
-	rail->broken = true;
+	WRITE_ONCE(rail->broken, true);
 
 	for (slot = 0; slot < RAILFS_STREAM_SLOTS; slot++) {
 		rail->slot[slot].err = err;
 		complete(&rail->slot[slot].done);
 	}
 
-	rail->asked_err = err;
-	complete(&rail->asked);
+	spin_lock_bh(&rail->pushes_lock);
+	list_for_each_entry_safe(push, next, &rail->pushes, link) {
+		railfs_push_fail(push, err);
+	}
+	spin_unlock_bh(&rail->pushes_lock);
+
+	wake_up(&rail->slot_room);
+}
+
+// The peer said where it wants the bytes for some key. Whoever registered that
+// key is handed the record; a record nobody asked for belongs to a request
+// that already timed out, and is dropped.
+static void railfs_on_cts(struct railfs_rdma *rail, u32 slot)
+{
+	struct railfs_cts record;
+	struct railfs_push *push;
+
+	if (slot >= RAILFS_CTS_SLOTS) {
+		railfs_strand_all(rail, -EPROTO);
+		return;
+	}
+
+	memcpy(&record, (u8 *)rail->ring + (size_t)slot * RAILFS_CTS_BYTES, sizeof(record));
+
+	spin_lock_bh(&rail->pushes_lock);
+	list_for_each_entry(push, &rail->pushes, link) {
+		if (push->key != record.key) {
+			continue;
+		}
+
+		list_del_init(&push->link);
+		push->cts = record;
+		push->asked_err = 0;
+		complete(&push->asked);
+		spin_unlock_bh(&rail->pushes_lock);
+		return;
+	}
+	spin_unlock_bh(&rail->pushes_lock);
+
+	pr_warn_ratelimited("railfs: dropping a stale clear to send for key %llu\n", record.key);
 }
 
 // Every receive on any rail arrives here, and the immediate says what it is: a
@@ -906,7 +1013,9 @@ static void railfs_on_landed(struct ib_cq *cq, struct ib_wc *wc)
 	u32 imm;
 
 	if (wc->status != IB_WC_SUCCESS) {
-		pr_err_ratelimited("railfs: rdma payload failed on rail %u: %s\n", line->index, ib_wc_status_msg(wc->status));
+		if (wc->status != IB_WC_WR_FLUSH_ERR) {
+			pr_err_ratelimited("railfs: rdma payload failed on rail %u: %s\n", line->index, ib_wc_status_msg(wc->status));
+		}
 		railfs_strand_all(rail, -EIO);
 		return;
 	}
@@ -920,9 +1029,7 @@ static void railfs_on_landed(struct ib_cq *cq, struct ib_wc *wc)
 	imm = wc->wc_flags & IB_WC_WITH_IMM ? be32_to_cpu(wc->ex.imm_data) : 0;
 
 	if (imm & RAILFS_IS_CTS) {
-		rail->asked_err = 0;
-		rail->asked_imm = imm;
-		complete(&rail->asked);
+		railfs_on_cts(rail, imm & ~RAILFS_IS_CTS);
 		return;
 	}
 
@@ -934,6 +1041,14 @@ static void railfs_on_landed(struct ib_cq *cq, struct ib_wc *wc)
 
 	rail->slot[imm].err = 0;
 	rail->slot[imm].line = line->index;
+
+	// Claim the slot before completing it. Losing the exchange means the
+	// caller has already gone, and the page is ours to throw away.
+	if (atomic_cmpxchg(&rail->slot[imm].state, RAILFS_SLOT_LIVE, RAILFS_SLOT_LANDED) == RAILFS_SLOT_ORPHAN) {
+		railfs_rdma_slot_release(rail, imm);
+		return;
+	}
+
 	complete(&rail->slot[imm].done);
 }
 
@@ -947,14 +1062,39 @@ static void railfs_rail_break(struct railfs_rdma *rail)
 	struct ib_qp_attr attr = {};
 	u32 i;
 
-	rail->broken = true;
+	// Once, and one caller at a time: concurrent timeouts would otherwise
+	// race the same queue pairs through the transition. A late caller still
+	// wakes the sleepers, since its own timeout sent it here.
+	mutex_lock(&rail->break_lock);
+	if (READ_ONCE(rail->broken)) {
+		mutex_unlock(&rail->break_lock);
+		goto wake;
+	}
+
+	WRITE_ONCE(rail->broken, true);
 	attr.qp_state = IB_QPS_ERR;
 
 	for (i = 0; i < rail->lines; i++) {
-		if (ib_modify_qp(rail->line[i].qp, &attr, IB_QP_STATE)) {
+		if (rail->line[i].qp && ib_modify_qp(rail->line[i].qp, &attr, IB_QP_STATE)) {
 			pr_err("railfs: could not flush rail %u after a timeout\n", i);
 		}
 	}
+	mutex_unlock(&rail->break_lock);
+
+wake:
+	// The timeout paths reach here without railfs_strand_all, so this is the
+	// only wake anyone parked for a slot gets.
+	wake_up(&rail->slot_room);
+}
+
+void railfs_rdma_break(struct railfs_rdma *rail)
+{
+	if (!rail) {
+		return;
+	}
+
+	railfs_rail_break(rail);
+	railfs_strand_all(rail, -ENOTCONN);
 }
 
 // The clear-to-send is posted and never waited for, so this only reports. It
@@ -962,20 +1102,23 @@ static void railfs_rail_break(struct railfs_rdma *rail)
 // release a write whose payload is still on the wire.
 static void railfs_on_cts_sent(struct ib_cq *cq, struct ib_wc *wc)
 {
-	if (wc->status != IB_WC_SUCCESS) {
+	if (wc->status != IB_WC_SUCCESS && wc->status != IB_WC_WR_FLUSH_ERR) {
 		pr_err_ratelimited("railfs: rdma clear to send failed: %s\n", ib_wc_status_msg(wc->status));
 	}
 }
 
+// Holds the reference the post took, so a push whose caller timed out and
+// left is still whole when its flushed completion arrives.
 static void railfs_on_sent(struct ib_cq *cq, struct ib_wc *wc)
 {
-	struct railfs_line *line = container_of(wc->wr_cqe, struct railfs_line, send_cqe);
+	struct railfs_push *push = container_of(wc->wr_cqe, struct railfs_push, cqe);
 
-	line->rail->sent_err = wc->status == IB_WC_SUCCESS ? 0 : -EIO;
-	if (wc->status != IB_WC_SUCCESS) {
+	push->sent_err = wc->status == IB_WC_SUCCESS ? 0 : -EIO;
+	if (wc->status != IB_WC_SUCCESS && wc->status != IB_WC_WR_FLUSH_ERR) {
 		pr_err_ratelimited("railfs: rdma send failed: %s\n", ib_wc_status_msg(wc->status));
 	}
-	complete(&line->rail->sent);
+	complete(&push->sent);
+	railfs_push_put(push);
 }
 
 // Writes one clear-to-send into the peer's ring naming where this page may land
@@ -1000,7 +1143,7 @@ static int railfs_rdma_offer_at(struct railfs_rdma *rail, u32 slot, u64 key, u32
 		return -EMSGSIZE;
 	}
 
-	if (rail->broken) {
+	if (READ_ONCE(rail->broken)) {
 		return -ENOTCONN;
 	}
 
@@ -1009,9 +1152,12 @@ static int railfs_rdma_offer_at(struct railfs_rdma *rail, u32 slot, u64 key, u32
 		return -ENOTCONN;
 	}
 
+	// Armed before the clear-to-send goes out: from here the peer may land a
+	// page at any moment, and the landing has to find the slot claimable.
 	reinit_completion(&rail->slot[slot].done);
 	rail->slot[slot].err = 0;
 	rail->slot[slot].line = 0;
+	atomic_set(&rail->slot[slot].state, RAILFS_SLOT_LIVE);
 
 	post->cts_cqe.done = railfs_on_cts_sent;
 
@@ -1024,9 +1170,7 @@ static int railfs_rdma_offer_at(struct railfs_rdma *rail, u32 slot, u64 key, u32
 		cts.rkey[i] = rkey[i];
 	}
 
-	// The peer notices a record by its sequence changing, so this counts
-	// across the whole connection rather than per slot.
-	cts.seq = ++rail->seq;
+	cts.seq = (u32)atomic_inc_return(&rail->seq);
 
 	memcpy((u8 *)post->offers + (size_t)slot * RAILFS_CTS_BYTES, &cts, sizeof(cts));
 
@@ -1048,23 +1192,128 @@ static int railfs_rdma_offer_at(struct railfs_rdma *rail, u32 slot, u64 key, u32
 	return ib_post_send(post->qp, &wr.wr, &bad_send);
 }
 
-// Each NIC registers its own landing address and key.
-int railfs_rdma_offer(struct railfs_rdma *rail, u32 slot, u64 key, u32 len)
+static bool railfs_slot_free(const struct railfs_rdma *rail)
+{
+	return !bitmap_empty(rail->free, RAILFS_STREAM_SLOTS);
+}
+
+// Waits rather than fails when every slot is offered: the caller is a
+// filesystem operation with nowhere else to go, and a slot comes back as soon
+// as a page lands.
+static int railfs_slot_take(struct railfs_rdma *rail, u32 *slot)
+{
+	for (;;) {
+		u32 at;
+
+		if (READ_ONCE(rail->broken)) {
+			return -ENOTCONN;
+		}
+
+		at = find_first_bit(rail->free, RAILFS_STREAM_SLOTS);
+		if (at < RAILFS_STREAM_SLOTS && test_and_clear_bit(at, rail->free)) {
+			rail->slot[at].gpu = false;
+			atomic_set(&rail->slot[at].state, RAILFS_SLOT_LIVE);
+			*slot = at;
+			return 0;
+		}
+
+		if (wait_event_killable(rail->slot_room, READ_ONCE(rail->broken) || railfs_slot_free(rail))) {
+			return -ERESTARTSYS;
+		}
+	}
+}
+
+void railfs_rdma_slot_release(struct railfs_rdma *rail, u32 slot)
+{
+	if (slot >= RAILFS_STREAM_SLOTS) {
+		return;
+	}
+
+	set_bit(slot, rail->free);
+	wake_up(&rail->slot_room);
+}
+
+// A broken rail never delivers, so the slot is simply lost with it.
+void railfs_rdma_slot_orphan(struct railfs_rdma *rail, u32 slot)
+{
+	if (slot >= RAILFS_STREAM_SLOTS) {
+		return;
+	}
+
+	if (READ_ONCE(rail->broken)) {
+		railfs_rdma_slot_release(rail, slot);
+		return;
+	}
+
+	// Losing the exchange means the page landed while this caller was
+	// leaving, so nothing else is coming and the slot is ours to give back.
+	if (atomic_cmpxchg(&rail->slot[slot].state, RAILFS_SLOT_LIVE, RAILFS_SLOT_ORPHAN) != RAILFS_SLOT_LIVE) {
+		railfs_rdma_slot_release(rail, slot);
+	}
+}
+
+static void railfs_gpu_unbind_all(struct railfs_rdma *rail, u32 bound)
+{
+	u32 i;
+
+	for (i = 0; i < bound; i++) {
+		railfs_gpu_unbind(&rail->line[i]);
+	}
+}
+
+int railfs_rdma_fetch_begin(struct railfs_rdma *rail, u64 key, u32 len, struct sg_table *gpu, u32 *slot)
 {
 	u64 addr[RAILFS_MAX_RAILS] = {};
 	u32 rkey[RAILFS_MAX_RAILS] = {};
+	u32 shared = railfs_shared_lines(rail);
+	u32 bound = 0;
 	u32 i;
+	int err;
 
-	if (slot >= RAILFS_STREAM_SLOTS) {
-		return -EINVAL;
+	if (READ_ONCE(rail->broken) || !shared) {
+		return -ENOTCONN;
 	}
 
-	for (i = 0; i < railfs_shared_lines(rail); i++) {
-		addr[i] = (u64)railfs_landing_dma_at(&rail->line[i], slot);
-		rkey[i] = rail->line[i].landing_mr->rkey;
+	err = railfs_slot_take(rail, slot);
+	if (err) {
+		return err;
 	}
 
-	return railfs_rdma_offer_at(rail, slot, key, len, addr, rkey);
+	if (gpu) {
+		mutex_lock(&rail->gds_lock);
+		rail->slot[*slot].gpu = true;
+
+		for (i = 0; i < shared; i++) {
+			err = railfs_gpu_bind(&rail->line[i], gpu, DMA_FROM_DEVICE, IB_ACCESS_LOCAL_WRITE | IB_ACCESS_REMOTE_WRITE);
+			if (err) {
+				goto fail;
+			}
+
+			bound++;
+			addr[i] = rail->line[i].gpu_mr->iova;
+			rkey[i] = rail->line[i].gpu_mr->rkey;
+		}
+	} else {
+		for (i = 0; i < shared; i++) {
+			addr[i] = railfs_landing_remote_at(&rail->line[i], *slot);
+			rkey[i] = rail->line[i].landing_mr->rkey;
+		}
+	}
+
+	err = railfs_rdma_offer_at(rail, *slot, key, len, addr, rkey);
+	if (err) {
+		goto fail;
+	}
+
+	return 0;
+
+fail:
+	if (gpu) {
+		railfs_gpu_unbind_all(rail, bound);
+		mutex_unlock(&rail->gds_lock);
+	}
+	railfs_rdma_slot_release(rail, *slot);
+	return err;
 }
 
 static int railfs_rdma_await(struct railfs_rdma *rail, u32 slot)
@@ -1085,165 +1334,108 @@ static int railfs_rdma_await(struct railfs_rdma *rail, u32 slot)
 	return 0;
 }
 
-// The collected landing remains valid until the next offer on this slot.
-static int railfs_rdma_collect_at(struct railfs_rdma *rail, u32 slot, u32 len, const void **at)
+// The landing stays valid until the slot is released, whichever way this ends;
+// the slot is the caller's to release either way.
+int railfs_rdma_fetch_end(struct railfs_rdma *rail, u32 slot, const void **at)
 {
-	u32 line;
 	int err;
+
+	*at = NULL;
 
 	if (slot >= RAILFS_STREAM_SLOTS) {
 		return -EINVAL;
 	}
 
-	if (len > RAILFS_PAGE_BYTES) {
-		return -EMSGSIZE;
-	}
-
 	err = railfs_rdma_await(rail, slot);
-	if (err) {
+
+	if (rail->slot[slot].gpu) {
+		railfs_gpu_unbind_all(rail, railfs_shared_lines(rail));
+		mutex_unlock(&rail->gds_lock);
 		return err;
 	}
 
-	line = rail->slot[slot].line;
-	*at = railfs_landing_at(&rail->line[line], slot);
-	return len;
+	if (!err) {
+		*at = railfs_landing_at(&rail->line[rail->slot[slot].line], slot);
+	}
+	return err;
 }
 
-int railfs_rdma_collect(struct railfs_rdma *rail, u32 slot, void *buf, u32 len)
+struct railfs_push *railfs_rdma_expect(struct railfs_rdma *rail, u64 key)
 {
-	const void *at;
-	int got = railfs_rdma_collect_at(rail, slot, len, &at);
+	struct railfs_push *push = kzalloc(sizeof(*push), GFP_NOFS);
 
-	if (got < 0) {
-		return got;
+	if (!push) {
+		return NULL;
 	}
 
-	memcpy(buf, at, len);
-	return len;
+	kref_init(&push->ref);
+	INIT_LIST_HEAD(&push->link);
+	push->key = key;
+	init_completion(&push->asked);
+	init_completion(&push->sent);
+
+	spin_lock_bh(&rail->pushes_lock);
+	list_add_tail(&push->link, &rail->pushes);
+	spin_unlock_bh(&rail->pushes_lock);
+	return push;
 }
 
-int railfs_rdma_fetch_landed(struct railfs_rdma *rail, u64 key, u32 len, const void **landed)
+static void railfs_push_unlink(struct railfs_rdma *rail, struct railfs_push *push)
 {
-	int err = railfs_rdma_offer(rail, 0, key, len);
-
-	if (err) {
-		return err;
-	}
-
-	return railfs_rdma_collect_at(rail, 0, len, landed);
+	spin_lock_bh(&rail->pushes_lock);
+	list_del_init(&push->link);
+	spin_unlock_bh(&rail->pushes_lock);
 }
 
-int railfs_rdma_fetch_sg(struct railfs_rdma *rail, u64 key, struct sg_table *pages, u32 len)
+void railfs_rdma_forget(struct railfs_rdma *rail, struct railfs_push *push)
 {
-	u64 addr[RAILFS_MAX_RAILS] = {};
-	u32 rkey[RAILFS_MAX_RAILS] = {};
-	u32 shared = railfs_shared_lines(rail);
-	u32 bound = 0;
-	u32 i;
-	int err;
-
-	if (rail->broken || !shared) {
-		return -ENOTCONN;
+	if (!push) {
+		return;
 	}
 
-	for (i = 0; i < shared; i++) {
-		err = railfs_gpu_bind(&rail->line[i], pages, DMA_FROM_DEVICE, IB_ACCESS_LOCAL_WRITE | IB_ACCESS_REMOTE_WRITE);
-		if (err) {
-			goto unbind;
-		}
-
-		bound++;
-		addr[i] = rail->line[i].gpu_mr->iova;
-		rkey[i] = rail->line[i].gpu_mr->rkey;
-	}
-
-	err = railfs_rdma_offer_at(rail, 0, key, len, addr, rkey);
-	if (err) {
-		goto unbind;
-	}
-
-	err = railfs_rdma_await(rail, 0);
-
-unbind:
-	for (i = 0; i < bound; i++) {
-		railfs_gpu_unbind(&rail->line[i]);
-	}
-
-	return err ? err : (int)len;
+	railfs_push_unlink(rail, push);
+	railfs_push_put(push);
 }
 
-// One page, offered and collected without letting go in between. What a ranged
-// read does.
-int railfs_rdma_fetch(struct railfs_rdma *rail, u64 key, void *buf, u32 len)
+// Waits for the peer to say where it wants the bytes for this push's key. The
+// completion handler has already matched the record to this push, so nothing
+// here is anyone else's.
+static int railfs_await_cts(struct railfs_rdma *rail, struct railfs_push *push)
 {
-	int err = railfs_rdma_offer(rail, 0, key, len);
-
-	if (err) {
-		return err;
+	if (!wait_for_completion_timeout(&push->asked, msecs_to_jiffies(RAILFS_WAIT_MS))) {
+		railfs_push_unlink(rail, push);
+		railfs_rail_break(rail);
+		return -ETIMEDOUT;
 	}
 
-	return railfs_rdma_collect(rail, 0, buf, len);
+	if (push->asked_err) {
+		return push->asked_err;
+	}
+
+	if (push->cts.slot >= RAILFS_CTS_SLOTS) {
+		return -EPROTO;
+	}
+
+	return 0;
 }
 
 // The mirror of a fetch: here the peer says where it wants the bytes and this
 // side writes them. The immediate carries the slot without the clear-to-send
 // bit, which is how the peer tells a payload from a request.
-// Waits for the peer to say where it wants the bytes for this key, skipping
-// records left behind by requests that already timed out. The completion is
-// never reinitialised: receives are stocked from the moment a rail comes up, so
-// a record can arrive before this is called and resetting would lose it.
-static int railfs_await_cts(struct railfs_rdma *rail, u64 key, struct railfs_cts *out)
-{
-	u32 asks = 0;
-	u32 slot;
-
-	for (;;) {
-		if (++asks > RAILFS_STALE_LIMIT) {
-			return -EPROTO;
-		}
-
-		if (!wait_for_completion_timeout(&rail->asked, msecs_to_jiffies(RAILFS_WAIT_MS))) {
-			railfs_rail_break(rail);
-			return -ETIMEDOUT;
-		}
-
-		if (rail->asked_err) {
-			return rail->asked_err;
-		}
-
-		if (!(rail->asked_imm & RAILFS_IS_CTS)) {
-			return -EPROTO;
-		}
-
-		slot = rail->asked_imm & ~RAILFS_IS_CTS;
-		if (slot >= RAILFS_CTS_SLOTS) {
-			return -EPROTO;
-		}
-
-		memcpy(out, (u8 *)rail->ring + (size_t)slot * RAILFS_CTS_BYTES, sizeof(*out));
-
-		if (out->key == key) {
-			return 0;
-		}
-
-		pr_warn("railfs: skipping a stale clear to send for key %llu, wanted %llu\n", out->key, key);
-	}
-}
-
-static int railfs_rdma_push_from(struct railfs_rdma *rail, u64 key, const void *buf, struct folio **folios, unsigned int nr,
-				 struct sg_table *pages, u32 len)
+static int railfs_rdma_push_from(struct railfs_rdma *rail, struct railfs_push *push, const void *buf, struct folio **folios,
+				 unsigned int nr, struct sg_table *pages, u32 len)
 {
 	const struct ib_send_wr *bad_send;
 	struct railfs_line *post;
 	struct railfs_line *bound = NULL;
 	struct ib_rdma_wr wr = {};
-	struct railfs_cts cts;
 	struct ib_sge sge[RAILFS_MAX_SGE] = {};
 	struct ib_device *mapped = NULL;
 	dma_addr_t dma[RAILFS_MAX_SGE] = {};
 	unsigned int mapped_nr = 0;
 	unsigned int entries = 1;
 	unsigned int i;
+	u32 staging = RAILFS_STREAM_SLOTS;
 	u32 shared;
 	u32 which;
 	int err;
@@ -1253,7 +1445,7 @@ static int railfs_rdma_push_from(struct railfs_rdma *rail, u64 key, const void *
 		goto out;
 	}
 
-	if (rail->broken) {
+	if (READ_ONCE(rail->broken)) {
 		err = -ENOTCONN;
 		goto out;
 	}
@@ -1264,24 +1456,22 @@ static int railfs_rdma_push_from(struct railfs_rdma *rail, u64 key, const void *
 		goto out;
 	}
 
-	which = rail->turn++ % shared;
+	which = (u32)atomic_inc_return(&rail->turn) % shared;
 	post = &rail->line[which];
 
-	post->send_cqe.done = railfs_on_sent;
-
-	err = railfs_await_cts(rail, key, &cts);
+	err = railfs_await_cts(rail, push);
 	if (err) {
 		goto out;
 	}
 
-	if (len > cts.length) {
+	if (len > push->cts.length) {
 		err = -EMSGSIZE;
 		goto out;
 	}
 
 	// A folio is mapped for the device and sent where it lies. Anything else
-	// is staged through the landing region first, which is what a folio too
-	// small to cover the write falls back to.
+	// is staged through a landing page first, which is what a folio too small
+	// to cover the write falls back to.
 	if (folios) {
 		u32 left = len;
 
@@ -1316,8 +1506,10 @@ static int railfs_rdma_push_from(struct railfs_rdma *rail, u64 key, const void *
 			goto out;
 		}
 	} else if (pages) {
+		mutex_lock(&rail->gds_lock);
 		err = railfs_gpu_bind(post, pages, DMA_TO_DEVICE, IB_ACCESS_LOCAL_WRITE);
 		if (err) {
+			mutex_unlock(&rail->gds_lock);
 			goto out;
 		}
 
@@ -1326,41 +1518,47 @@ static int railfs_rdma_push_from(struct railfs_rdma *rail, u64 key, const void *
 		sge[0].length = len;
 		sge[0].lkey = post->gpu_mr->lkey;
 	} else {
-		memcpy(railfs_landing_at(post, RAILFS_PUSH_SLOT), buf, len);
-		sge[0].addr = railfs_landing_dma_at(post, RAILFS_PUSH_SLOT);
+		err = railfs_slot_take(rail, &staging);
+		if (err) {
+			goto out;
+		}
+
+		memcpy(railfs_landing_at(post, staging), buf, len);
+		sge[0].addr = post->landing[staging].dma;
 		sge[0].length = len;
 		sge[0].lkey = post->pd->local_dma_lkey;
 	}
 
-	reinit_completion(&rail->sent);
-	rail->sent_err = 0;
+	push->cqe.done = railfs_on_sent;
 
-	wr.wr.wr_cqe = &post->send_cqe;
+	wr.wr.wr_cqe = &push->cqe;
 	wr.wr.sg_list = sge;
 	wr.wr.num_sge = entries;
 	wr.wr.opcode = IB_WR_RDMA_WRITE_WITH_IMM;
-	wr.wr.ex.imm_data = cpu_to_be32(cts.slot);
+	wr.wr.ex.imm_data = cpu_to_be32(push->cts.slot);
 	wr.wr.send_flags = IB_SEND_SIGNALED;
 	// The peer names one landing per rail, so the address has to be the one
 	// belonging to the rail this write goes out on.
-	wr.remote_addr = cts.addr[which];
-	wr.rkey = cts.rkey[which];
+	wr.remote_addr = push->cts.addr[which];
+	wr.rkey = push->cts.rkey[which];
 
+	kref_get(&push->ref);
 	err = ib_post_send(post->qp, &wr.wr, &bad_send);
 	if (err) {
+		railfs_push_put(push);
 		goto out;
 	}
 
-	if (!wait_for_completion_timeout(&rail->sent, msecs_to_jiffies(RAILFS_WAIT_MS))) {
+	if (!wait_for_completion_timeout(&push->sent, msecs_to_jiffies(RAILFS_WAIT_MS))) {
+		// Breaking flushes the send but does not wait for it. Draining does,
+		// which is what makes the mappings below safe to take back.
 		railfs_rail_break(rail);
-
-		// Retain CPU mappings until DMA is known to have stopped.
-		mapped = NULL;
+		ib_drain_qp(post->qp);
 		err = -ETIMEDOUT;
 		goto out;
 	}
 
-	err = rail->sent_err ? rail->sent_err : (int)len;
+	err = push->sent_err ? push->sent_err : (int)len;
 out:
 	// Release mappings only after completion or a QP drain.
 	if (mapped) {
@@ -1370,23 +1568,28 @@ out:
 	}
 	if (bound) {
 		railfs_gpu_unbind(bound);
+		mutex_unlock(&rail->gds_lock);
 	}
+	if (staging < RAILFS_STREAM_SLOTS) {
+		railfs_rdma_slot_release(rail, staging);
+	}
+	railfs_push_unlink(rail, push);
 	return err;
 }
 
-int railfs_rdma_push(struct railfs_rdma *rail, u64 key, const void *buf, u32 len)
+int railfs_rdma_push(struct railfs_rdma *rail, struct railfs_push *push, const void *buf, u32 len)
 {
-	return railfs_rdma_push_from(rail, key, buf, NULL, 0, NULL, len);
+	return railfs_rdma_push_from(rail, push, buf, NULL, 0, NULL, len);
 }
 
-int railfs_rdma_push_folios(struct railfs_rdma *rail, u64 key, struct folio **folios, unsigned int nr, u32 len)
+int railfs_rdma_push_folios(struct railfs_rdma *rail, struct railfs_push *push, struct folio **folios, unsigned int nr, u32 len)
 {
-	return railfs_rdma_push_from(rail, key, NULL, folios, nr, NULL, len);
+	return railfs_rdma_push_from(rail, push, NULL, folios, nr, NULL, len);
 }
 
-int railfs_rdma_push_sg(struct railfs_rdma *rail, u64 key, struct sg_table *pages, u32 len)
+int railfs_rdma_push_sg(struct railfs_rdma *rail, struct railfs_push *push, struct sg_table *pages, u32 len)
 {
-	return railfs_rdma_push_from(rail, key, NULL, NULL, 0, pages, len);
+	return railfs_rdma_push_from(rail, push, NULL, NULL, 0, pages, len);
 }
 
 int railfs_rdma_start(void)

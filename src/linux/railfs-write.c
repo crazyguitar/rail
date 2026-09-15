@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-// Handing dirty folios back to the peer. Writeback gathers what it can into
-// whole pages, spreads one file over a window of connections, and bounds how
-// many flushes may be outstanding at once.
+// Handing dirty folios back to the peer: gathered into whole pages, one file
+// kept to a window of connections, and bounded in flight.
 
 #include <linux/backing-dev.h>
 #include <linux/fs.h>
-#include <linux/hash.h>
 #include <linux/pagemap.h>
 #include <linux/slab.h>
 #include <linux/writeback.h>

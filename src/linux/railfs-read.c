@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 //
 // Filling the page cache from the peer. A readahead window is cut into fetches
-// of one page each, and every fetch holds a connection only for its exchange so
-// the window is bounded by how many may be in flight, not by how many
-// connections were mounted.
+// of one page each, bounded by how many may be in flight, not by connections.
 
 #include <linux/fs.h>
 #include <linux/pagemap.h>
@@ -18,17 +16,18 @@ struct railfs_folio_read {
 	struct folio *folio;
 };
 
-// Copied into the folio while the connection is still held: the bytes sit in
-// that connection's landing and its next read overwrites them.
+// Copied into the folio before the landing is given back: the bytes sit where
+// the transport put them until then, and the next read there overwrites them.
 static int railfs_folio_op(struct railfs_conn *conn, void *arg)
 {
 	struct railfs_folio_read *req = arg;
-	const void *landed = NULL;
+	struct railfs_landed landed;
 	u32 len = (u32)folio_size(req->folio);
 	int got = railfs_read_landed(conn, req->path, folio_pos(req->folio), len, &landed);
 
 	if (got > 0) {
-		memcpy_to_folio(req->folio, 0, landed, got);
+		memcpy_to_folio(req->folio, 0, landed.at, got);
+		railfs_read_release(&landed);
 	}
 	return got;
 }
@@ -183,7 +182,7 @@ static void railfs_fetch_free(struct railfs_fetch *fetch)
 static int railfs_fetch_op(struct railfs_conn *conn, void *arg)
 {
 	struct railfs_fetch *fetch = arg;
-	const void *landed = NULL;
+	struct railfs_landed landed;
 	u64 mark;
 	int got = railfs_read_landed(conn, fetch->path, fetch->offset, fetch->len, &landed);
 
@@ -192,15 +191,16 @@ static int railfs_fetch_op(struct railfs_conn *conn, void *arg)
 	}
 
 	mark = railfs_now();
-	railfs_fetch_land(fetch, landed, (size_t)got);
+	railfs_fetch_land(fetch, landed.at, (size_t)got);
 	railfs_trace_add(RAILFS_PHASE_READ_LAND, mark, (u64)got);
 
 	if (fetch->widened) {
 		mark = railfs_now();
-		railfs_fill_around(fetch, landed, (size_t)got);
+		railfs_fill_around(fetch, landed.at, (size_t)got);
 		railfs_trace_add(RAILFS_PHASE_READ_AROUND, mark, (u64)got);
 	}
 
+	railfs_read_release(&landed);
 	fetch->landed = true;
 	return got;
 }

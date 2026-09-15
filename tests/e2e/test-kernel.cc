@@ -670,10 +670,36 @@ TEST_F(Kernel, NamesTheConnectionCountItWasGiven) {
   EXPECT_NE(readWholeFile("/proc/mounts").find("conns=4"), std::string::npos);
 }
 
+// A connection carries many requests at once: four readers on a mount with
+// one connection have their fetches on the wire together, not in turn.
+TEST_F(Kernel, SharesOneConnectionAcrossReaders) {
+  std::vector<std::filesystem::path> Locals;
+  for (int I = 0; I < 4; I++) {
+    Locals.push_back(makeFile("kernel-share-" + std::to_string(I) + ".bin", 24u << 20, 60 + I));
+    seedRemote(Locals.back(), Export + "/share" + std::to_string(I) + ".bin");
+  }
+
+  const std::string Readers = "for i in 0 1 2 3; do dd if=" + Mountpoint + "/share$i.bin of=/dev/null bs=1M 2>/dev/null & done; wait";
+
+  ASSERT_TRUE(mountIt(defaultOptions() + ",conns=1"));
+  ASSERT_TRUE(dropCaches().has_value());
+  forgetCounters();
+  [[maybe_unused]] auto Ran = runLocal({"sh", "-c", Readers});
+  const int Together = busiestCalls();
+
+  ASSERT_GE(Together, 0) << "the module did not report its counters; is debugfs mounted";
+  EXPECT_GT(Together, 1) << "a one-connection mount never had more than " << Together << " request in flight";
+  EXPECT_EQ(busiestConnections(), 1);
+
+  for (int I = 0; I < 4; I++) {
+    EXPECT_EQ(digestThrough("share" + std::to_string(I) + ".bin"), digestOf(Locals[I]));
+  }
+}
+
 TEST_F(Kernel, ParallelReadersSpreadAcrossTheConnectionPool) {
-  // Every operation holds a connection for its whole exchange, so a mount with
-  // one is serial by construction. This is the only check that the pool is
-  // actually being spread across.
+  // A connection is busy while any request is on it, so a mount with one can
+  // never show two busy. This is the only check that the pool is actually
+  // being spread across.
   for (int I = 0; I < 4; I++) {
     const auto Local = makeFile("kernel-par-" + std::to_string(I) + ".bin", 24u << 20, 70 + I);
     seedRemote(Local, Export + "/par" + std::to_string(I) + ".bin");
@@ -1096,15 +1122,20 @@ TEST_F(Kernel, DoesNotGiveASmallFileAFolioTheSizeOfTheFloor) {
   ASSERT_TRUE(ran({"ssh", peerHost(), "for i in $(seq 1 500); do head -c 1024 /dev/zero > " + Many + "/f$i; done"}));
 
   ASSERT_TRUE(mountIt("host=" + Host + ",export=many,port=" + std::to_string(kPort) + ",minfolio=262144"));
+  // A host without a writable cgroup-v2 memory controller cannot take this
+  // measurement; that is not a failing kernel.
+  if (!openCacheGroup()) GTEST_SKIP() << "no cgroup to charge the page cache to";
   ASSERT_TRUE(dropCaches().has_value());
 
-  const long Before = cachedMiB();
+  const long Before = groupCacheMiB();
   ASSERT_GE(Before, 0);
-  [[maybe_unused]] auto Read = runLocal({"sh", "-c", "cat " + Mountpoint + "/* > /dev/null"});
-  const long Grew = cachedMiB() - Before;
+  ASSERT_TRUE(readCharged("cat " + Mountpoint + "/* > /dev/null")) << "the charged read did not run";
+  const long Grew = groupCacheMiB() - Before;
 
   // 500 KiB of data. Bounded it costs a few MiB; a floor per file would cost
-  // 125, so the bar is set far from both.
+  // 125, so the bar is set far from both. Charged to a cgroup rather than read
+  // off Cached, which belongs to the whole machine: under a full run another
+  // test's seeding moved it and failed this one.
   EXPECT_LT(Grew, 40) << "cache grew " << Grew << " MiB for 500 KiB of files";
 }
 

@@ -41,11 +41,15 @@ void railfs_trace_stop(void);
  */
 void railfs_trace_inflight(int delta);
 
-/* The same for connections held. A mount that never has two busy at once is
- * not spreading across its pool, which is a property worth asserting on
- * directly rather than inferring from how long something took.
+/* The same for connections with a request in flight: a mount that never has
+ * two busy is not spreading across its pool.
  */
 void railfs_trace_busy(int delta);
+
+/* And for requests between send and reply across the mount: more than one on
+ * a one-connection mount is what sharing means.
+ */
+void railfs_trace_calls(int delta);
 
 static inline u64 railfs_now(void) { return ktime_get_ns(); }
 

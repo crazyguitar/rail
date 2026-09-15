@@ -4,6 +4,7 @@
 #include "rail/vfs/remotes.h"
 
 #include "rail/app/checksum.h"
+#include "rail/io/inbox.h"
 #include "rail/io/runner.h"
 #include "rail/io/stream.h"
 #include "rail/nfs/rpc.h"
@@ -1395,70 +1396,20 @@ void startSession(const ExportOptions &Opts, std::vector<Live> &Running, Stream 
   Running.push_back(std::move(Slot));
 }
 
-class Inbox {
-public:
-  Inbox() : Wake(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)) {}
-  Inbox(const Inbox &) = delete;
-  Inbox &operator=(const Inbox &) = delete;
-  ~Inbox() {
-    if (Wake >= 0) ::close(Wake);
-  }
-
-  bool usable() const { return Wake >= 0; }
-  int wakeFd() const { return Wake; }
-  bool stopped() const { return Stopping.load(); }
-
-  void post(Stream Conn) {
-    {
-      const std::lock_guard<std::mutex> Held(Lock);
-      Handed.push_back(std::move(Conn));
-    }
-    ring();
-  }
-
-  void stop() {
-    Stopping.store(true);
-    ring();
-  }
-
-  std::deque<Stream> take() {
-    const std::lock_guard<std::mutex> Held(Lock);
-    return std::exchange(Handed, {});
-  }
-
-  Coro<void> wakeup() {
-    co_await WaitFor{Wake, EPOLLIN};
-    uint64_t Ticks = 0;
-    [[maybe_unused]] auto Got = ::read(Wake, &Ticks, sizeof(Ticks));
-  }
-
-private:
-  void ring() {
-    const uint64_t One = 1;
-    [[maybe_unused]] auto Wrote = ::write(Wake, &One, sizeof(One));
-  }
-
-  int Wake;
-  std::atomic<bool> Stopping{false};
-  std::mutex Lock;
-  std::deque<Stream> Handed;
-};
-
-struct Attending {
-  Inbox &In;
-
-  explicit Attending(Inbox &In) : In(In) {}
-  Attending(const Attending &) = delete;
-  Attending &operator=(const Attending &) = delete;
-  ~Attending() { Loop::get().forget(In.wakeFd()); }
-};
-
 Coro<Result<void>> serveInbox(const ExportOptions &Opts, Inbox &In) {
   const Attending Mine(In);
   std::vector<Live> Running;
   for (;;) {
     co_await In.wakeup();
-    if (In.stopped()) co_return Result<void>{};
+    if (In.stopped()) {
+      // Anything handed over in the moment before the stop is closed rather
+      // than left in a queue nobody will drain again.
+      for (auto &Late : In.take()) {
+        std::fprintf(stderr, "railnfs: closing a client handed to a thread that has stopped\n");
+        Late.close();
+      }
+      co_return Result<void>{};
+    }
     reapFinished(Running);
     for (auto &Conn : In.take()) startSession(Opts, Running, std::move(Conn));
   }
@@ -1471,7 +1422,17 @@ Coro<Result<void>> acceptInTurn(const ExportOptions &Opts, std::vector<std::uniq
   for (size_t Next = 0;; Next = (Next + 1) % Boxes.size()) {
     auto Conn = co_await Listener->accept();
     if (!Conn) co_return std::unexpected(Conn.error());
-    Boxes[Next]->post(std::move(*Conn));
+
+    // As in the file service: a stopped thread refuses, so the client moves
+    // on to the next rather than being swallowed.
+    bool Handed = false;
+    for (size_t Tried = 0; Tried < Boxes.size() && !Handed; Tried++) {
+      Handed = Boxes[Next]->post(std::move(*Conn));
+      // The outer increment rotates after a handover; advancing here too
+      // would skip every other thread.
+      if (!Handed) Next = (Next + 1) % Boxes.size();
+    }
+    if (!Handed) co_return failMessage("every serving thread has stopped");
   }
 }
 
